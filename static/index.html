@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Apigee Entitlement Tracker</title>
+  <link rel="icon" href="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261005-6" />
+</head>
+<body>
+
+  <!-- Authentication View -->
+  <section id="login-screen" class="login-screen">
+    <div class="login-card glass-window">
+      <div class="login-brand">
+        <img
+          src="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png"
+          alt="Apigee"
+          class="brand-logo brand-logo-lg"
+        />
+        <h1>Apigee Entitlement Tracker</h1>
+        <p class="login-brand-subtitle">Capacity Audit &amp; Contract Compliance</p>
+      </div>
+
+      <!-- Active User Account Card -->
+      <div class="glass-subcard login-account-card">
+        <div class="eyebrow">Logged-in User Account</div>
+        <div id="login-active-email" class="active-session-email">Detecting...</div>
+      </div>
+
+      <!-- Action Buttons: Exactly 1 Enter button, 1 Authenticate/Change Account button -->
+      <div class="login-actions-group">
+        <button id="btn-enter-app" type="button" class="btn btn-primary btn-lg btn-enter-action">
+          Enter Dashboard &rarr;
+        </button>
+
+        <button id="btn-authenticate-account" type="button" class="btn btn-google-login">
+          <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+            <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+            <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+            <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+            <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+          </svg>
+          <span id="btn-authenticate-text">Authenticate / Change Account</span>
+        </button>
+      </div>
+
+      <!-- Error message container -->
+      <div id="login-error-box" class="login-error-box" style="display: none;"></div>
+
+      <!-- Live Scan & Loading Progress (Matching Home Page Refresh Live Scan style) -->
+      <div id="login-scan-progress" class="dashboard-progress-banner glass-card" style="display: none; margin-top: 1.25rem;">
+        <div class="dashboard-progress-inner">
+          <div class="dashboard-progress-top">
+            <div class="dashboard-progress-label">
+              <span class="scan-pulse-dot"></span>
+              <strong id="login-progress-status">Loading Apigee Entitlements...</strong>
+              <span id="login-progress-detail" class="dashboard-progress-sub">Connecting to APIs</span>
+            </div>
+            <span id="login-progress-percent" class="scan-progress-percent">0%</span>
+          </div>
+          <div class="scan-progress-bar-track">
+            <div id="login-progress-bar-fill" class="scan-progress-bar-fill" style="width: 0%;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+
+
+  <!-- Dashboard View -->
+  <div id="dashboard-screen" class="spatial-stage" style="display: none;">
+    <div class="spatial-layout">
+      <!-- Navigation Dock -->
+      <nav class="spatial-dock" aria-label="Quick Navigation">
+        <a href="#section-entitlement-config" class="dock-btn active" title="Contract & Entitlement Parameters">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </a>
+        <a href="#limit-validation-card" class="dock-btn" title="Compliance & Overview">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
+        </a>
+        <a href="#section-filters" class="dock-btn" title="Filters & Organizations">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        </a>
+        <a href="#section-monitoring" class="dock-btn" title="PDUs Across Time (Cloud Monitoring)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </a>
+        <a href="#section-calls-monthly" class="dock-btn" title="API Calls per Month (Contract Period)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        </a>
+        <a href="#section-report" class="dock-btn" title="Detail Report">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+        </a>
+      </nav>
+
+      <!-- Main Workspace -->
+      <div class="glass-window main-window">
+        <!-- Header -->
+        <header class="top-header">
+          <div class="brand-group">
+            <img
+              src="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png"
+              alt="Apigee"
+              class="brand-logo"
+            />
+            <div>
+              <h1>Apigee Entitlement Tracker</h1>
+              <div class="brand-subtitle-row">
+                <span class="brand-subtitle" id="header-account-subtitle">GCP User: —</span>
+                <span id="header-token-badge" class="token-pill token-pill-active" style="display: none;">User Token Active</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="header-actions">
+            <button
+              id="btn-theme-toggle"
+              type="button"
+              class="btn btn-secondary btn-sm theme-toggle-btn icon-btn"
+              title="Toggle Dark / Light Theme"
+              aria-label="Toggle Dark or Light Theme"
+            >
+              <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="5"></circle>
+                <line x1="12" y1="1" x2="12" y2="3"></line>
+                <line x1="12" y1="21" x2="12" y2="23"></line>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                <line x1="1" y1="12" x2="3" y2="12"></line>
+                <line x1="21" y1="12" x2="23" y2="12"></line>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+              </svg>
+              <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+              </svg>
+            </button>
+            <button
+              id="btn-switch-account"
+              type="button"
+              class="btn btn-secondary btn-sm icon-btn"
+              title="Change Account / Re-authenticate"
+              aria-label="Change Account"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-3-3.87"></path>
+                <path d="M4 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                <circle cx="10" cy="7" r="4"></circle>
+                <line x1="19" y1="8" x2="19" y2="14"></line>
+                <line x1="22" y1="11" x2="16" y2="11"></line>
+              </svg>
+            </button>
+            <button
+              id="btn-refresh-scan"
+              type="button"
+              class="btn btn-primary btn-sm icon-btn"
+              title="Refresh Live Scan"
+              aria-label="Refresh Live Scan"
+            >
+              <svg class="icon-refresh" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <polyline points="1 20 1 14 7 14"></polyline>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+
+        <main class="main-container">
+          <!-- Service Account Fallback Notice (visible only when Cloud Run SA is used) -->
+          <div id="dashboard-sa-notice" class="dashboard-sa-banner glass-card" style="display: none;">
+            <div class="sa-banner-content">
+              <span class="sa-banner-icon">ℹ️</span>
+              <span class="sa-banner-text" id="sa-banner-text">
+                Viewing organizations authorized for Cloud Run Service Account. To audit all organizations authorized for your personal user email, provide your user access token.
+              </span>
+            </div>
+            <button type="button" id="btn-banner-add-token" class="btn btn-sm btn-outline">
+              Add User Token
+            </button>
+          </div>
+
+          <!-- Scan Progress Banner -->
+          <div id="dashboard-scan-progress" class="dashboard-progress-banner glass-card" style="display: none;">
+            <div class="dashboard-progress-inner">
+              <div class="dashboard-progress-top">
+                <div class="dashboard-progress-label">
+                  <span class="scan-pulse-dot"></span>
+                  <strong id="dashboard-progress-status">Refreshing Live Apigee Scan...</strong>
+                  <span id="dashboard-progress-detail" class="dashboard-progress-sub"></span>
+                </div>
+                <span id="dashboard-progress-percent" class="scan-progress-percent">0%</span>
+              </div>
+              <div class="scan-progress-bar-track">
+                <div id="dashboard-progress-bar-fill" class="scan-progress-bar-fill" style="width: 0%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Contract & Entitlement Configuration -->
+          <section id="section-entitlement-config" class="entitlement-config-card glass-card is-collapsed" aria-label="Contract and Entitlement Parameters">
+            <div
+              id="entitlement-config-toggle"
+              class="entitlement-config-header"
+              role="button"
+              tabindex="0"
+              aria-expanded="false"
+              aria-controls="entitlement-config-body"
+            >
+              <div class="entitlement-header-left">
+                <div class="entitlement-title-row">
+                  <svg class="entitlement-gear-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                  </svg>
+                  <h2 class="card-section-title">Contract &amp; Entitlement Parameters</h2>
+                </div>
+                <div class="entitlement-summary-pills">
+                  <span class="entitlement-param-pill">Start: <strong id="pill-summary-contract-date">2026-01-01</strong></span>
+                  <span class="entitlement-param-pill">PDUs: <strong id="pill-summary-pdu-limit">500</strong></span>
+                  <span class="entitlement-param-pill">Env Units: <strong id="pill-summary-env-limit">20</strong></span>
+                  <span class="entitlement-param-pill">Yearly Calls: <strong id="pill-summary-calls-limit">100M</strong></span>
+                </div>
+              </div>
+
+              <div class="entitlement-header-right">
+                <span class="entitlement-toggle-label" id="lbl-entitlement-toggle">Edit Parameters</span>
+                <span class="entitlement-chevron-btn" aria-hidden="true">
+                  <svg class="entitlement-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </span>
+              </div>
+            </div>
+
+            <div id="entitlement-config-body" class="entitlement-config-body">
+              <div class="entitlement-body-top">
+                <p class="chart-subtitle" id="entitlement-config-subtitle">
+                  Permanently stored in <code>pdu_limit.json</code> &bull; Active Contract Year: <strong id="lbl-active-contract-period">2026-01-01 &rarr; 2027-01-01</strong>
+                </p>
+                <button id="btn-apply-limit" type="button" class="btn btn-primary btn-sm">
+                  Save Parameters
+                </button>
+              </div>
+
+              <div class="entitlement-config-grid">
+                <div class="config-field">
+                  <label for="input-contract-date">Contract Starting Date</label>
+                  <input id="input-contract-date" type="date" class="glass-text-input" value="2026-01-01" />
+                  <span class="config-help">Start date for monthly &amp; yearly API call tracking (14m Analytics)</span>
+                </div>
+
+                <div class="config-field">
+                  <label for="input-pdu-limit">PDU Entitlement Limit</label>
+                  <input id="input-pdu-limit" type="number" min="1" step="50" class="glass-text-input" value="500" />
+                  <span class="config-help">Max Proxy Deployment Units (Proxy &times; Region)</span>
+                </div>
+
+                <div class="config-field">
+                  <label for="input-env-limit">Environment Entitlement (Env Units)</label>
+                  <input id="input-env-limit" type="number" min="1" step="1" class="glass-text-input" value="20" />
+                  <span class="config-help">Max Environment Units (Environment &times; Regions)</span>
+                </div>
+
+                <div class="config-field">
+                  <label for="input-calls-limit">Yearly API Calls Entitlement (Millions of calls)</label>
+                  <input id="input-calls-limit" type="number" min="0.01" step="1" class="glass-text-input" value="100" />
+                  <span class="config-help" id="lbl-calls-limit-formatted">Max API Calls per contract year in Millions (e.g. 100 for 100M)</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Entitlement Compliance Overview -->
+          <section id="limit-validation-card" class="overview-bento below-limit">
+            <!-- Entitlement Dimension Cards -->
+            <div class="stacked-metrics">
+              <!-- Dimension 1: Proxy Deployment Units (PDUs) -->
+              <div class="glass-card stat-mini-card dimension-card active" data-dim="pdu">
+                <div class="stat-icon-circle">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                </div>
+                <div class="stat-info" style="flex: 1;">
+                  <div class="limit-inline-row">
+                    <div>
+                      <div class="metric-number">
+                        <span id="val-consumed-pdus">0</span>
+                        <span class="metric-slash">/ <span id="val-limit-pdus">500</span></span>
+                      </div>
+                      <div class="metric-label">1. PDU Entitlement (Proxy &times; Region)</div>
+                    </div>
+                    <span id="pill-status-pdu" class="chart-status-pill below">BELOW LIMIT</span>
+                  </div>
+                  <div class="metric-sub">
+                    <span id="val-consumed-formula">0 deployed units</span> &bull;
+                    <span id="val-utilization-pct">0% used</span>
+                    (<span id="val-margin-pdus">500</span> <span id="val-margin-label">available</span>)
+                  </div>
+                </div>
+              </div>
+
+              <!-- Dimension 2: Environment Units (Env × Regions) -->
+              <div class="glass-card stat-mini-card dimension-card" data-dim="environments">
+                <div class="stat-icon-circle">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                </div>
+                <div class="stat-info" style="flex: 1;">
+                  <div class="limit-inline-row">
+                    <div>
+                      <div class="metric-number">
+                        <span id="val-consumed-envs">0</span>
+                        <span class="metric-slash">/ <span id="val-limit-envs">20</span></span>
+                      </div>
+                      <div class="metric-label">2. Environment Units (Env &times; Regions)</div>
+                    </div>
+                    <span id="pill-status-envs" class="chart-status-pill below">BELOW LIMIT</span>
+                  </div>
+                  <div class="metric-sub" id="val-envs-formula">
+                    0 regional environment units across 0 logical envs &bull; 0% used
+                  </div>
+                </div>
+              </div>
+
+              <!-- Dimension 3: Yearly API Calls -->
+              <div class="glass-card stat-mini-card dimension-card" data-dim="calls">
+                <div class="stat-icon-circle">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                </div>
+                <div class="stat-info" style="flex: 1;">
+                  <div class="limit-inline-row">
+                    <div>
+                      <div class="metric-number">
+                        <span id="val-consumed-calls">0</span>
+                        <span class="metric-slash">/ <span id="val-limit-calls">100M</span></span>
+                      </div>
+                      <div class="metric-label">3. Yearly API Calls (Contract Year)</div>
+                    </div>
+                    <span id="pill-status-calls" class="chart-status-pill below">BELOW LIMIT</span>
+                  </div>
+                  <div class="metric-sub" id="val-calls-formula">
+                    Contract year: 2026-01-01 &rarr; 2027-01-01 &bull; Stored in <code>pdu_limit.json</code>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Compliance Gauge Card -->
+            <div class="glass-card overview-gauge-card">
+              <div class="overview-card-header">
+                <div>
+                  <h2 class="card-section-title">Entitlement Compliance</h2>
+                  <span id="verdict-scope-label" class="verdict-scope">All Authorized Organizations</span>
+                </div>
+                <div class="overview-header-actions">
+                  <span id="verdict-badge" class="verdict-pill below">BELOW LIMITS</span>
+                  <a id="btn-export-csv" href="/api/export/environments" class="btn btn-secondary btn-sm">
+                    Export CSV
+                  </a>
+                </div>
+              </div>
+
+              <!-- Dimension Selector -->
+              <div class="gauge-dim-pills" role="tablist" aria-label="Select Gauge Dimension">
+                <button type="button" class="gauge-dim-btn active" data-gauge-dim="pdu">PDUs</button>
+                <button type="button" class="gauge-dim-btn" data-gauge-dim="environments">Env Units</button>
+                <button type="button" class="gauge-dim-btn" data-gauge-dim="calls">Yearly Calls</button>
+              </div>
+
+              <div class="overview-gauge-body">
+                <!-- Ring Gauge -->
+                <div class="donut-wrap">
+                  <svg width="168" height="168" viewBox="0 0 168 168" class="donut-svg">
+                    <circle cx="84" cy="84" r="64" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="16" />
+                    <circle
+                      id="donut-progress-ring"
+                      cx="84"
+                      cy="84"
+                      r="64"
+                      fill="none"
+                      stroke="#2dd4bf"
+                      stroke-width="16"
+                      stroke-linecap="round"
+                      stroke-dasharray="402.12"
+                      stroke-dashoffset="402.12"
+                      transform="rotate(-90 84 84)"
+                    />
+                  </svg>
+                  <div class="donut-center">
+                    <span id="donut-pct-text" class="donut-pct">0%</span>
+                    <span id="donut-sub-text" class="donut-sub">0 PDUs</span>
+                  </div>
+                </div>
+
+                <!-- Compliance Summary Legend -->
+                <div class="overview-legend">
+                  <div class="legend-row">
+                    <div class="legend-label"><span class="dot dot-cyan"></span>1. PDUs Used</div>
+                    <div class="legend-val" id="legend-pdu-summary">0 / 500 (0%)</div>
+                  </div>
+                  <div class="legend-row">
+                    <div class="legend-label"><span class="dot dot-gold"></span>2. Env Units (Env&times;Reg)</div>
+                    <div class="legend-val" id="legend-env-summary">0 / 20 (0%)</div>
+                  </div>
+                  <div class="legend-row">
+                    <div class="legend-label"><span class="dot dot-muted"></span>3. Yearly API Calls</div>
+                    <div class="legend-val" id="legend-calls-summary">0 / 100M (0%)</div>
+                  </div>
+                  <div class="legend-row">
+                    <div class="legend-label"><span class="dot dot-cyan" style="opacity:0.5;"></span>X vs Hybrid PDUs</div>
+                    <div class="legend-val"><span id="legend-x-pdus">0</span> X &bull; <span id="legend-hybrid-pdus">0</span> Hyb (<span id="legend-active-envs">0</span> envs)</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Progress Bar -->
+              <div class="limit-progress-track">
+                <div id="limit-progress-fill" class="limit-progress-fill" style="width: 0%"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Organization & Environment Filters -->
+          <section id="section-filters" class="filter-panel glass-card" aria-label="Organization Multi-Select and Filters">
+            <div class="filter-group">
+              <!-- Organization Multi-Select -->
+              <div class="filter-item org-dropdown-wrapper" id="org-dropdown-wrapper">
+                <label for="org-dropdown-btn">Organization (Multi-Select)</label>
+                <button
+                  id="org-dropdown-btn"
+                  type="button"
+                  class="select-control org-dropdown-trigger"
+                  aria-haspopup="listbox"
+                  aria-expanded="false"
+                >
+                  <span id="org-dropdown-label">All Authorized Organizations</span>
+                  <svg class="dropdown-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </button>
+
+                <!-- Organization Dropdown Menu -->
+                <div id="org-dropdown-menu" class="org-dropdown-menu" role="listbox" aria-multiselectable="true">
+                  <div class="org-dropdown-toolbar">
+                    <span id="org-selection-summary" class="org-selection-badge">All Selected</span>
+                    <div class="org-dropdown-actions">
+                      <button id="btn-org-select-all" type="button" class="btn-link">Select All</button>
+                      <button id="btn-org-clear" type="button" class="btn-link">Clear</button>
+                    </div>
+                  </div>
+                  <div id="org-checkbox-list" class="org-checkbox-list">
+                    <!-- Populated dynamically -->
+                  </div>
+                </div>
+              </div>
+
+              <div class="filter-item">
+                <label for="filter-env">Environment</label>
+                <select id="filter-env" class="select-control">
+                  <option value="ALL">All Environments</option>
+                </select>
+              </div>
+
+              <div class="filter-item">
+                <label for="filter-footprint">Footprint</label>
+                <select id="filter-footprint" class="select-control">
+                  <option value="ALL">All (Apigee X + Hybrid)</option>
+                  <option value="CLOUD">Apigee X Only</option>
+                  <option value="HYBRID">Apigee Hybrid Only</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="filter-toggles">
+              <label class="ios-switch-label" for="chk-hide-zero">
+                <span>Hide 0-PDU Envs</span>
+                <span class="ios-switch">
+                  <input type="checkbox" id="chk-hide-zero" checked />
+                  <span class="ios-switch-slider"></span>
+                </span>
+              </label>
+
+              <label class="ios-switch-label" for="chk-include-sf">
+                <span>Shared Flows</span>
+                <span class="ios-switch">
+                  <input type="checkbox" id="chk-include-sf" checked />
+                  <span class="ios-switch-slider"></span>
+                </span>
+              </label>
+
+              <button id="btn-reset-filters" type="button" class="btn btn-secondary btn-sm">
+                Reset
+              </button>
+            </div>
+          </section>
+
+          <!-- Cloud Monitoring Time-Series Chart -->
+          <section id="section-monitoring" class="chart-card glass-card" aria-label="PDUs and Environment Units Across Time">
+            <div class="chart-header">
+              <div>
+                <div class="chart-title-row">
+                  <h2 class="card-section-title" id="chart-main-title">PDUs Across Time (Cloud Monitoring)</h2>
+                  <span id="chart-limit-pill" class="chart-status-pill below">UNDER LIMIT</span>
+                </div>
+                <p class="chart-subtitle" id="chart-subtitle">
+                  Metric: <code>apigee.googleapis.com/proxy/details</code> &bull; Loading time-series...
+                </p>
+              </div>
+              <div class="chart-controls">
+                <!-- Chart Dimension Switcher -->
+                <div class="range-pills dim-pills" role="group" aria-label="Chart Dimension">
+                  <button type="button" class="dim-btn active" data-chart-dim="pdu">PDUs</button>
+                  <button type="button" class="dim-btn" data-chart-dim="environments">Env Units</button>
+                </div>
+                <div class="range-pills" id="chart-days-pills" role="group" aria-label="Time Range">
+                  <button type="button" class="range-btn" data-days="1">24h</button>
+                  <button type="button" class="range-btn" data-days="7">7d</button>
+                  <button type="button" class="range-btn active" data-days="14">14d</button>
+                  <button type="button" class="range-btn" data-days="30">30d</button>
+                </div>
+                <button id="btn-refresh-chart" type="button" class="btn btn-primary btn-sm">
+                  Refresh Monitoring
+                </button>
+              </div>
+            </div>
+
+            <div id="chart-container" class="chart-canvas-wrap">
+              <div class="chart-empty">Querying Cloud Monitoring time-series...</div>
+            </div>
+          </section>
+
+          <!-- Monthly API Calls Chart -->
+          <section id="section-calls-monthly" class="chart-card glass-card" aria-label="Number of API Calls per Month Starting on Contract Date">
+            <div class="chart-header">
+              <div>
+                <div class="chart-title-row">
+                  <h2 class="card-section-title">API Calls per Month (Starting from Contract Date)</h2>
+                  <span id="calls-chart-limit-pill" class="chart-status-pill below">UNDER YEARLY LIMIT</span>
+                </div>
+                <p class="chart-subtitle" id="calls-chart-subtitle">
+                  Source: <code>Apigee Analytics (14m retention) + Cloud Monitoring</code> &bull; Loading monthly call volume...
+                </p>
+              </div>
+              <div class="chart-controls">
+                <button id="btn-refresh-calls-chart" type="button" class="btn btn-primary btn-sm">
+                  Refresh Analytics Calls
+                </button>
+              </div>
+            </div>
+
+            <div id="calls-monthly-chart-container" class="chart-canvas-wrap">
+              <div class="chart-empty">Loading monthly API calls from Contract Starting Date...</div>
+            </div>
+          </section>
+
+          <!-- Environment Entitlement Detail Table -->
+          <section id="section-report" class="table-card glass-card">
+            <div class="table-card-header">
+              <h2 class="card-section-title">Environment Entitlement Detail Report (PDUs, Env Units &amp; Yearly Calls)</h2>
+              <span class="table-card-sub">Single-line footprint &bull; Matches CSV Export</span>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Organization</th>
+                    <th class="footprint-col">Runtime</th>
+                    <th>Environment</th>
+                    <th>Regions</th>
+                    <th class="num-cell">Env Units (Regions)</th>
+                    <th class="num-cell">% of Env Limit</th>
+                    <th class="num-cell" id="th-deployed-units">Deployed Units (Proxies + SF)</th>
+                    <th class="num-cell">Consumed PDUs</th>
+                    <th class="num-cell">% of PDU Limit</th>
+                    <th class="num-cell">Number of call since period start</th>
+                    <th class="num-cell">% of call Limit</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-pdu"></tbody>
+                <tfoot id="tfoot-pdu"></tfoot>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: User Token Manager -->
+  <div id="modal-token-manager" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="token-modal-title">
+    <div class="modal-card glass-window">
+      <div class="modal-header">
+        <h3 id="token-modal-title">GCP User OAuth Token</h3>
+        <button type="button" id="btn-close-token-modal" class="btn-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-secondary" style="margin-bottom: 0.75rem;">
+          To ensure IAM compliance, all Apigee and Cloud Monitoring API queries run with your personal user permissions.
+        </p>
+        <div class="token-helper-text" style="margin-bottom: 0.35rem;">
+          Generate a fresh token in your terminal:
+        </div>
+        <div class="token-command-box" style="margin-bottom: 0.85rem;">
+          <code>gcloud auth application-default print-access-token</code>
+          <button type="button" id="btn-copy-modal-token-cmd" class="btn btn-xs btn-outline">Copy</button>
+        </div>
+        <label for="input-modal-user-token" class="eyebrow" style="margin-bottom: 0.35rem; display: block;">Paste Token</label>
+        <div class="token-input-row" style="margin-bottom: 0.5rem;">
+          <input
+            type="password"
+            id="input-modal-user-token"
+            class="form-control form-control-sm"
+            placeholder="Paste token (ya29...)"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button type="button" id="btn-apply-modal-token" class="btn btn-sm btn-primary">Save & Apply</button>
+        </div>
+        <div id="modal-token-msg" class="token-feedback-msg" style="display: none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast-notification" role="status" aria-live="polite"></div>
+  <script src="/static/app.js?v=20261005-6"></script>
+
+
+</body>
+</html>

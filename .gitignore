@@ -1,0 +1,28 @@
+# Python virtual environment & bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime state, cached scan data, and local exports (never commit live org data)
+data/
+exports/
+pdu_limit.json
+
+# Environment variables & secrets
+.env
+*.env
+*.pem
+*.key
+credentials.json
+
+# OS & editor metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+
