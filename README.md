@@ -5,6 +5,13 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Google Cloud](https://img.shields.io/badge/Google%20Cloud-Apigee%20X%20%26%20Hybrid-4285F4.svg)](https://cloud.google.com/apigee)
 
+***
+
+:warning: **This is not an official Google product.**<BR>This implementation is not an official Google product, nor is it part of an official Google product. Support is available on a best-effort basis via GitHub.
+
+***
+
+
 **Apigee Entitlement Tracker** is an enterprise cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
 
 ---
