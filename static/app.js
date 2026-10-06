@@ -515,20 +515,94 @@ function renderMonitoringChart() {
     return true;
   });
 
-  // Aggregate points by timestamp across matching (org, env) series
-  const timeMap = new Map();
+  // 1. Determine alignment resolution (bucket interval in ms)
+  const alignSeconds =
+    currentMonitoringTs.alignmentPeriodSeconds ||
+    (selectedChartDays <= 1
+      ? 3600
+      : selectedChartDays <= 7
+      ? 14400
+      : selectedChartDays <= 14
+      ? 21600
+      : 43200);
+  const bucketMs = alignSeconds * 1000;
+
+  // 2. Gather all valid epoch timestamps across matching series
+  const allEpochs = [];
   matchingSeries.forEach((s) => {
     (s.points || []).forEach((pt) => {
-      timeMap.set(pt.timestamp, (timeMap.get(pt.timestamp) || 0) + pt.pdu);
+      const t = new Date(pt.timestamp).getTime();
+      if (!isNaN(t)) allEpochs.push(t);
     });
   });
 
-  const sortedTimestamps = Array.from(timeMap.keys()).sort();
-  let points = sortedTimestamps.map((ts) => ({
-    timestamp: ts,
-    date: new Date(ts),
-    pdu: timeMap.get(ts),
-  }));
+  if (!allEpochs.length) {
+    container.innerHTML = `<div class="chart-empty">No Cloud Monitoring telemetry found for the selected filter (${escapeHtml(
+      unitLabel
+    )}).</div>`;
+    if (subtitle) {
+      subtitle.innerHTML = `Metric: <code>apigee.googleapis.com/proxy/details</code> &bull; 0 active series for current filter`;
+    }
+    return;
+  }
+
+  // 3. Create regular canonical time buckets from min to max
+  const minEpoch = Math.floor(Math.min(...allEpochs) / bucketMs) * bucketMs;
+  const maxEpoch = Math.floor(Math.max(...allEpochs) / bucketMs) * bucketMs;
+
+  const buckets = [];
+  for (let t = minEpoch; t <= maxEpoch; t += bucketMs) {
+    buckets.push(t);
+  }
+
+  // 4. Aggregate series across regular buckets with forward-fill (sample-and-hold for continuous gauge values)
+  let points = [];
+  if (buckets.length > 1) {
+    const bucketTotals = new Array(buckets.length).fill(0);
+
+    matchingSeries.forEach((s) => {
+      const rawPts = (s.points || [])
+        .map((p) => ({ time: new Date(p.timestamp).getTime(), val: Number(p.pdu || 0) }))
+        .filter((p) => !isNaN(p.time))
+        .sort((a, b) => a.time - b.time);
+
+      if (!rawPts.length) return;
+
+      const firstTime = rawPts[0].time;
+      const firstVal = rawPts[0].val;
+      let ptIdx = 0;
+      // If the series starts within 2 buckets of minEpoch, use first point's value as baseline
+      let currentVal = firstTime - minEpoch <= 2 * bucketMs ? firstVal : 0;
+
+      buckets.forEach((bucketTime, bIdx) => {
+        while (ptIdx < rawPts.length && rawPts[ptIdx].time <= bucketTime + bucketMs / 2) {
+          currentVal = rawPts[ptIdx].val;
+          ptIdx++;
+        }
+        bucketTotals[bIdx] += currentVal;
+      });
+    });
+
+    points = buckets.map((t, idx) => ({
+      timestamp: new Date(t).toISOString(),
+      date: new Date(t),
+      pdu: bucketTotals[idx],
+    }));
+  } else {
+    // Single point fallback
+    const timeMap = new Map();
+    matchingSeries.forEach((s) => {
+      (s.points || []).forEach((pt) => {
+        timeMap.set(pt.timestamp, (timeMap.get(pt.timestamp) || 0) + pt.pdu);
+      });
+    });
+    const sortedTimestamps = Array.from(timeMap.keys()).sort();
+    points = sortedTimestamps.map((ts) => ({
+      timestamp: ts,
+      date: new Date(ts),
+      pdu: timeMap.get(ts),
+    }));
+  }
 
   // Drop trailing bucket if it's a partial final alignment window with fewer reporting orgs
   if (points.length > 3) {

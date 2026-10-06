@@ -1537,10 +1537,14 @@ def fetch_monitoring_pdu_timeseries_sync(
     else:
         align_seconds = 43200      # 12h resolution for 30d+
 
+    # Align query window to canonical align_seconds boundaries
     now = datetime.datetime.now(datetime.timezone.utc)
-    start = now - datetime.timedelta(days=days)
-    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_epoch = int(now.timestamp())
+    aligned_end_epoch = (now_epoch // align_seconds) * align_seconds
+    aligned_end = datetime.datetime.fromtimestamp(aligned_end_epoch, tz=datetime.timezone.utc)
+    aligned_start = aligned_end - datetime.timedelta(days=days)
+    start_str = aligned_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = aligned_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     mon_base_url = MONITORING_BASE_URL
 
@@ -1559,7 +1563,7 @@ def fetch_monitoring_pdu_timeseries_sync(
                     continue
                 pts = []
                 for idx in range(num_buckets):
-                    t_pt = start + datetime.timedelta(seconds=(idx + 1) * align_seconds)
+                    t_pt = aligned_start + datetime.timedelta(seconds=(idx + 1) * align_seconds)
                     pts.append(
                         {
                             "timestamp": t_pt.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1614,7 +1618,7 @@ def fetch_monitoring_pdu_timeseries_sync(
         series_out: List[Dict[str, Any]] = []
         if not err and data and data.get("timeSeries"):
             if dim == "environments":
-                # Count distinct active regional locations per (org, env) at each timestamp
+                # Count distinct active regional locations per (org, env) at each canonical timestamp
                 env_ts_regions: Dict[str, Dict[str, int]] = {}
                 for ts in data.get("timeSeries", []):
                     lbl = ts.get("resource", {}).get("labels", {})
@@ -1623,8 +1627,14 @@ def fetch_monitoring_pdu_timeseries_sync(
                         t_str = p.get("interval", {}).get("endTime") or p.get("interval", {}).get("startTime")
                         val = int(p.get("value", {}).get("int64Value", 0))
                         if t_str and val > 0:
-                            env_ts_regions.setdefault(env_name, {})[t_str] = (
-                                env_ts_regions.get(env_name, {}).get(t_str, 0) + 1
+                            try:
+                                dt = datetime.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+                                epoch_snap = int(round(dt.timestamp() / align_seconds)) * align_seconds
+                                t_clean = datetime.datetime.fromtimestamp(epoch_snap, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception:
+                                t_clean = t_str
+                            env_ts_regions.setdefault(env_name, {})[t_clean] = (
+                                env_ts_regions.get(env_name, {}).get(t_clean, 0) + 1
                             )
                 for env_name, ts_map in env_ts_regions.items():
                     pts_clean = [
@@ -1645,13 +1655,19 @@ def fetch_monitoring_pdu_timeseries_sync(
                     lbl = ts.get("resource", {}).get("labels", {})
                     env_name = lbl.get("env", "default")
                     pts_raw = ts.get("points", [])
-                    pts_clean = []
+                    pts_by_bucket: Dict[str, int] = {}
                     for p in pts_raw:
                         t_str = p.get("interval", {}).get("endTime") or p.get("interval", {}).get("startTime")
                         val = int(p.get("value", {}).get("int64Value", 0))
                         if t_str:
-                            pts_clean.append({"timestamp": t_str, "pdu": val})
-                    pts_clean.sort(key=lambda x: x["timestamp"])
+                            try:
+                                dt = datetime.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+                                epoch_snap = int(round(dt.timestamp() / align_seconds)) * align_seconds
+                                t_clean = datetime.datetime.fromtimestamp(epoch_snap, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                pts_by_bucket[t_clean] = max(pts_by_bucket.get(t_clean, 0), val)
+                            except Exception:
+                                pts_by_bucket[t_str] = max(pts_by_bucket.get(t_str, 0), val)
+                    pts_clean = [{"timestamp": k, "pdu": v} for k, v in sorted(pts_by_bucket.items())]
                     series_out.append(
                         {
                             "organization": org_name,
