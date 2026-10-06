@@ -19,7 +19,7 @@ NC='\033[0m'
 
 # Default configuration
 PROJECT_ID="${GCP_PROJECT:-<YOUR-PROJECT-ID>}"
-REGION="${GCP_REGION:<YOUR-REGION>}"
+REGION="${GCP_REGION:-<YOUR-REGION>}"
 SERVICE_NAME="${CLOUD_RUN_SERVICE:-apigee-entitlement-tracker}"
 SA_EMAIL="${CLOUD_RUN_SA:-apigee-pdu-monitor-sa@${PROJECT_ID}.iam.gserviceaccount.com}"
 SECRET_CLIENT_ID="apigee-tracker-oauth-client-id"

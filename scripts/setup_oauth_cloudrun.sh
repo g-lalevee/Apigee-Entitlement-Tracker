@@ -28,7 +28,7 @@ NC='\033[0m' # No Color
 
 # Defaults
 PROJECT_ID="${GCP_PROJECT:-<YOUR-PROJECT-ID>}"
-REGION="${GCP_REGION:<YOUR-REGION>}"
+REGION="${GCP_REGION:-<YOUR-REGION>}"
 SERVICE_NAME="${CLOUD_RUN_SERVICE:-apigee-entitlement-tracker}"
 SECRET_CLIENT_ID="apigee-tracker-oauth-client-id"
 SECRET_CLIENT_SECRET="apigee-tracker-oauth-client-secret"
