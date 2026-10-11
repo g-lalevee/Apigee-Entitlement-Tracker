@@ -12,10 +12,10 @@
 ***
 
 
-**Apigee Entitlement Tracker** is an enterprise cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
+**Apigee Entitlement Tracker** is an cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
 
 > [!IMPORTANT]
-> **Entitlement Model Support**: This tool **does not support the legacy Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model** (Proxy Deployment Units, Environment Units, and Yearly API Calls).
+> **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
 
 ---
 
