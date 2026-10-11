@@ -76,24 +76,7 @@ flowchart TD
 ```
 
 1. **Apigee Management API**:
-   * **Control Plane Hosting Jurisdictions & Data Residency (DRZ)**: Full support for non-global hosting jurisdictions as defined in the official [Google Cloud Apigee Locations Documentation](https://docs.cloud.google.com/apigee/docs/locations#available-apigee-api-control-plane-hosting-jurisdictions). Requests route automatically to the selected control plane endpoint:
-
-     | Jurisdiction | Code | Region | Dedicated Endpoint |
-     | :--- | :--- | :--- | :--- |
-     | **Global (Default)** | `global` | Global | `https://apigee.googleapis.com/v1` |
-     | **United States** | `us` | Americas | `https://apigee.us.rep.googleapis.com/v1` |
-     | **Canada** | `ca` | Americas | `https://ca-apigee.googleapis.com/v1` |
-     | **European Union** | `eu` | Europe | `https://apigee.eu.rep.googleapis.com/v1` |
-     | **Germany** | `de` | Europe | `https://de-apigee.googleapis.com/v1` |
-     | **France** (`europe-west9`) | `fr` | Europe | `https://fr-apigee.googleapis.com/v1` |
-     | **Switzerland** (`europe-west6`) | `ch` | Europe | `https://ch-apigee.googleapis.com/v1` |
-     | **Australia** | `au` | Asia-Pacific | `https://au-apigee.googleapis.com/v1` |
-     | **India** | `in` | Asia-Pacific | `https://apigee.in.rep.googleapis.com/v1` |
-     | **Japan** | `jp` | Asia-Pacific | `https://jp-apigee.googleapis.com/v1` |
-     | **Qatar** (`me-central1`) | `qa` | Middle East | `https://qa-apigee.googleapis.com/v1` |
-     | **Saudi Arabia** (`me-central2`) | `sa` | Middle East | `https://sa-apigee.googleapis.com/v1` |
-     | **Israel** (`me-west1`) | `il` | Middle East | `https://il-apigee.googleapis.com/v1` |
-
+   * **Control Plane Hosting Jurisdictions & Data Residency (DRZ)**: Full support for non-global hosting jurisdictions as defined in the official [Google Cloud Apigee Locations Documentation](https://docs.cloud.google.com/apigee/docs/locations#available-apigee-api-control-plane-hosting-jurisdictions). 
    * **Organization Discovery**: Calls `GET /v1/organizations` using the caller's OAuth token to enumerate all organizations the user has access to within the active jurisdiction.
    * **Regional Footprint & Attachments**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regions each environment is attached to (instance attachments).
    * **Environment Inventory**: Calls `GET /v1/organizations/{org}/environments` to inspect each environment.
