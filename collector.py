@@ -20,7 +20,9 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import google.auth
@@ -29,6 +31,162 @@ import requests
 
 APIGEE_BASE_URL = "https://apigee.googleapis.com/v1"
 MONITORING_BASE_URL = "https://monitoring.googleapis.com/v3"
+
+# Official Apigee API Control Plane Hosting Jurisdictions
+# Reference: https://docs.cloud.google.com/apigee/docs/locations#available-apigee-api-control-plane-hosting-jurisdictions
+APIGEE_JURISDICTIONS: Dict[str, Dict[str, str]] = {
+    "global": {
+        "code": "global",
+        "region": "Global",
+        "name": "Global (Default)",
+        "description": "Global (Default) — apigee.googleapis.com",
+        "endpoint": "apigee.googleapis.com",
+        "baseUrl": "https://apigee.googleapis.com/v1",
+    },
+    "us": {
+        "code": "us",
+        "region": "Americas",
+        "name": "United States",
+        "description": "United States (us - multiple regions) — apigee.us.rep.googleapis.com",
+        "endpoint": "apigee.us.rep.googleapis.com",
+        "baseUrl": "https://apigee.us.rep.googleapis.com/v1",
+    },
+    "ca": {
+        "code": "ca",
+        "region": "Americas",
+        "name": "Canada",
+        "description": "Canada (ca - multiple regions) — ca-apigee.googleapis.com",
+        "endpoint": "ca-apigee.googleapis.com",
+        "baseUrl": "https://ca-apigee.googleapis.com/v1",
+    },
+    "eu": {
+        "code": "eu",
+        "region": "Europe",
+        "name": "European Union",
+        "description": "European Union (eu - multiple regions) — apigee.eu.rep.googleapis.com",
+        "endpoint": "apigee.eu.rep.googleapis.com",
+        "baseUrl": "https://apigee.eu.rep.googleapis.com/v1",
+    },
+    "de": {
+        "code": "de",
+        "region": "Europe",
+        "name": "Germany",
+        "description": "Germany (de - multiple regions) — de-apigee.googleapis.com",
+        "endpoint": "de-apigee.googleapis.com",
+        "baseUrl": "https://de-apigee.googleapis.com/v1",
+    },
+    "fr": {
+        "code": "fr",
+        "region": "Europe",
+        "name": "France",
+        "description": "France (fr - europe-west9) — fr-apigee.googleapis.com",
+        "endpoint": "fr-apigee.googleapis.com",
+        "baseUrl": "https://fr-apigee.googleapis.com/v1",
+    },
+    "ch": {
+        "code": "ch",
+        "region": "Europe",
+        "name": "Switzerland",
+        "description": "Switzerland (ch - europe-west6) — ch-apigee.googleapis.com",
+        "endpoint": "ch-apigee.googleapis.com",
+        "baseUrl": "https://ch-apigee.googleapis.com/v1",
+    },
+    "au": {
+        "code": "au",
+        "region": "Asia-Pacific",
+        "name": "Australia",
+        "description": "Australia (au - multiple regions) — au-apigee.googleapis.com",
+        "endpoint": "au-apigee.googleapis.com",
+        "baseUrl": "https://au-apigee.googleapis.com/v1",
+    },
+    "in": {
+        "code": "in",
+        "region": "Asia-Pacific",
+        "name": "India",
+        "description": "India (in - multiple regions) — apigee.in.rep.googleapis.com",
+        "endpoint": "apigee.in.rep.googleapis.com",
+        "baseUrl": "https://apigee.in.rep.googleapis.com/v1",
+    },
+    "jp": {
+        "code": "jp",
+        "region": "Asia-Pacific",
+        "name": "Japan",
+        "description": "Japan (jp - multiple regions) — jp-apigee.googleapis.com",
+        "endpoint": "jp-apigee.googleapis.com",
+        "baseUrl": "https://jp-apigee.googleapis.com/v1",
+    },
+    "qa": {
+        "code": "qa",
+        "region": "Middle East",
+        "name": "Qatar",
+        "description": "Qatar (qa - me-central1) — qa-apigee.googleapis.com",
+        "endpoint": "qa-apigee.googleapis.com",
+        "baseUrl": "https://qa-apigee.googleapis.com/v1",
+    },
+    "sa": {
+        "code": "sa",
+        "region": "Middle East",
+        "name": "Saudi Arabia",
+        "description": "Saudi Arabia (sa - me-central2) — sa-apigee.googleapis.com",
+        "endpoint": "sa-apigee.googleapis.com",
+        "baseUrl": "https://sa-apigee.googleapis.com/v1",
+    },
+    "il": {
+        "code": "il",
+        "region": "Middle East",
+        "name": "Israel",
+        "description": "Israel (il - me-west1) — il-apigee.googleapis.com",
+        "endpoint": "il-apigee.googleapis.com",
+        "baseUrl": "https://il-apigee.googleapis.com/v1",
+    },
+}
+
+_ACTIVE_JURISDICTION = "global"
+
+def get_active_jurisdiction() -> Dict[str, str]:
+    """Return the currently selected Apigee control plane jurisdiction configuration."""
+    global _ACTIVE_JURISDICTION
+    return APIGEE_JURISDICTIONS.get(_ACTIVE_JURISDICTION, APIGEE_JURISDICTIONS["global"])
+
+def get_apigee_base_url() -> str:
+    """Return the base URL of the active Apigee control plane jurisdiction."""
+    return get_active_jurisdiction()["baseUrl"]
+
+def set_active_jurisdiction(code_or_url: Optional[str]) -> Dict[str, str]:
+    """
+    Set active jurisdiction by code ('global', 'eu', 'us', etc.) or hostname/URL.
+    Clears cached session base URLs.
+    """
+    global _ACTIVE_JURISDICTION
+    if not code_or_url:
+        return get_active_jurisdiction()
+    clean = str(code_or_url).strip().lower()
+    for code, info in APIGEE_JURISDICTIONS.items():
+        if clean in (code, info["endpoint"].lower(), info["baseUrl"].lower(), info["name"].lower()):
+            _ACTIVE_JURISDICTION = code
+            if hasattr(_thread_local, "session"):
+                delattr(_thread_local, "session")
+            return info
+    # Handle direct endpoint URL
+    if clean.startswith("http://") or clean.startswith("https://"):
+        custom_base = clean.rstrip("/")
+        if not custom_base.endswith("/v1"):
+            custom_base += "/v1"
+        endpoint = custom_base.replace("https://", "").replace("http://", "").replace("/v1", "")
+        info = {
+            "code": "custom",
+            "region": "Custom",
+            "name": "Custom",
+            "description": f"Custom Endpoint ({custom_base})",
+            "endpoint": endpoint,
+            "baseUrl": custom_base,
+        }
+        APIGEE_JURISDICTIONS["custom"] = info
+        _ACTIVE_JURISDICTION = "custom"
+        if hasattr(_thread_local, "session"):
+            delattr(_thread_local, "session")
+        return info
+    return get_active_jurisdiction()
 
 # Google OIDC & OAuth 2.0 endpoints
 GOOGLE_OIDC_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -49,30 +207,67 @@ _thread_local = threading.local()
 
 _ACTIVE_OIDC_SESSION: Dict[str, Any] = {}
 _OIDC_LOCK = threading.Lock()
+_SESSION_CACHE_FILE = Path(__file__).resolve().parent / "data" / ".session.json"
+
+
+def _save_session_to_disk(sess: Dict[str, Any]) -> None:
+    try:
+        _SESSION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = _SESSION_CACHE_FILE.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(sess, indent=2), encoding="utf-8")
+        try:
+            os.chmod(tmp_file, 0o600)
+        except Exception:
+            pass
+        tmp_file.replace(_SESSION_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _load_session_from_disk() -> Dict[str, Any]:
+    try:
+        if _SESSION_CACHE_FILE.exists():
+            content = _SESSION_CACHE_FILE.read_text(encoding="utf-8")
+            if content.strip():
+                return json.loads(content)
+    except Exception:
+        pass
+    return {}
 
 
 def set_active_oidc_session(session: Dict[str, Any]) -> None:
-    """Set the active user session."""
+    """Set the active user session and persist to disk cache."""
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = dict(session)
     if hasattr(_thread_local, "session"):
         delattr(_thread_local, "session")
+    _save_session_to_disk(session)
 
 
 def get_active_oidc_session() -> Dict[str, Any]:
-    """Retrieve the current active user session."""
+    """Retrieve the current active user session, restoring from disk cache if needed."""
+    global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
+        if not _ACTIVE_OIDC_SESSION:
+            disk_sess = _load_session_from_disk()
+            if disk_sess:
+                _ACTIVE_OIDC_SESSION = disk_sess
         return dict(_ACTIVE_OIDC_SESSION)
 
 
 def clear_active_oidc_session() -> None:
-    """Clear the active user session."""
+    """Clear the active user session and delete disk cache."""
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = {}
     if hasattr(_thread_local, "session"):
         delattr(_thread_local, "session")
+    try:
+        if _SESSION_CACHE_FILE.exists():
+            _SESSION_CACHE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def validate_google_oauth_token(token: str) -> Dict[str, Any]:
@@ -146,7 +341,8 @@ def build_google_oidc_auth_url(
         "response_type": "code",
         "scope": scopes,
         "access_type": "offline",
-        "prompt": "select_account",
+        "prompt": "consent select_account",
+        "include_granted_scopes": "true",
     }
     if state:
         params["state"] = state
@@ -197,17 +393,67 @@ def exchange_google_oidc_code(
             pass
 
     email = user_info.get("email") or "google-user"
+    expires_in = token_data.get("expires_in")
+    expires_at = (time.time() + float(expires_in)) if expires_in else None
     session = {
         "email": email,
         "name": user_info.get("name", email),
         "picture": user_info.get("picture"),
         "accessToken": access_token,
+        "refreshToken": token_data.get("refresh_token") or get_active_oidc_session().get("refreshToken"),
         "idToken": id_token,
-        "expiresIn": token_data.get("expires_in"),
+        "expiresIn": expires_in,
+        "expiresAt": expires_at,
         "authMethod": "GOOGLE_OIDC_WEB_FLOW",
     }
     set_active_oidc_session(session)
     return session
+
+
+def refresh_google_oauth_token(
+    refresh_token: str,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Refresh an expired Google OAuth access token using an OAuth2 refresh token."""
+    if not refresh_token or not str(refresh_token).strip():
+        return None
+    cid = client_id or os.environ.get("GOOGLE_CLIENT_ID", DEFAULT_GOOGLE_CLIENT_ID)
+    sec = client_secret or os.environ.get("GOOGLE_CLIENT_SECRET")
+    payload = {
+        "client_id": cid,
+        "grant_type": "refresh_token",
+        "refresh_token": str(refresh_token).strip(),
+    }
+    if sec:
+        payload["client_secret"] = sec
+    try:
+        resp = requests.post(GOOGLE_OIDC_TOKEN_URL, data=payload, timeout=10.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            new_access_tok = data.get("access_token")
+            expires_in = data.get("expires_in", 3600)
+            new_refresh_tok = data.get("refresh_token") or refresh_token
+            if new_access_tok:
+                sess = get_active_oidc_session()
+                if sess:
+                    sess["accessToken"] = new_access_tok
+                    sess["refreshToken"] = new_refresh_tok
+                    sess["expiresIn"] = expires_in
+                    sess["expiresAt"] = time.time() + float(expires_in)
+                    set_active_oidc_session(sess)
+                else:
+                    set_active_oidc_session({
+                        "accessToken": new_access_tok,
+                        "refreshToken": new_refresh_tok,
+                        "expiresIn": expires_in,
+                        "expiresAt": time.time() + float(expires_in),
+                        "authMethod": "GOOGLE_OIDC_REFRESH",
+                    })
+            return data
+    except Exception:
+        pass
+    return None
 
 
 def _find_gcloud_bin() -> Optional[str]:
@@ -264,20 +510,145 @@ def _is_user_credentials(creds: Any) -> bool:
     return False
 
 
-def get_gcp_user_auth_info() -> Dict[str, Any]:
-    """Inspect the active Google Cloud user or credentials."""
+def get_gcp_user_auth_info(
+    explicit_token: Optional[str] = None,
+    explicit_refresh_token: Optional[str] = None,
+    explicit_account: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Inspect the active Google Cloud user or credentials and token expiration status."""
     oidc_sess = get_active_oidc_session()
-    has_token = bool(oidc_sess.get("accessToken"))
+    cur_jur = get_active_jurisdiction()
+    all_jurisdictions = list(APIGEE_JURISDICTIONS.values())
 
-    if oidc_sess.get("email") and has_token:
+    # If in-memory/disk session is missing tokens but request has explicit tokens, restore session
+    if explicit_token and (
+        not oidc_sess.get("accessToken")
+        or (oidc_sess.get("expiresAt") and time.time() >= float(oidc_sess["expiresAt"]))
+    ):
+        try:
+            tok_info = validate_google_oauth_token(explicit_token)
+            tok_email = tok_info.get("email") or explicit_account or "google-user"
+            oidc_sess = {
+                "email": tok_email,
+                "name": tok_email,
+                "accessToken": explicit_token,
+                "refreshToken": explicit_refresh_token or oidc_sess.get("refreshToken"),
+                "expiresIn": tok_info.get("expiresIn", 3600),
+                "expiresAt": time.time() + float(tok_info.get("expiresIn", 3600)),
+                "authMethod": "REQUEST_BEARER_TOKEN",
+            }
+            set_active_oidc_session(oidc_sess)
+        except Exception:
+            pass
+    elif explicit_refresh_token and not oidc_sess.get("refreshToken"):
+        oidc_sess["refreshToken"] = explicit_refresh_token
+        set_active_oidc_session(oidc_sess)
+
+    token = oidc_sess.get("accessToken")
+    refresh_tok = oidc_sess.get("refreshToken") or explicit_refresh_token
+    token_valid = False
+    token_expired = False
+    expires_in = None
+
+    if token:
+        expires_at = oidc_sess.get("expiresAt")
+        # Proactive refresh: if token expires within 300 seconds (5 mins) and refresh token is available
+        if expires_at and time.time() >= (float(expires_at) - 300) and refresh_tok:
+            refreshed = refresh_google_oauth_token(refresh_tok)
+            if refreshed:
+                oidc_sess = get_active_oidc_session()
+                token = oidc_sess.get("accessToken")
+                token_valid = True
+                token_expired = False
+                expires_in = oidc_sess.get("expiresIn")
+            elif time.time() >= float(expires_at):
+                token_valid = False
+                token_expired = True
+            else:
+                token_valid = True
+                token_expired = False
+                expires_in = max(0, int(float(expires_at) - time.time()))
+        elif expires_at and time.time() >= float(expires_at):
+            # Token expired: attempt automatic refresh
+            if refresh_tok:
+                refreshed = refresh_google_oauth_token(refresh_tok)
+                if refreshed:
+                    oidc_sess = get_active_oidc_session()
+                    token = oidc_sess.get("accessToken")
+                    token_valid = True
+                    token_expired = False
+                    expires_in = oidc_sess.get("expiresIn")
+                else:
+                    token_valid = False
+                    token_expired = True
+            else:
+                token_valid = False
+                token_expired = True
+        else:
+            # Token within valid lifetime window
+            token_valid = True
+            token_expired = False
+            expires_in = max(0, int(float(expires_at) - time.time())) if expires_at else 3600
+    elif refresh_tok:
+        # No access token loaded in memory, but refresh token exists: refresh immediately
+        refreshed = refresh_google_oauth_token(refresh_tok)
+        if refreshed:
+            oidc_sess = get_active_oidc_session()
+            token = oidc_sess.get("accessToken")
+            token_valid = True
+            token_expired = False
+            expires_in = oidc_sess.get("expiresIn")
+        else:
+            token_valid = False
+            token_expired = True
+
+    if oidc_sess.get("email") and token_valid:
+        rem_seconds = (
+            max(0, int(float(oidc_sess["expiresAt"]) - time.time()))
+            if oidc_sess.get("expiresAt")
+            else (int(expires_in) if expires_in else 3600)
+        )
         return {
             "authenticated": True,
             "hasUserToken": True,
+            "tokenValid": True,
+            "tokenExpired": False,
+            "expiresIn": rem_seconds,
             "isServiceAccountFallback": False,
             "activeAccount": oidc_sess["email"],
             "accounts": [{"account": oidc_sess["email"], "status": "ACTIVE"}],
             "projectId": None,
-            "apigeeBaseUrl": APIGEE_BASE_URL,
+            "apigeeBaseUrl": get_apigee_base_url(),
+            "controlPlaneJurisdiction": cur_jur["code"],
+            "controlPlaneEndpoint": cur_jur["endpoint"],
+            "jurisdiction": cur_jur,
+            "jurisdictions": all_jurisdictions,
+            "authSource": oidc_sess["email"],
+            "authMethod": oidc_sess.get("authMethod", "USER_TOKEN"),
+            "userInfo": {
+                "email": oidc_sess.get("email"),
+                "name": oidc_sess.get("name"),
+                "picture": oidc_sess.get("picture"),
+            },
+            "gcloudPath": _find_gcloud_bin(),
+            "isCloudRun": bool(os.environ.get("K_SERVICE")),
+        }
+
+    if oidc_sess.get("email") and token_expired:
+        return {
+            "authenticated": False,
+            "hasUserToken": False,
+            "tokenValid": False,
+            "tokenExpired": True,
+            "isServiceAccountFallback": False,
+            "activeAccount": oidc_sess["email"],
+            "accounts": [{"account": oidc_sess["email"], "status": "EXPIRED"}],
+            "projectId": None,
+            "apigeeBaseUrl": get_apigee_base_url(),
+            "controlPlaneJurisdiction": cur_jur["code"],
+            "controlPlaneEndpoint": cur_jur["endpoint"],
+            "jurisdiction": cur_jur,
+            "jurisdictions": all_jurisdictions,
             "authSource": oidc_sess["email"],
             "authMethod": oidc_sess.get("authMethod", "USER_TOKEN"),
             "userInfo": {
@@ -293,11 +664,17 @@ def get_gcp_user_auth_info() -> Dict[str, Any]:
         return {
             "authenticated": True,
             "hasUserToken": False,
+            "tokenValid": False,
+            "tokenExpired": False,
             "isServiceAccountFallback": True,
             "activeAccount": oidc_sess["email"],
             "accounts": [{"account": oidc_sess["email"], "status": "ACTIVE"}],
             "projectId": None,
-            "apigeeBaseUrl": APIGEE_BASE_URL,
+            "apigeeBaseUrl": get_apigee_base_url(),
+            "controlPlaneJurisdiction": cur_jur["code"],
+            "controlPlaneEndpoint": cur_jur["endpoint"],
+            "jurisdiction": cur_jur,
+            "jurisdictions": all_jurisdictions,
             "authSource": oidc_sess["email"],
             "authMethod": "GOOGLE_CLOUD_IAP_OIDC",
             "userInfo": {
@@ -372,15 +749,24 @@ def get_gcp_user_auth_info() -> Dict[str, Any]:
                                 "email": tok_email,
                                 "name": tok_email,
                                 "accessToken": tok,
+                                "expiresIn": tok_info.get("expiresIn"),
+                                "expiresAt": time.time() + float(tok_info.get("expiresIn", 3600)),
                                 "authMethod": "LOCAL_GCLOUD_ADC",
                             })
                             return {
                                 "authenticated": True,
                                 "hasUserToken": True,
+                                "tokenValid": True,
+                                "tokenExpired": False,
+                                "expiresIn": tok_info.get("expiresIn", 3600),
                                 "activeAccount": tok_email,
                                 "accounts": all_accounts or [{"account": tok_email, "status": "ACTIVE"}],
                                 "projectId": project_id,
-                                "apigeeBaseUrl": APIGEE_BASE_URL,
+                                "apigeeBaseUrl": get_apigee_base_url(),
+                                "controlPlaneJurisdiction": cur_jur["code"],
+                                "controlPlaneEndpoint": cur_jur["endpoint"],
+                                "jurisdiction": cur_jur,
+                                "jurisdictions": all_jurisdictions,
                                 "authSource": tok_email,
                                 "authMethod": "LOCAL_GCLOUD_ADC",
                                 "gcloudPath": gcloud_bin,
@@ -393,6 +779,7 @@ def get_gcp_user_auth_info() -> Dict[str, Any]:
 
     # ADC check: Only end-user credentials count as authenticated user account
     runtime_sa: Optional[str] = None
+    has_token = False
     if not active_account:
         try:
             creds, default_proj = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
@@ -403,24 +790,37 @@ def get_gcp_user_auth_info() -> Dict[str, Any]:
                 all_accounts.append({"account": active_account, "status": "ACTIVE"})
                 auth_source = active_account
                 has_token = True
+                token_valid = True
+                token_expired = False
             else:
                 runtime_sa = getattr(creds, "service_account_email", None)
                 auth_source = "No active GCP User Account"
                 has_token = False
+                token_valid = False
+                token_expired = False
         except Exception:
             auth_source = "No active GCP User Account"
             has_token = False
+            token_valid = False
+            token_expired = False
     else:
         auth_source = active_account
 
     return {
-        "authenticated": bool(active_account),
+        "authenticated": bool(active_account and (has_token or token_valid)),
         "hasUserToken": has_token,
+        "tokenValid": token_valid,
+        "tokenExpired": token_expired,
+        "expiresIn": expires_in,
         "isServiceAccountFallback": bool(runtime_sa and not has_token),
         "activeAccount": active_account,
         "accounts": all_accounts,
         "projectId": project_id,
-        "apigeeBaseUrl": APIGEE_BASE_URL,
+        "apigeeBaseUrl": get_apigee_base_url(),
+        "controlPlaneJurisdiction": cur_jur["code"],
+        "controlPlaneEndpoint": cur_jur["endpoint"],
+        "jurisdiction": cur_jur,
+        "jurisdictions": all_jurisdictions,
         "authSource": auth_source,
         "authMethod": "LOCAL_ADC" if gcloud_bin else "NONE",
         "gcloudPath": gcloud_bin,
@@ -574,7 +974,7 @@ def _create_authenticated_session(
             }
         )
         user_label = oidc_sess.get("email") or target_account or "User"
-        return sess, APIGEE_BASE_URL, f"GCP User Token: {user_label} (OAuth2 API)"
+        return sess, get_apigee_base_url(), f"GCP User Token: {user_label} (OAuth2 API)"
 
     # 2. Local gcloud CLI fallback (runs on laptop where gcloud CLI is installed)
     gcloud_bin = _find_gcloud_bin()
@@ -596,7 +996,7 @@ def _create_authenticated_session(
                         }
                     )
                     user_label = target_account or "Local User"
-                    return sess, APIGEE_BASE_URL, f"GCP User: {user_label} (Local ADC)"
+                    return sess, get_apigee_base_url(), f"GCP User: {user_label} (Local ADC)"
             except Exception:
                 pass
 
@@ -608,7 +1008,7 @@ def _create_authenticated_session(
             sess.headers.update({"Accept": "application/json"})
             return (
                 sess,
-                APIGEE_BASE_URL,
+                get_apigee_base_url(),
                 f"Application Default Credentials: {target_account or 'ADC'} (User Credentials)",
             )
     except Exception:
@@ -623,7 +1023,7 @@ def _create_authenticated_session(
         user_label = target_account or "User"
         return (
             sess,
-            APIGEE_BASE_URL,
+            get_apigee_base_url(),
             f"Service Account: {sa_email} (Logged User: {user_label})",
         )
     except Exception as exc:
@@ -640,7 +1040,8 @@ def _get_thread_session(
 ) -> Tuple[requests.Session, str, str]:
     """Get or create a thread-local authenticated requests.Session for concurrent worker threads."""
     tok_fingerprint = (explicit_token.strip()[-12:] if explicit_token else "") or get_active_oidc_session().get("accessToken", "")[-12:]
-    cache_key = f"{account or 'default'}:{tok_fingerprint}"
+    cur_jur = get_active_jurisdiction()["code"]
+    cache_key = f"{account or 'default'}:{tok_fingerprint}:{cur_jur}"
     if (
         not hasattr(_thread_local, "session")
         or getattr(_thread_local, "cache_key", None) != cache_key
@@ -1406,12 +1807,15 @@ def collect_all_organizations_sync(
         )
     )
 
+    cur_jur = get_active_jurisdiction()
     raw_payload: Dict[str, Any] = {
         "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source": "LIVE_APIGEE_API",
         "authSource": auth_source,
         "account": discovery.get("account"),
-        "apiEndpoint": discovery.get("apiEndpoint"),
+        "apiEndpoint": discovery.get("apiEndpoint") or (get_apigee_base_url() + "/organizations"),
+        "controlPlaneJurisdiction": cur_jur.get("code", "global"),
+        "jurisdiction": cur_jur,
         "totalAuthorizedOrgs": discovery.get("totalAuthorizedOrgs", len(org_payloads)),
         "organizations": org_payloads,
     }

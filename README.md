@@ -14,6 +14,9 @@
 
 **Apigee Entitlement Tracker** is an enterprise cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
 
+> [!IMPORTANT]
+> **Entitlement Model Support**: This tool **does not support the legacy Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model** (Proxy Deployment Units, Environment Units, and Yearly API Calls).
+
 ---
 
 ## 1. Problem Solved
@@ -30,6 +33,7 @@ Enterprises typically manage several organizations across business units, enviro
 **Apigee Entitlement Tracker** solves this by providing:
 1. **Unified Single-Pane-of-Glass Interface**:
    * Automatically discovers all Apigee X and Hybrid organizations your Google identity is authorized to access.
+   * **Full DRZ (Data Residency Zones) & Regional Control Plane Support**: Allows selection of non-global Apigee Control Plane Hosting Jurisdictions (US, EU, Germany, France, Switzerland, Canada, Australia, India, Japan, Qatar, Saudi Arabia, Israel, or Global default).
    * Real-time compliance indicators and status badges (`WITHIN COMMITMENT`, `OVERAGE RISK`, `ABOVE LIMIT`) across all 3 entitlement dimensions.
    * Multi-organization and multi-environment filtering.
    * Visual time-series analytics for historical PDU capacity trends and monthly API call run-rate pacing over your active contract year.
@@ -71,8 +75,26 @@ flowchart TD
     Engine --> Dashboard[Unified Web Dashboard & CSV Exporter]
 ```
 
-1. **Apigee Management API (`apigee.googleapis.com/v1`)**:
-   * **Organization Discovery**: Calls `GET /v1/organizations` using the caller's OAuth token to enumerate all organizations the user has access to.
+1. **Apigee Management API**:
+   * **Control Plane Hosting Jurisdictions & Data Residency (DRZ)**: Full support for non-global hosting jurisdictions as defined in the official [Google Cloud Apigee Locations Documentation](https://docs.cloud.google.com/apigee/docs/locations#available-apigee-api-control-plane-hosting-jurisdictions). Requests route automatically to the selected control plane endpoint:
+
+     | Jurisdiction | Code | Region | Dedicated Endpoint |
+     | :--- | :--- | :--- | :--- |
+     | **Global (Default)** | `global` | Global | `https://apigee.googleapis.com/v1` |
+     | **United States** | `us` | Americas | `https://apigee.us.rep.googleapis.com/v1` |
+     | **Canada** | `ca` | Americas | `https://ca-apigee.googleapis.com/v1` |
+     | **European Union** | `eu` | Europe | `https://apigee.eu.rep.googleapis.com/v1` |
+     | **Germany** | `de` | Europe | `https://de-apigee.googleapis.com/v1` |
+     | **France** (`europe-west9`) | `fr` | Europe | `https://fr-apigee.googleapis.com/v1` |
+     | **Switzerland** (`europe-west6`) | `ch` | Europe | `https://ch-apigee.googleapis.com/v1` |
+     | **Australia** | `au` | Asia-Pacific | `https://au-apigee.googleapis.com/v1` |
+     | **India** | `in` | Asia-Pacific | `https://apigee.in.rep.googleapis.com/v1` |
+     | **Japan** | `jp` | Asia-Pacific | `https://jp-apigee.googleapis.com/v1` |
+     | **Qatar** (`me-central1`) | `qa` | Middle East | `https://qa-apigee.googleapis.com/v1` |
+     | **Saudi Arabia** (`me-central2`) | `sa` | Middle East | `https://sa-apigee.googleapis.com/v1` |
+     | **Israel** (`me-west1`) | `il` | Middle East | `https://il-apigee.googleapis.com/v1` |
+
+   * **Organization Discovery**: Calls `GET /v1/organizations` using the caller's OAuth token to enumerate all organizations the user has access to within the active jurisdiction.
    * **Regional Footprint & Attachments**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regions each environment is attached to (instance attachments).
    * **Environment Inventory**: Calls `GET /v1/organizations/{org}/environments` to inspect each environment.
    * **Deployments Inspection**: Calls `GET /v1/organizations/{org}/environments/{env}/deployments` to inspect every active proxy and shared flow revision, automatically classifying proxies as Standard or Extensible.
@@ -175,8 +197,11 @@ python3 app.py
   ```
 
 #### How to Use Locally
-1. **Login Screen**: Your active `gcloud` user account is automatically detected. Click **Enter / Continue** to start the discovery scan.
-2. **Live Discovery**: A progress bar streams real-time status while querying organizations, environments, and deployments.
+1. **Login & Jurisdiction Selection**:
+   * Select your **Control Plane Hosting Jurisdiction** (Global or specific regional DRZ endpoint).
+   * Your active `gcloud` user account is automatically detected. Click **Enter Dashboard** to start the discovery scan.
+   * To switch jurisdictions or change account at any time, click the **Change account / Re-authenticate / Change Control Plane Jurisdiction** button in the top navigation bar.
+2. **Live Discovery**: A modal progress popup streams real-time status while querying organizations, environments, and deployments.
 3. **Configure Entitlements**: Expand the top **Contract & Entitlement Parameters** card and configure:
    * **Contract Starting Date** (e.g. `2026-01-01`)
    * **PDU Entitlement Limit** (e.g. `1500`)
@@ -191,8 +216,11 @@ python3 app.py
 #### Headless CLI Audit Mode (Optional)
 Run an automated audit and generate CSV reports without starting the web server:
 ```bash
-# Scan live organizations and export CSV reports to ./exports
+# Scan live organizations in Global control plane and export CSV reports
 python3 app.py --scan-live --export-dir ./exports --no-open-browser
+
+# Scan live organizations for a specific DRZ jurisdiction (e.g. EU or US)
+python3 app.py --jurisdiction eu --scan-live --export-dir ./exports --no-open-browser
 
 # Wipe cached scan files (data/*.json)
 python3 app.py --clean

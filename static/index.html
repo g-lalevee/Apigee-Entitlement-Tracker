@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261005-6" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261011-1" />
 </head>
 <body>
 
@@ -19,22 +19,51 @@
         <img
           src="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png"
           alt="Apigee"
-          class="brand-logo brand-logo-lg"
+          class="brand-logo login-brand-logo"
         />
         <h1>Apigee Entitlement Tracker</h1>
-        <p class="login-brand-subtitle">Capacity Audit &amp; Contract Compliance</p>
       </div>
 
-      <!-- Active User Account Card -->
-      <div class="glass-subcard login-account-card">
-        <div class="eyebrow">Logged-in User Account</div>
-        <div id="login-active-email" class="active-session-email">Detecting...</div>
+      <!-- Control Plane Hosting Jurisdiction Selector (Global or Regional DRZ) -->
+      <div class="glass-subcard login-account-card login-jurisdiction-card">
+        <label for="select-control-plane" class="eyebrow" style="display: block; font-size: 0.65rem; margin-bottom: 0.2rem; cursor: pointer; letter-spacing: 0.05em;">
+          Control Plane Jurisdiction
+        </label>
+        <select id="select-control-plane" class="custom-select jurisdiction-select" aria-label="Select Apigee Control Plane Hosting Jurisdiction">
+          <optgroup label="Global (Default)">
+            <option value="global" selected>Global</option>
+          </optgroup>
+          <optgroup label="Americas">
+            <option value="us">United States (us)</option>
+            <option value="ca">Canada (ca)</option>
+          </optgroup>
+          <optgroup label="Europe">
+            <option value="eu">European Union (eu)</option>
+            <option value="de">Germany (de)</option>
+            <option value="fr">France (fr, europe-west9)</option>
+            <option value="ch">Switzerland (ch, europe-west6)</option>
+          </optgroup>
+          <optgroup label="Asia-Pacific">
+            <option value="au">Australia (au)</option>
+            <option value="in">India (in)</option>
+            <option value="jp">Japan (jp)</option>
+          </optgroup>
+          <optgroup label="Middle East">
+            <option value="qa">Qatar (qa, me-central1)</option>
+            <option value="sa">Saudi Arabia (sa, me-central2)</option>
+            <option value="il">Israel (il, me-west1)</option>
+          </optgroup>
+        </select>
+        <div id="jurisdiction-endpoint-desc" class="jurisdiction-endpoint-hint" style="margin-top: 0.2rem; font-size: 0.68rem; color: var(--text-muted);">
+          Endpoint: <code>https://apigee.googleapis.com/v1</code>
+        </div>
       </div>
 
-      <!-- Action Buttons: Exactly 1 Enter button, 1 Authenticate/Change Account button -->
+
+      <!-- Action Buttons: Exactly 1 Enter button (frozen if token expired/missing), 1 Authenticate/Change Account button -->
       <div class="login-actions-group">
-        <button id="btn-enter-app" type="button" class="btn btn-primary btn-lg btn-enter-action">
-          Enter Dashboard &rarr;
+        <button id="btn-enter-app" type="button" class="btn btn-primary btn-lg btn-enter-action btn-frozen" disabled title="Authentication mandatory: token expired or missing">
+          <span id="btn-enter-app-text">&#128274; Enter Dashboard</span>
         </button>
 
         <button id="btn-authenticate-account" type="button" class="btn btn-google-login">
@@ -50,23 +79,6 @@
 
       <!-- Error message container -->
       <div id="login-error-box" class="login-error-box" style="display: none;"></div>
-
-      <!-- Live Scan & Loading Progress (Matching Home Page Refresh Live Scan style) -->
-      <div id="login-scan-progress" class="dashboard-progress-banner glass-card" style="display: none; margin-top: 1.25rem;">
-        <div class="dashboard-progress-inner">
-          <div class="dashboard-progress-top">
-            <div class="dashboard-progress-label">
-              <span class="scan-pulse-dot"></span>
-              <strong id="login-progress-status">Loading Apigee Entitlements...</strong>
-              <span id="login-progress-detail" class="dashboard-progress-sub">Connecting to APIs</span>
-            </div>
-            <span id="login-progress-percent" class="scan-progress-percent">0%</span>
-          </div>
-          <div class="scan-progress-bar-track">
-            <div id="login-progress-bar-fill" class="scan-progress-bar-fill" style="width: 0%;"></div>
-          </div>
-        </div>
-      </div>
     </section>
 
 
@@ -111,6 +123,7 @@
               <div class="brand-subtitle-row">
                 <span class="brand-subtitle" id="header-account-subtitle">GCP User: —</span>
                 <span id="header-token-badge" class="token-pill token-pill-active" style="display: none;">User Token Active</span>
+                <span id="header-jurisdiction-badge" class="token-pill jurisdiction-pill">Control Plane: Global</span>
               </div>
             </div>
           </div>
@@ -142,8 +155,8 @@
               id="btn-switch-account"
               type="button"
               class="btn btn-secondary btn-sm icon-btn"
-              title="Change Account / Re-authenticate"
-              aria-label="Change Account"
+              title="Change account / Re-authenticate / Change Control Plane Jurisdiction"
+              aria-label="Change account / Re-authenticate / Change Control Plane Jurisdiction"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M20 21v-2a4 4 0 0 0-3-3.87"></path>
@@ -239,9 +252,6 @@
 
             <div id="entitlement-config-body" class="entitlement-config-body">
               <div class="entitlement-body-top">
-                <p class="chart-subtitle" id="entitlement-config-subtitle">
-                  Permanently stored in <code>pdu_limit.json</code> &bull; Active Contract Year: <strong id="lbl-active-contract-period">2026-01-01 &rarr; 2027-01-01</strong>
-                </p>
                 <button id="btn-apply-limit" type="button" class="btn btn-primary btn-sm">
                   Save Parameters
                 </button>
@@ -624,8 +634,29 @@
     </div>
   </div>
 
+  <!-- Modal: Live Scan & Loading Progress Popup (Home Page) -->
+  <div id="modal-scan-progress" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="scan-modal-status">
+    <div class="modal-card glass-window scan-progress-modal-card">
+      <div class="modal-header scan-modal-header">
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+          <span class="scan-pulse-dot"></span>
+          <h3 id="scan-modal-status" style="margin: 0; font-size: 1.05rem; font-weight: 600;">Scanning Apigee Entitlements...</h3>
+        </div>
+        <span id="scan-modal-percent" class="scan-progress-percent">0%</span>
+      </div>
+      <div class="modal-body" style="padding-top: 0.5rem; padding-bottom: 1.25rem;">
+        <div id="scan-modal-detail" class="dashboard-progress-sub" style="margin-bottom: 0.85rem; font-size: 0.85rem; color: var(--text-secondary);">
+          Connecting to Apigee APIs...
+        </div>
+        <div class="scan-progress-bar-track">
+          <div id="scan-modal-progress-fill" class="scan-progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast-notification" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261005-6"></script>
+  <script src="/static/app.js?v=20261012-7"></script>
 
 
 </body>

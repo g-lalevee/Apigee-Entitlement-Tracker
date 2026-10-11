@@ -16,6 +16,7 @@ import html
 import json
 import os
 import pathlib
+import time
 from typing import Any, Dict, List, Optional
 
 import uvicorn
@@ -33,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from collector import (
+    APIGEE_JURISDICTIONS,
     DEFAULT_GOOGLE_CLIENT_ID,
     build_google_oidc_auth_url,
     clear_active_oidc_session,
@@ -40,11 +42,15 @@ from collector import (
     discover_authorized_organizations,
     exchange_google_oidc_code,
     fetch_monitoring_pdu_timeseries,
+    get_active_jurisdiction,
     get_active_oidc_session,
+    get_apigee_base_url,
     get_demo_dataset,
     get_gcp_user_auth_info,
     populate_contract_api_calls,
     recalculate_portfolio,
+    refresh_google_oauth_token,
+    set_active_jurisdiction,
     set_active_oidc_session,
     switch_or_login_gcp_user,
     validate_google_oauth_token,
@@ -78,6 +84,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "regionOverrides": {},           # Map of "org:env" -> region count
     "orgFilter": [],
     "gcpAccount": None,
+    "controlPlaneJurisdiction": "global",
 }
 
 
@@ -136,6 +143,9 @@ def load_config() -> Dict[str, Any]:
     else:
         save_entitlement_limits(cfg)
 
+    if cfg.get("controlPlaneJurisdiction"):
+        set_active_jurisdiction(cfg["controlPlaneJurisdiction"])
+
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return cfg
@@ -153,32 +163,95 @@ def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(disk_cfg, indent=2), encoding="utf-8")
 
 
-def load_raw_dataset() -> Dict[str, Any]:
-    if RAW_CACHE_PATH.exists():
+def get_raw_cache_path(jurisdiction_code: Optional[str] = None) -> pathlib.Path:
+    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    return DATA_DIR / f"latest_raw_{jur}.json"
+
+
+def get_discovered_orgs_path(jurisdiction_code: Optional[str] = None) -> pathlib.Path:
+    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    return DATA_DIR / f"discovered_orgs_{jur}.json"
+
+
+def load_raw_dataset(jurisdiction_code: Optional[str] = None) -> Dict[str, Any]:
+    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    target_path = get_raw_cache_path(jur)
+    if not target_path.exists() and jur == "global" and RAW_CACHE_PATH.exists():
+        target_path = RAW_CACHE_PATH
+
+    if target_path.exists():
         try:
-            return json.loads(RAW_CACHE_PATH.read_text(encoding="utf-8"))
+            data = json.loads(target_path.read_text(encoding="utf-8"))
+            data_jur = str(data.get("controlPlaneJurisdiction") or "").strip().lower()
+            if not data_jur and data.get("apiEndpoint"):
+                for k, v in APIGEE_JURISDICTIONS.items():
+                    if v["endpoint"] in data["apiEndpoint"]:
+                        data_jur = k
+                        break
+            if not data_jur:
+                data_jur = "global"
+
+            # Strict isolation check: ensure data matches the requested jurisdiction!
+            if data_jur == jur:
+                return data
         except Exception:
             pass
+
+    cur_jur_info = APIGEE_JURISDICTIONS.get(jur) or get_active_jurisdiction()
+    if jur != "global":
+        return {
+            "source": "NEW",
+            "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "controlPlaneJurisdiction": jur,
+            "jurisdiction": cur_jur_info,
+            "apiEndpoint": cur_jur_info.get("endpoint", "") + "/organizations",
+            "totalAuthorizedOrgs": 0,
+            "organizations": [],
+        }
+
     demo = get_demo_dataset()
-    save_raw_dataset(demo, merge_existing=False)
     return demo
 
 
-def save_raw_dataset(raw_data: Dict[str, Any], merge_existing: bool = True) -> Dict[str, Any]:
+def save_raw_dataset(
+    raw_data: Dict[str, Any],
+    merge_existing: bool = True,
+    jurisdiction_code: Optional[str] = None,
+) -> Dict[str, Any]:
     sanitized = dict(raw_data)
     sanitized.pop("account", None)
     if str(sanitized.get("authSource", "")).startswith("GCP User"):
         sanitized["authSource"] = "GCP User Account (OAuth2)"
 
+    cur_jur_info = get_active_jurisdiction()
+    jur = (
+        jurisdiction_code
+        or sanitized.get("controlPlaneJurisdiction")
+        or cur_jur_info.get("code", "global")
+    ).strip().lower()
+
+    sanitized["controlPlaneJurisdiction"] = jur
+    sanitized["jurisdiction"] = APIGEE_JURISDICTIONS.get(jur) or cur_jur_info
+    target_path = get_raw_cache_path(jur)
+
     if (
         merge_existing
-        and RAW_CACHE_PATH.exists()
+        and target_path.exists()
         and sanitized.get("source") == "LIVE_APIGEE_API"
     ):
         try:
-            existing = json.loads(RAW_CACHE_PATH.read_text(encoding="utf-8"))
+            existing = json.loads(target_path.read_text(encoding="utf-8"))
+            existing_jur = str(existing.get("controlPlaneJurisdiction") or "global").strip().lower()
+            if not existing_jur and existing.get("apiEndpoint"):
+                for k, v in APIGEE_JURISDICTIONS.items():
+                    if v["endpoint"] in existing["apiEndpoint"]:
+                        existing_jur = k
+                        break
+
+            # STRICT CHECK: NEVER merge organizations across different jurisdictions!
             if (
                 existing.get("source") == "LIVE_APIGEE_API"
+                and existing_jur == jur
                 and existing.get("organizations")
                 and sanitized.get("organizations")
             ):
@@ -214,7 +287,7 @@ def save_raw_dataset(raw_data: Dict[str, Any], merge_existing: bool = True) -> D
         except Exception:
             pass
 
-    RAW_CACHE_PATH.write_text(json.dumps(sanitized, indent=2), encoding="utf-8")
+    target_path.write_text(json.dumps(sanitized, indent=2), encoding="utf-8")
     return sanitized
 
 
@@ -264,9 +337,10 @@ def append_history_snapshot(portfolio: Dict[str, Any]) -> List[Dict[str, Any]]:
     return history
 
 
-def get_current_portfolio() -> Dict[str, Any]:
+def get_current_portfolio(jurisdiction_code: Optional[str] = None) -> Dict[str, Any]:
     cfg = load_config()
-    raw = load_raw_dataset()
+    cur_jur_code = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    raw = load_raw_dataset(cur_jur_code)
     portfolio = recalculate_portfolio(
         raw,
         entitlement_pdu=cfg.get("entitlementPdu", 1500),
@@ -281,6 +355,10 @@ def get_current_portfolio() -> Dict[str, Any]:
         history = append_history_snapshot(portfolio)
     portfolio["history"] = history
     portfolio["auth"] = get_gcp_user_auth_info()
+    cur_jur = APIGEE_JURISDICTIONS.get(cur_jur_code) or get_active_jurisdiction()
+    portfolio["jurisdiction"] = cur_jur
+    portfolio["controlPlaneJurisdiction"] = cur_jur["code"]
+    portfolio["controlPlaneEndpoint"] = cur_jur["endpoint"]
     return portfolio
 
 
@@ -309,6 +387,11 @@ class AuthLoginRequest(BaseModel):
     account: Optional[str] = None
     triggerBrowserLogin: bool = False
     accessToken: Optional[str] = None
+    jurisdiction: Optional[str] = None
+
+
+class JurisdictionUpdateRequest(BaseModel):
+    jurisdiction: str
 
 
 class OidcTokenRequest(BaseModel):
@@ -320,6 +403,7 @@ class LiveScanRequest(BaseModel):
     account: Optional[str] = None
     accessToken: Optional[str] = None
     orgFilter: Optional[List[str]] = None
+    jurisdiction: Optional[str] = None
 
 
 @app.middleware("http")
@@ -379,7 +463,16 @@ def get_request_user_account(request: Request, explicit_account: Optional[str] =
 
 @app.get("/api/auth-status")
 async def check_auth_status(request: Request) -> JSONResponse:
-    info = await asyncio.to_thread(get_gcp_user_auth_info)
+    auth_tok = extract_bearer_token(request)
+    cookie_refresh_tok = request.cookies.get("apigee_refresh_token")
+    cookie_access_tok = request.cookies.get("apigee_access_token")
+    req_account = get_request_user_account(request)
+    info = await asyncio.to_thread(
+        get_gcp_user_auth_info,
+        explicit_token=auth_tok or cookie_access_tok,
+        explicit_refresh_token=cookie_refresh_tok,
+        explicit_account=req_account,
+    )
     iap_user = request.headers.get("x-goog-authenticated-user-email") or request.headers.get("X-Goog-Authenticated-User-Email")
     if iap_user:
         clean_user = iap_user.split(":")[-1] if ":" in iap_user else iap_user
@@ -394,14 +487,32 @@ async def check_auth_status(request: Request) -> JSONResponse:
         info["accounts"] = accounts
 
     bearer_tok = extract_bearer_token(request)
-    if bearer_tok and not info.get("hasUserToken"):
+    if bearer_tok:
         try:
             tok_info = await asyncio.to_thread(validate_google_oauth_token, bearer_tok)
             info["hasUserToken"] = True
+            info["tokenValid"] = True
+            info["tokenExpired"] = False
+            info["expiresIn"] = tok_info.get("expiresIn")
             if not info.get("activeAccount"):
                 info["activeAccount"] = tok_info.get("email")
+                info["authenticated"] = True
         except Exception:
-            pass
+            if not info.get("hasUserToken"):
+                info["tokenValid"] = False
+                info["tokenExpired"] = True
+                info["hasUserToken"] = False
+
+    # Ensure tokenValid & tokenExpired flags are strictly set
+    token_valid = bool(info.get("tokenValid", False) and info.get("hasUserToken", False))
+    token_expired = bool(info.get("tokenExpired", False))
+    info["tokenValid"] = token_valid
+    info["tokenExpired"] = token_expired
+    cur_jur = get_active_jurisdiction()
+    info["jurisdiction"] = cur_jur
+    info["controlPlaneJurisdiction"] = cur_jur["code"]
+    info["controlPlaneEndpoint"] = cur_jur["endpoint"]
+    info["jurisdictions"] = list(APIGEE_JURISDICTIONS.values())
 
     return JSONResponse(
         info,
@@ -420,8 +531,6 @@ async def api_oidc_auth_url(
     host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
     base_url = f"{forwarded_proto}://{host}"
     redirect_uri = f"{base_url}/api/auth/oidc/callback"
-
-    clear_active_oidc_session()
 
     custom_client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     custom_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
@@ -568,8 +677,10 @@ async def api_oidc_callback(
     try {{
       sessionStorage.setItem('apigee_user_access_token', {json.dumps(access_token)});
       sessionStorage.setItem('apigee_user_email', {json.dumps(email)});
+      localStorage.setItem('apigee_user_access_token', {json.dumps(access_token)});
+      localStorage.setItem('apigee_user_email', {json.dumps(email)});
     }} catch (e) {{
-      console.warn('sessionStorage error', e);
+      console.warn('storage error', e);
     }}
     window.location.replace('/?authenticated=1');
   </script>
@@ -577,22 +688,23 @@ async def api_oidc_callback(
 </html>"""
 
         resp = HTMLResponse(content=html_content)
+        is_https = (forwarded_proto == "https") or (request.url.scheme == "https")
         if access_token:
             resp.set_cookie(
                 key="apigee_access_token",
                 value=access_token,
                 max_age=3600,
                 httponly=True,
-                secure=True,
+                secure=is_https,
                 samesite="lax",
             )
         if refresh_token:
             resp.set_cookie(
                 key="apigee_refresh_token",
                 value=refresh_token,
-                max_age=30 * 86400,
+                max_age=180 * 86400,
                 httponly=True,
-                secure=True,
+                secure=is_https,
                 samesite="lax",
             )
         return resp
@@ -633,9 +745,50 @@ async def api_oidc_logout() -> JSONResponse:
 
 
 
+@app.get("/api/jurisdictions")
+async def api_get_jurisdictions() -> JSONResponse:
+    """Return list of supported Apigee Control Plane Hosting Jurisdictions and the active one."""
+    return JSONResponse({
+        "current": get_active_jurisdiction(),
+        "jurisdictions": list(APIGEE_JURISDICTIONS.values()),
+    })
+
+
+@app.post("/api/jurisdiction")
+async def api_set_jurisdiction(payload: JurisdictionUpdateRequest) -> JSONResponse:
+    """Set the active Apigee Control Plane Hosting Jurisdiction."""
+    prev_jur = get_active_jurisdiction()["code"]
+    jur_info = set_active_jurisdiction(payload.jurisdiction)
+    cfg = load_config()
+    cfg["controlPlaneJurisdiction"] = jur_info["code"]
+    save_config(cfg)
+    if prev_jur != jur_info["code"] and DISCOVERED_ORGS_PATH.exists():
+        try:
+            DISCOVERED_ORGS_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return JSONResponse({
+        "status": "success",
+        "jurisdiction": jur_info,
+        "jurisdictions": list(APIGEE_JURISDICTIONS.values()),
+    })
+
+
 @app.post("/api/auth/login")
 async def api_auth_login(request: Request, payload: AuthLoginRequest) -> JSONResponse:
     """Switch account or initiate Google OIDC login without requiring local gcloud CLI."""
+    if payload.jurisdiction:
+        prev_jur = get_active_jurisdiction()["code"]
+        jur_info = set_active_jurisdiction(payload.jurisdiction)
+        cfg = load_config()
+        cfg["controlPlaneJurisdiction"] = jur_info["code"]
+        save_config(cfg)
+        if prev_jur != jur_info["code"] and DISCOVERED_ORGS_PATH.exists():
+            try:
+                DISCOVERED_ORGS_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
     redirect_uri = f"{forwarded_proto}://{host}/api/auth/oidc/callback"
@@ -692,16 +845,22 @@ async def api_discover_organizations(
     request: Request,
     refresh: bool = Query(default=True, description="Query live GET /v1/organizations"),
     account: Optional[str] = Query(default=None, description="Optional GCP user account email"),
+    jurisdiction: Optional[str] = Query(default=None, description="Control plane hosting jurisdiction"),
 ) -> JSONResponse:
+    if jurisdiction:
+        set_active_jurisdiction(jurisdiction)
     user_token = extract_bearer_token(request)
     user_account = get_request_user_account(request, account)
+    cur_jur_code = get_active_jurisdiction()["code"]
+    disc_path = get_discovered_orgs_path(cur_jur_code)
     existing_orgs = []
-    if DISCOVERED_ORGS_PATH.exists():
+    if disc_path.exists():
         try:
-            cached = json.loads(DISCOVERED_ORGS_PATH.read_text(encoding="utf-8"))
-            existing_orgs = cached.get("organizations", [])
-            if not refresh:
-                return JSONResponse(cached)
+            cached = json.loads(disc_path.read_text(encoding="utf-8"))
+            if cached.get("controlPlaneJurisdiction") == cur_jur_code:
+                existing_orgs = cached.get("organizations", [])
+                if not refresh:
+                    return JSONResponse(cached)
         except Exception:
             pass
 
@@ -710,6 +869,8 @@ async def api_discover_organizations(
             account=user_account,
             explicit_token=user_token,
         )
+        discovered["controlPlaneJurisdiction"] = cur_jur_code
+        discovered["jurisdiction"] = get_active_jurisdiction()
 
         if existing_orgs:
             known = {o["organization"]: o for o in existing_orgs}
@@ -718,17 +879,26 @@ async def api_discover_organizations(
             merged = sorted(list(known.values()), key=lambda x: x["organization"].lower())
             discovered["organizations"] = merged
             discovered["totalAuthorizedOrgs"] = len(merged)
-        DISCOVERED_ORGS_PATH.write_text(json.dumps(discovered, indent=2), encoding="utf-8")
+        disc_path.write_text(json.dumps(discovered, indent=2), encoding="utf-8")
         return JSONResponse(discovered)
     except Exception as exc:
         if existing_orgs:
-            return JSONResponse({"organizations": existing_orgs, "totalAuthorizedOrgs": len(existing_orgs)})
+            return JSONResponse({
+                "organizations": existing_orgs,
+                "totalAuthorizedOrgs": len(existing_orgs),
+                "controlPlaneJurisdiction": cur_jur_code,
+            })
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/portfolio")
-async def api_get_portfolio(request: Request) -> JSONResponse:
-    portfolio = get_current_portfolio()
+async def api_get_portfolio(
+    request: Request,
+    jurisdiction: Optional[str] = Query(default=None, description="Apigee control plane jurisdiction"),
+) -> JSONResponse:
+    if jurisdiction:
+        set_active_jurisdiction(jurisdiction)
+    portfolio = get_current_portfolio(jurisdiction)
     user_account = get_request_user_account(request)
     user_token = extract_bearer_token(request)
     if "auth" not in portfolio or not isinstance(portfolio["auth"], dict):
@@ -747,25 +917,29 @@ async def api_get_monitoring_timeseries(
     days: int = Query(default=14, ge=1, le=90, description="Lookback window in days"),
     dimension: str = Query(default="pdu", description="Dimension: pdu | environments | calls"),
     refresh: bool = Query(default=False, description="Force live query to Cloud Monitoring / Apigee Analytics API"),
+    jurisdiction: Optional[str] = Query(default=None, description="Apigee control plane jurisdiction"),
 ) -> JSONResponse:
+    if jurisdiction:
+        set_active_jurisdiction(jurisdiction)
+    cur_jur_code = get_active_jurisdiction()["code"]
     cfg = load_config()
     dim = (dimension or "pdu").strip().lower()
     user_token = extract_bearer_token(request)
     user_account = get_request_user_account(request)
     contract_dt = str(cfg.get("contractStartDate") or "default").replace("-", "")
     cache_suffix = f"_{contract_dt}" if dim == "calls" else f"_{days}d"
-    cache_file = DATA_DIR / f"monitoring_ts_{dim}{cache_suffix}.json"
+    cache_file = DATA_DIR / f"monitoring_ts_{cur_jur_code}_{dim}{cache_suffix}.json"
 
     existing_cached: Optional[Dict[str, Any]] = None
     if cache_file.exists():
         try:
             existing_cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if not refresh:
+            if not refresh and existing_cached.get("controlPlaneJurisdiction", "global") == cur_jur_code:
                 return JSONResponse(existing_cached)
         except Exception:
             existing_cached = None
 
-    raw = load_raw_dataset()
+    raw = load_raw_dataset(cur_jur_code)
     try:
         ts_data = await fetch_monitoring_pdu_timeseries(
             raw_data=raw,
@@ -775,9 +949,15 @@ async def api_get_monitoring_timeseries(
             dimension=dim,
             contract_start_date=cfg.get("contractStartDate"),
         )
+        ts_data["controlPlaneJurisdiction"] = cur_jur_code
 
         # Merge existing multi-org series if live query only covered a subset of organizations
-        if existing_cached and existing_cached.get("series") and raw.get("source") == "LIVE_APIGEE_API":
+        if (
+            existing_cached
+            and existing_cached.get("series")
+            and existing_cached.get("controlPlaneJurisdiction", "global") == cur_jur_code
+            and raw.get("source") == "LIVE_APIGEE_API"
+        ):
             merged_series_map = {
                 (s.get("organization"), s.get("environment")): s
                 for s in existing_cached.get("series", [])
@@ -791,11 +971,11 @@ async def api_get_monitoring_timeseries(
 
         # If contract API calls were freshly populated into raw_data, persist raw_data too
         if dim == "calls":
-            save_raw_dataset(raw)
+            save_raw_dataset(raw, jurisdiction_code=cur_jur_code)
         cache_file.write_text(json.dumps(ts_data, indent=2), encoding="utf-8")
         return JSONResponse(ts_data)
     except Exception as exc:
-        if existing_cached:
+        if existing_cached and existing_cached.get("controlPlaneJurisdiction", "global") == cur_jur_code:
             return JSONResponse(existing_cached)
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -859,6 +1039,8 @@ async def api_update_settings(payload: SettingsUpdateRequest) -> JSONResponse:
 
 @app.post("/api/scan")
 async def api_trigger_live_scan(request: Request, payload: LiveScanRequest) -> JSONResponse:
+    if payload.jurisdiction:
+        set_active_jurisdiction(payload.jurisdiction)
     cfg = load_config()
     user_token = extract_bearer_token(request, payload.accessToken)
     user_account = get_request_user_account(request, payload.account)
@@ -879,7 +1061,7 @@ async def api_trigger_live_scan(request: Request, payload: LiveScanRequest) -> J
         cfg["orgFilter"] = payload.orgFilter
         save_config(cfg)
 
-    raw_data = save_raw_dataset(raw_data)
+    raw_data = save_raw_dataset(raw_data, jurisdiction_code=payload.jurisdiction)
     portfolio = recalculate_portfolio(
         raw_data,
         entitlement_pdu=cfg.get("entitlementPdu", 1500),
@@ -892,6 +1074,10 @@ async def api_trigger_live_scan(request: Request, payload: LiveScanRequest) -> J
     history = append_history_snapshot(portfolio)
     portfolio["history"] = history
     portfolio["auth"] = get_gcp_user_auth_info()
+    cur_jur = get_active_jurisdiction()
+    portfolio["jurisdiction"] = cur_jur
+    portfolio["controlPlaneJurisdiction"] = cur_jur["code"]
+    portfolio["controlPlaneEndpoint"] = cur_jur["endpoint"]
     return JSONResponse(portfolio)
 
 
@@ -901,6 +1087,7 @@ async def api_scan_stream(
     request: Request,
     account: Optional[str] = Query(default=None),
     token: Optional[str] = Query(default=None),
+    jurisdiction: Optional[str] = Query(default=None),
 ) -> StreamingResponse:
     """
     Real-time streaming endpoint for live Apigee scanning with progression bar support.
@@ -912,6 +1099,7 @@ async def api_scan_stream(
 
     body_token = None
     target_account = account
+    requested_jur = jurisdiction
     if request.method == "POST":
         try:
             body = await request.json()
@@ -920,8 +1108,13 @@ async def api_scan_stream(
                     target_account = body["account"]
                 if body.get("accessToken"):
                     body_token = body["accessToken"]
+                if body.get("jurisdiction"):
+                    requested_jur = body["jurisdiction"]
         except Exception:
             pass
+
+    if requested_jur:
+        set_active_jurisdiction(requested_jur)
 
     user_token = extract_bearer_token(request, token or body_token)
     final_account = get_request_user_account(request, target_account)
@@ -941,7 +1134,7 @@ async def api_scan_stream(
             )
 
 
-            raw_data = save_raw_dataset(raw_data)
+            raw_data = save_raw_dataset(raw_data, jurisdiction_code=requested_jur)
             portfolio = recalculate_portfolio(
                 raw_data,
                 entitlement_pdu=cfg.get("entitlementPdu", 1500),
@@ -954,6 +1147,10 @@ async def api_scan_stream(
             history = append_history_snapshot(portfolio)
             portfolio["history"] = history
             portfolio["auth"] = get_gcp_user_auth_info()
+            cur_jur = get_active_jurisdiction()
+            portfolio["jurisdiction"] = cur_jur
+            portfolio["controlPlaneJurisdiction"] = cur_jur["code"]
+            portfolio["controlPlaneEndpoint"] = cur_jur["endpoint"]
 
             total_pdus = portfolio.get("summary", {}).get("totalPdus", 0)
             total_orgs = portfolio.get("summary", {}).get("totalOrganizations", 0)

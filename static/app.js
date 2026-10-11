@@ -115,14 +115,20 @@ function formatFootprint(runtimeType) {
 }
 
 function getStoredUserToken() {
-  return sessionStorage.getItem('apigee_user_access_token') || '';
+  try {
+    return sessionStorage.getItem('apigee_user_access_token') || localStorage.getItem('apigee_user_access_token') || '';
+  } catch (_) {
+    return '';
+  }
 }
 
 function setStoredUserToken(token) {
   if (token && token.trim()) {
-    sessionStorage.setItem('apigee_user_access_token', token.trim());
+    try { sessionStorage.setItem('apigee_user_access_token', token.trim()); } catch (_) {}
+    try { localStorage.setItem('apigee_user_access_token', token.trim()); } catch (_) {}
   } else {
-    sessionStorage.removeItem('apigee_user_access_token');
+    try { sessionStorage.removeItem('apigee_user_access_token'); } catch (_) {}
+    try { localStorage.removeItem('apigee_user_access_token'); } catch (_) {}
   }
 }
 
@@ -157,11 +163,6 @@ function updateTokenStatusPill(hasToken, label = null) {
     }
   }
 
-  // Enter button is NEVER disabled - user can always enter!
-  if (enterBtn) {
-    enterBtn.disabled = false;
-    enterBtn.innerHTML = 'Enter Dashboard &rarr;';
-  }
 
   if (headerBadge) {
     if (hasToken) {
@@ -217,8 +218,10 @@ async function applyUserToken(token, feedbackEl = null) {
     setStoredUserToken(cleanTok);
     if (info.activeAccount) {
       activeSessionEmail = info.activeAccount;
-      const emailEl = document.getElementById('login-active-email');
-      if (emailEl) emailEl.textContent = info.activeAccount;
+      const enterBtnText = document.getElementById('btn-enter-app-text');
+      if (enterBtnText) {
+        enterBtnText.innerHTML = `Enter Dashboard (${escapeHtml(info.activeAccount)}) &rarr;`;
+      }
     }
     updateTokenStatusPill(true);
     if (feedbackEl) {
@@ -243,15 +246,114 @@ async function applyUserToken(token, feedbackEl = null) {
   }
 }
 
+const JURISDICTION_ENDPOINTS = {
+  global: { name: 'Global', endpoint: 'https://apigee.googleapis.com/v1' },
+  us: { name: 'United States (us)', endpoint: 'https://apigee.us.rep.googleapis.com/v1' },
+  ca: { name: 'Canada (ca)', endpoint: 'https://ca-apigee.googleapis.com/v1' },
+  eu: { name: 'European Union (eu)', endpoint: 'https://apigee.eu.rep.googleapis.com/v1' },
+  de: { name: 'Germany (de)', endpoint: 'https://de-apigee.googleapis.com/v1' },
+  fr: { name: 'France (fr, europe-west9)', endpoint: 'https://fr-apigee.googleapis.com/v1' },
+  ch: { name: 'Switzerland (ch, europe-west6)', endpoint: 'https://ch-apigee.googleapis.com/v1' },
+  au: { name: 'Australia (au)', endpoint: 'https://au-apigee.googleapis.com/v1' },
+  in: { name: 'India (in)', endpoint: 'https://apigee.in.rep.googleapis.com/v1' },
+  jp: { name: 'Japan (jp)', endpoint: 'https://jp-apigee.googleapis.com/v1' },
+  qa: { name: 'Qatar (qa, me-central1)', endpoint: 'https://qa-apigee.googleapis.com/v1' },
+  sa: { name: 'Saudi Arabia (sa, me-central2)', endpoint: 'https://sa-apigee.googleapis.com/v1' },
+  il: { name: 'Israel (il, me-west1)', endpoint: 'https://il-apigee.googleapis.com/v1' },
+};
+
+function getStoredJurisdiction() {
+  return localStorage.getItem('apigee_control_plane_jurisdiction') || 'global';
+}
+
+function setStoredJurisdiction(val) {
+  localStorage.setItem('apigee_control_plane_jurisdiction', val || 'global');
+}
+
+function updateJurisdictionHint(jurCode) {
+  const descEl = document.getElementById('jurisdiction-endpoint-desc');
+  const info = JURISDICTION_ENDPOINTS[jurCode] || { endpoint: `https://${jurCode}-apigee.googleapis.com/v1` };
+  if (descEl) {
+    descEl.innerHTML = `Endpoint: <code>${info.endpoint}</code>`;
+  }
+}
+
+function showScanProgressModal(title = 'Scanning Apigee Entitlements...', detail = 'Connecting to APIs...', percent = 0) {
+  const modal = document.getElementById('modal-scan-progress');
+  const statusEl = document.getElementById('scan-modal-status');
+  const detailEl = document.getElementById('scan-modal-detail');
+  const percentEl = document.getElementById('scan-modal-percent');
+  const fillEl = document.getElementById('scan-modal-progress-fill');
+
+  if (statusEl) statusEl.textContent = title;
+  if (detailEl) detailEl.textContent = detail;
+  const pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
+  if (percentEl) percentEl.textContent = `${pct}%`;
+  if (fillEl) fillEl.style.width = `${pct}%`;
+
+  if (modal) modal.style.display = 'grid';
+}
+
+function updateScanProgressModal(evt) {
+  const modal = document.getElementById('modal-scan-progress');
+  const statusEl = document.getElementById('scan-modal-status');
+  const detailEl = document.getElementById('scan-modal-detail');
+  const percentEl = document.getElementById('scan-modal-percent');
+  const fillEl = document.getElementById('scan-modal-progress-fill');
+
+  if (modal && modal.style.display === 'none') {
+    modal.style.display = 'grid';
+  }
+
+  const pct = Math.max(0, Math.min(100, Math.round(evt.percent || 0)));
+  if (statusEl && evt.message) statusEl.textContent = evt.message;
+  if (detailEl && evt.detail !== undefined) detailEl.textContent = evt.detail;
+  if (percentEl) percentEl.textContent = `${pct}%`;
+  if (fillEl) fillEl.style.width = `${pct}%`;
+}
+
+function hideScanProgressModal() {
+  const modal = document.getElementById('modal-scan-progress');
+  if (modal) {
+    modal.style.display = 'none';
+  }
+}
+
 async function initAuthScreen() {
-  const emailEl = document.getElementById('login-active-email');
-  const enterBtn = document.getElementById('btn-enter-app') || document.getElementById('btn-continue-active-account');
+  const enterBtn = document.getElementById('btn-enter-app');
+  const enterBtnText = document.getElementById('btn-enter-app-text');
+  const authBtn = document.getElementById('btn-authenticate-account');
+  const authBtnText = document.getElementById('btn-authenticate-text');
   const errBox = document.getElementById('login-error-box');
+  const jurSelect = document.getElementById('select-control-plane');
 
   activeSessionEmail = '';
-  if (emailEl) emailEl.textContent = 'Detecting...';
-  if (enterBtn) {
-    enterBtn.disabled = false;
+
+  // Wire jurisdiction selector
+  const activeJur = getStoredJurisdiction();
+  if (jurSelect) {
+    jurSelect.value = activeJur;
+    updateJurisdictionHint(activeJur);
+    if (!jurSelect.dataset.listenerBound) {
+      jurSelect.dataset.listenerBound = 'true';
+      jurSelect.addEventListener('change', async (e) => {
+        const val = e.target.value;
+        setStoredJurisdiction(val);
+        updateJurisdictionHint(val);
+        currentPortfolio = null;
+        allOrgsSelected = true;
+        selectedOrgs.clear();
+        currentMonitoringTs = null;
+        currentCallsTs = null;
+        try {
+          await apiFetch('/api/jurisdiction', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jurisdiction: val }),
+          });
+        } catch (_) {}
+      });
+    }
   }
 
   // Handle URL redirect query params from Google OIDC callback
@@ -278,29 +380,67 @@ async function initAuthScreen() {
     const email = auth.activeAccount || (accounts.length > 0 ? accounts[0].account : '') || '';
     activeSessionEmail = email;
 
-    if (email) {
-      if (emailEl) emailEl.textContent = email;
-    } else {
-      if (emailEl) emailEl.textContent = 'Active Google User';
+    if (auth.jurisdiction && auth.jurisdiction.code && jurSelect) {
+      jurSelect.value = auth.jurisdiction.code;
+      setStoredJurisdiction(auth.jurisdiction.code);
+      updateJurisdictionHint(auth.jurisdiction.code);
     }
 
-    const hasToken = Boolean(auth.hasUserToken || getStoredUserToken());
-    updateTokenStatusPill(hasToken);
+    const isTokenExpired = Boolean(auth.tokenExpired);
+    const isTokenValid = Boolean(auth.tokenValid && auth.hasUserToken && !isTokenExpired);
 
-    if (justAuthenticated) {
-      setTimeout(() => {
-        openDashboardForAccount(activeSessionEmail, true);
-      }, 250);
-      return;
+    updateTokenStatusPill(isTokenValid);
+
+    // Rule: If authentication is required, freeze "Enter Dashboard" button.
+    // When logged in, button displays: "Enter Dashboard (google id) →"
+    if (!isTokenValid) {
+      if (enterBtn) {
+        enterBtn.disabled = true;
+        enterBtn.classList.add('btn-frozen');
+        enterBtn.title = 'Authentication mandatory: User token is expired or missing';
+      }
+      if (enterBtnText) {
+        enterBtnText.innerHTML = '&#128274; Enter Dashboard';
+      }
+      if (authBtn) {
+        authBtn.classList.add('btn-mandatory');
+      }
+      if (authBtnText) {
+        authBtnText.textContent = isTokenExpired ? 'Token Expired — Authenticate with Google' : 'Authenticate with Google';
+      }
+    } else {
+      if (enterBtn) {
+        enterBtn.disabled = false;
+        enterBtn.classList.remove('btn-frozen');
+        enterBtn.title = 'Enter Dashboard';
+      }
+      if (enterBtnText) {
+        const idLabel = email ? ` (${escapeHtml(email)})` : '';
+        enterBtnText.innerHTML = `Enter Dashboard${idLabel} &rarr;`;
+      }
+      if (authBtn) {
+        authBtn.classList.remove('btn-mandatory');
+      }
+      if (authBtnText) {
+        authBtnText.textContent = 'Authenticate / Change Account';
+      }
     }
   } catch (err) {
     activeSessionEmail = '';
-    if (emailEl) emailEl.textContent = 'Active Google User';
     updateTokenStatusPill(false);
-  } finally {
     if (enterBtn) {
-      enterBtn.disabled = false;
-      enterBtn.innerHTML = 'Enter Dashboard &rarr;';
+      enterBtn.disabled = true;
+      enterBtn.classList.add('btn-frozen');
+      enterBtn.title = 'Authentication mandatory to enter dashboard';
+    }
+    if (enterBtnText) {
+      enterBtnText.innerHTML = '&#128274; Enter Dashboard';
+    }
+    if (authBtn) {
+      authBtn.classList.add('btn-mandatory');
+    }
+    if (authBtnText) {
+      authBtnText.textContent = 'Authenticate with Google';
     }
   }
 }
@@ -308,10 +448,12 @@ async function initAuthScreen() {
 
 async function startLiveScanWithProgress({
   account = null,
+  jurisdiction = null,
   onProgress = null,
 } = {}) {
   const token = getStoredUserToken();
-  let url = `/api/scan/stream?account=${encodeURIComponent(account || '')}`;
+  const jur = jurisdiction || getStoredJurisdiction();
+  let url = `/api/scan/stream?account=${encodeURIComponent(account || '')}&jurisdiction=${encodeURIComponent(jur)}`;
   if (token) {
     url += `&token=${encodeURIComponent(token)}`;
   }
@@ -357,56 +499,60 @@ async function startLiveScanWithProgress({
   throw new Error('Scan stream ended unexpectedly without completion payload');
 }
 
-async function openDashboardForAccount(account, runLiveScan = false) {
+async function openDashboardForAccount(account, runLiveScan = true) {
   if (!account && !activeSessionEmail) return;
 
   const errBox = document.getElementById('login-error-box');
-  const enterBtn = document.getElementById('btn-enter-app') || document.getElementById('btn-continue-active-account');
-  const progressBox = document.getElementById('login-scan-progress');
-  const progressPercent = document.getElementById('login-progress-percent');
-  const progressFill = document.getElementById('login-progress-bar-fill');
-  const progressStatus = document.getElementById('login-progress-status');
-  const progressDetail = document.getElementById('login-progress-detail');
+  const enterBtn = document.getElementById('btn-enter-app');
+
+  if (enterBtn && enterBtn.classList.contains('btn-frozen')) {
+    return;
+  }
 
   if (errBox) errBox.style.display = 'none';
 
-  function updateLoginProgress(evt) {
-    if (!progressBox) return;
-    progressBox.style.display = 'block';
-    const pct = Math.max(0, Math.min(100, Math.round(evt.percent || 0)));
-    if (progressPercent) progressPercent.textContent = `${pct}%`;
-    if (progressFill) progressFill.style.width = `${pct}%`;
-    if (progressStatus) progressStatus.textContent = evt.message || 'Loading Apigee Entitlements...';
-    if (progressDetail) progressDetail.textContent = evt.detail || '';
-  }
+  // Immediately transition to Home Page / Dashboard screen
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('dashboard-screen').style.display = 'flex';
+
+  // Display scan progress modal popup on the home page
+  showScanProgressModal('Connecting to Apigee APIs...', 'Initializing scan session', 5);
 
   try {
-    if (enterBtn) {
-      enterBtn.disabled = true;
-    }
-
     if (runLiveScan) {
-      updateLoginProgress({ percent: 5, message: 'Connecting to Google Cloud Apigee APIs...', detail: 'Initializing scan session' });
-      currentPortfolio = await startLiveScanWithProgress({
-        account: account || null,
-        onProgress: updateLoginProgress,
-      });
+      showScanProgressModal('Connecting to Google Cloud Apigee APIs...', 'Scanning organizations and environments', 10);
+      try {
+        currentPortfolio = await startLiveScanWithProgress({
+          account: account || null,
+          jurisdiction: getStoredJurisdiction(),
+          onProgress: updateScanProgressModal,
+        });
+      } catch (scanErr) {
+        console.warn('Live scan encountered an issue, attempting cached fallback:', scanErr);
+        const targetJur = getStoredJurisdiction();
+        const res = await apiFetch(`/api/portfolio?jurisdiction=${encodeURIComponent(targetJur)}`);
+        if (!res.ok) throw scanErr;
+        currentPortfolio = await res.json();
+      }
     } else {
-      updateLoginProgress({ percent: 15, message: 'Loading Apigee Entitlements...', detail: 'Connecting to APIs' });
+      updateScanProgressModal({ percent: 15, message: 'Loading Apigee Entitlements...', detail: 'Connecting to APIs' });
       
-      const fetchPromise = apiFetch('/api/portfolio');
-      updateLoginProgress({ percent: 35, message: 'Retrieving organization portfolio...', detail: 'Fetching audit data' });
+      const targetJur = getStoredJurisdiction();
+      const fetchPromise = apiFetch(`/api/portfolio?jurisdiction=${encodeURIComponent(targetJur)}`);
+      updateScanProgressModal({ percent: 35, message: 'Retrieving organization portfolio...', detail: 'Fetching audit data' });
       
       const res = await fetchPromise;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       currentPortfolio = await res.json();
 
-      if (currentPortfolio.source !== 'LIVE_APIGEE_API') {
-        updateLoginProgress({ percent: 45, message: 'Initiating live scan for account...', detail: 'Streaming live audit' });
+      const portfolioJur = currentPortfolio.controlPlaneJurisdiction || (currentPortfolio.jurisdiction && currentPortfolio.jurisdiction.code);
+      if (currentPortfolio.source !== 'LIVE_APIGEE_API' || portfolioJur !== targetJur) {
+        updateScanProgressModal({ percent: 45, message: 'Initiating live scan for account...', detail: 'Streaming live audit' });
         try {
           currentPortfolio = await startLiveScanWithProgress({
             account: account || null,
-            onProgress: updateLoginProgress,
+            jurisdiction: targetJur,
+            onProgress: updateScanProgressModal,
           });
         } catch (scanErr) {
           console.warn('Initial live scan fallback encountered an issue, continuing with cached portfolio:', scanErr);
@@ -414,33 +560,37 @@ async function openDashboardForAccount(account, runLiveScan = false) {
       }
     }
 
-    updateLoginProgress({ percent: 90, message: 'Finalizing compliance metrics...', detail: 'Preparing dashboard views' });
+    updateScanProgressModal({ percent: 90, message: 'Finalizing compliance metrics...', detail: 'Preparing dashboard views' });
+
+    // Always reset org selection so organizations from previously selected regions do NOT linger
+    allOrgsSelected = true;
+    selectedOrgs.clear();
 
     // Populate dashboard UI
     populateOrgDropdown(currentPortfolio);
     populateEnvDropdown(currentPortfolio);
     renderSimplifiedDashboard();
 
-    updateLoginProgress({ percent: 100, message: 'Dashboard Ready!', detail: 'Launching view' });
+    updateScanProgressModal({ percent: 100, message: 'Dashboard Ready!', detail: 'Launching view' });
 
-    // Brief delay to display 100% progress smoothly
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
-    document.getElementById('login-screen').style.display = 'none';
-    document.getElementById('dashboard-screen').style.display = 'flex';
+    // Smooth transition: brief delay before dismissing modal popup
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    hideScanProgressModal();
 
     fetchMonitoringTimeSeries(selectedMonitoringDays, runLiveScan, selectedChartDimension);
     fetchMonthlyCallsSeries(runLiveScan);
   } catch (err) {
-    if (progressBox) progressBox.style.display = 'none';
+    hideScanProgressModal();
+    // Return back to login screen with error notice
+    document.getElementById('dashboard-screen').style.display = 'none';
+    document.getElementById('login-screen').style.display = 'flex';
     if (errBox) {
-      errBox.textContent = err.message;
+      errBox.textContent = `Scan Error: ${err.message}`;
       errBox.style.display = 'block';
     }
   } finally {
     if (enterBtn) {
       enterBtn.disabled = false;
-      enterBtn.innerHTML = 'Enter Dashboard &rarr;';
     }
   }
 }
@@ -468,10 +618,11 @@ async function fetchMonitoringTimeSeries(days = 14, refresh = false, dimension =
   }
 
   try {
+    const jur = getStoredJurisdiction();
     const res = await apiFetch(
       `/api/monitoring/timeseries?days=${days}&dimension=${encodeURIComponent(
         selectedChartDimension
-      )}&refresh=${refresh ? 'true' : 'false'}`
+      )}&refresh=${refresh ? 'true' : 'false'}&jurisdiction=${encodeURIComponent(jur)}`
     );
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -836,7 +987,8 @@ async function fetchMonthlyCallsSeries(refresh = false) {
   }
 
   try {
-    const res = await apiFetch(`/api/monitoring/timeseries?dimension=calls&refresh=${refresh ? 'true' : 'false'}`);
+    const jur = getStoredJurisdiction();
+    const res = await apiFetch(`/api/monitoring/timeseries?dimension=calls&refresh=${refresh ? 'true' : 'false'}&jurisdiction=${encodeURIComponent(jur)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     currentCallsTs = await res.json();
     renderMonthlyCallsChart();
@@ -1239,6 +1391,16 @@ function renderSimplifiedDashboard() {
     activeSessionEmail ||
     'Authenticated';
   document.getElementById('header-account-subtitle').textContent = `User: ${acct} • ${totalOrgsCount} Authorized Orgs`;
+
+  const jurBadge = document.getElementById('header-jurisdiction-badge');
+  if (jurBadge) {
+    const jurCode = currentPortfolio.controlPlaneJurisdiction || (currentPortfolio.jurisdiction && currentPortfolio.jurisdiction.code) || getStoredJurisdiction();
+    const jurInfo = currentPortfolio.jurisdiction || JURISDICTION_ENDPOINTS[jurCode] || { name: jurCode.toUpperCase(), endpoint: '' };
+    jurBadge.textContent = `Control Plane: ${jurInfo.name || jurCode.toUpperCase()}`;
+    if (jurInfo.endpoint) {
+      jurBadge.title = `Endpoint: ${jurInfo.endpoint}`;
+    }
+  }
 
   // Handle Service Account Notice Banner
   const saBanner = document.getElementById('dashboard-sa-notice');
@@ -1758,23 +1920,29 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Enter Dashboard Button Handler
   const handleEnterDashboard = async () => {
-    const btn = document.getElementById('btn-enter-app') || document.getElementById('btn-continue-active-account');
+    const btn = document.getElementById('btn-enter-app');
+    if (btn && btn.classList.contains('btn-frozen')) {
+      showToast('Authentication is mandatory to enter the dashboard.');
+      return;
+    }
     if (btn) {
       btn.disabled = true;
     }
     const errBox = document.getElementById('login-error-box');
     if (errBox) errBox.style.display = 'none';
 
-    if (activeSessionEmail) {
-      try {
-        await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ account: activeSessionEmail, triggerBrowserLogin: false }),
-        });
-      } catch (_) {}
-    }
-    await openDashboardForAccount(activeSessionEmail, false);
+    try {
+      await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          account: activeSessionEmail || undefined,
+          triggerBrowserLogin: false,
+          jurisdiction: getStoredJurisdiction(),
+        }),
+      });
+    } catch (_) {}
+    await openDashboardForAccount(activeSessionEmail, true);
   };
 
   document.getElementById('btn-enter-app')?.addEventListener('click', handleEnterDashboard);
@@ -1798,6 +1966,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Switch GCP Account
 
   document.getElementById('btn-switch-account')?.addEventListener('click', () => {
+    currentPortfolio = null;
+    allOrgsSelected = true;
+    selectedOrgs.clear();
+    currentMonitoringTs = null;
+    currentCallsTs = null;
     document.getElementById('dashboard-screen').style.display = 'none';
     document.getElementById('login-screen').style.display = 'grid';
     initAuthScreen();
@@ -1888,9 +2061,10 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.disabled = true;
     btn.classList.add('is-refreshing');
     btn.setAttribute('title', 'Refreshing live scan in progress...');
-    if (dProgress) dProgress.style.display = 'block';
+    showScanProgressModal('Refreshing Live Scan...', 'Connecting to Apigee APIs...', 5);
 
     function updateDashboardProgress(evt) {
+      updateScanProgressModal(evt);
       const pct = Math.max(0, Math.min(100, evt.percent || 0));
       if (dPercent) dPercent.textContent = `${pct}%`;
       if (dFill) dFill.style.width = `${pct}%`;
@@ -1919,9 +2093,12 @@ document.addEventListener('DOMContentLoaded', () => {
       updateDashboardProgress({ percent: 5, message: 'Initiating live Apigee scan...' });
       currentPortfolio = await startLiveScanWithProgress({
         account: null,
+        jurisdiction: getStoredJurisdiction(),
         onProgress: updateDashboardProgress,
       });
 
+      allOrgsSelected = true;
+      selectedOrgs.clear();
       populateOrgDropdown(currentPortfolio);
       populateEnvDropdown(currentPortfolio);
       renderSimplifiedDashboard();
@@ -1929,6 +2106,8 @@ document.addEventListener('DOMContentLoaded', () => {
         fetchMonitoringTimeSeries(selectedMonitoringDays, true, selectedChartDimension),
         fetchMonthlyCallsSeries(true),
       ]);
+      updateScanProgressModal({ percent: 100, message: 'Scan Complete!', detail: 'Live scan finished' });
+      await new Promise((r) => setTimeout(r, 250));
       showToast(
         `Refreshed live scan (${currentPortfolio.summary.totalPdus.toLocaleString()} PDUs, ${
           currentPortfolio.summary.totalEnvironmentUnits
@@ -1937,6 +2116,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       showToast(`Scan failed: ${err.message}`);
     } finally {
+      hideScanProgressModal();
       if (dProgress) {
         setTimeout(() => {
           dProgress.style.display = 'none';

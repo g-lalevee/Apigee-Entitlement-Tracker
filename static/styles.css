@@ -101,16 +101,27 @@ body {
 
 .login-brand {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
-  text-align: center;
-  gap: 0.75rem;
+  justify-content: center;
+  text-align: left;
+  gap: 0.65rem;
+  margin-bottom: 0.25rem;
 }
 
 .login-brand h1 {
-  font-size: 1.4rem;
+  font-size: 1.25rem;
   font-weight: 800;
   letter-spacing: -0.02em;
+  margin: 0;
+  line-height: 1.2;
+}
+
+.login-brand-logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  padding: 3px;
 }
 
 .brand-logo {
@@ -854,7 +865,7 @@ body {
   padding-top: 0.8rem;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 1rem;
   flex-wrap: wrap;
 }
@@ -2231,6 +2242,140 @@ body[data-theme="light"] .dashboard-progress-sub {
 
 .btn-close:hover {
   color: var(--text-primary);
+}
+
+/* Frozen button state when authentication is mandatory */
+.btn-frozen {
+  opacity: 0.55 !important;
+  cursor: not-allowed !important;
+  filter: grayscale(35%) !important;
+  background: var(--surface-card) !important;
+  border-color: rgba(255, 255, 255, 0.15) !important;
+  color: var(--text-muted) !important;
+  box-shadow: none !important;
+  pointer-events: auto !important;
+}
+
+/* Mandatory authentication button state */
+.btn-mandatory {
+  position: relative;
+  border-color: #3b82f6 !important;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.4) !important;
+  animation: pulse-mandatory 2s infinite ease-in-out;
+}
+
+@keyframes pulse-mandatory {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+    transform: translateY(0);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0.55);
+    transform: translateY(-1px);
+  }
+}
+
+/* Jurisdiction Selector */
+.login-jurisdiction-card {
+  margin-bottom: 1rem;
+  padding: 0.55rem 0.8rem !important;
+  gap: 0.25rem !important;
+  border-radius: 12px !important;
+}
+
+.jurisdiction-select {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.8rem;
+  background-color: var(--surface-subcard);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 0.35rem 0.55rem;
+  height: 32px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+}
+
+.jurisdiction-select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+}
+
+.jurisdiction-select optgroup {
+  font-weight: 700;
+  color: var(--text-muted);
+  background: #1e293b;
+}
+
+.jurisdiction-select option {
+  font-weight: 400;
+  color: #f1f5f9;
+  background: #0f172a;
+  padding: 0.3rem;
+}
+
+body.light-theme .jurisdiction-select optgroup {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+body.light-theme .jurisdiction-select option {
+  background: #ffffff;
+  color: #1e293b;
+}
+
+.jurisdiction-pill {
+  margin-left: 0.5rem;
+  background: rgba(59, 130, 246, 0.15) !important;
+  border: 1px solid rgba(59, 130, 246, 0.35) !important;
+  color: #93c5fd !important;
+}
+
+body.light-theme .jurisdiction-pill {
+  background: rgba(37, 99, 235, 0.12) !important;
+  border-color: rgba(37, 99, 235, 0.3) !important;
+  color: #1d4ed8 !important;
+}
+
+.token-pill-expired {
+  background: rgba(239, 68, 68, 0.15) !important;
+  border-color: rgba(239, 68, 68, 0.35) !important;
+  color: var(--status-red-bright) !important;
+}
+
+.token-notice-error {
+  color: var(--status-red-bright);
+}
+
+.token-notice-success {
+  color: var(--status-green-bright);
+}
+
+/* Modal Scan Progress card */
+.scan-progress-modal-card {
+  max-width: 520px;
+  padding: 1.75rem 2rem;
+  border-radius: 16px;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  animation: modal-fade-in 0.25s ease-out;
+}
+
+@keyframes modal-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.scan-modal-header {
+  border-bottom: none;
+  padding-bottom: 0;
 }
 
 
