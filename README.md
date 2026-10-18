@@ -17,7 +17,7 @@
 
 > [!IMPORTANT]
 > - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
-> - **Apigee Hybrid Limitation**: For **Apigee Hybrid**, the number of runtime instances (clusters) cannot be retrieved via the Apigee Management API, so the region/instance count defaults to **1**. As a result, the number of consumed PDUs and Environment Units may not be exact for multi-cluster/multi-region Hybrid deployments.
+> - **Apigee Hybrid Limitation**: For Apigee Hybrid, the number of runtime instances (clusters) is not retrieved, so the region/instance count defaults to **1**. As a result, the number of consumed PDUs and Environment Units may not be exact for multi-cluster/multi-region Hybrid deployments.
 
 ---
 
