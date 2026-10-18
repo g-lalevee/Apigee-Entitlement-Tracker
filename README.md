@@ -90,30 +90,6 @@ flowchart TD
 
 ---
 
-### Entitlement Calculation Formulas
-
-#### 1. Proxy Deployment Units (PDUs)
-$$\text{Total PDUs} = \sum_{\text{Environments}} \left[ (\text{Deployed Proxies} + \text{Deployed Shared Flows}) \times \text{Attached Regions} \right]$$
-* **Apigee X (`CLOUD`)**: Dynamically determines regional multipliers by querying instance attachments across each region.
-* **Apigee Hybrid (`HYBRID`)**: Automatically handles hybrid clusters with customizable per-environment or per-organization region multipliers.
-* **Artifact Classification**: Differentiates between Standard and Extensible proxies as well as deployed Shared Flows.
-
-#### 2. Environment Units
-$$\text{Environment Units} = \sum_{\text{Environments}} (\text{Environment} \times \text{Attached Regions})$$
-
-#### 3. Yearly API Calls (Contract Year) & Deployment Type Weighting
-* Aggregates recorded API call traffic from your configured **Contract Starting Date** up to the current date.
-* Categorizes API calls using the Apigee Analytics dimension `proxy_deployment_type`:
-  * **Standard Calls (`standard`)**: Weighted at **0.2&times;** entitlement units ($1 \text{ standard call} = 0.2 \text{ call units}$).
-  * **Extensible Calls (`extensible`)**: Weighted at **1.0&times;** entitlement units ($1 \text{ extensible call} = 1.0 \text{ call unit}$).
-* Calculates the contractual entitlement consumption formula:
-  $$\text{Entitlement Calls (Weighted)} = \text{round}\left( \text{Standard Calls} \times 0.2 + \text{Extensible Calls} \times 1.0 \right)$$
-  $$\text{Raw Total Calls} = \text{Standard Calls} + \text{Extensible Calls}$$
-* Evaluates total weighted consumption against your **Yearly API Calls Entitlement (configured in Millions of calls)** and calculates monthly run-rate pacing.
-* Both individual counts (Standard and Extensible) and the sum (weighted entitlement sum + raw sum) are displayed in the KPI cards, monthly call section banner, and environment reports.
-
----
-
 ### User Identity Delegation & Security Parity
 * **User-Delegated IAM**: Whether running locally or deployed on Cloud Run, backend requests execute using the **logged-in user's identity and OAuth token** (or Application Default Credentials).
 * **IAM Parity**: Users only see the Apigee organizations where their personal Google identity has been granted read permissions in IAM.
@@ -314,11 +290,6 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 ├── collector.py                # Apigee & Cloud Monitoring collection engine (X & Hybrid, OAuth2/ADC)
 ├── exporter.py                 # Structured CSV audit exporter formatted for Google Sheets / Excel
 ├── requirements.txt            # Pinned Python dependencies
-├── tests/                      # Unit and security regression test suite
-│   ├── test_app.py             # FastAPI endpoints and routing tests
-│   ├── test_collector.py       # Metrics, PDU arithmetic & weight aggregation tests
-│   ├── test_exporter.py        # CSV export formatting and column validation tests
-│   └── test_security.py        # Session isolation, SSRF whitelist & header security tests
 ├── scripts/
 │   ├── redeploy_cloudrun.sh    # One-click rebuild & deploy from source to Cloud Run
 │   └── setup_oauth_cloudrun.sh # Automated Secret Manager & Cloud Run OAuth configuration
