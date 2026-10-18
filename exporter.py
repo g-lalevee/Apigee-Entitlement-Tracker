@@ -63,7 +63,10 @@ ENVIRONMENTS_CSV_HEADER: tuple[str, ...] = (
     "Deployed Units (Proxies + SF)",
     "Consumed PDUs",
     "% of PDU Limit",
-    "Number of call since period start",
+    "Standard Calls",
+    "Extensible Calls",
+    "Raw Total Calls",
+    "Entitlement Calls (Weighted)",
     "% of call Limit",
 )
 
@@ -211,6 +214,33 @@ def generate_organizations_csv(portfolio: Mapping[str, Any]) -> str:
     return buf.getvalue()
 
 
+def _resolve_env_calls_data(
+    e: Mapping[str, Any],
+    limit_calls: int,
+) -> tuple[int, int, int, int, str]:
+    """Extract standard, extensible, raw, weighted calls, and limit percentage."""
+    std_calls = int(e.get("standardApiCalls", 0))
+    ext_calls = int(e.get("extensibleApiCalls", 0))
+    raw_calls = int(e.get("rawApiCalls", std_calls + ext_calls))
+    yearly_calls = int(e.get("yearlyApiCalls", 0))
+    if yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
+        yearly_calls = int(round(std_calls * 0.2 + ext_calls * 1.0))
+    call_limit_pct = (
+        f"{(yearly_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
+    )
+    return std_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct
+
+
+def _format_env_unit_label(e: Mapping[str, Any], include_sf: bool) -> str:
+    """Format the proxy and shared flow deployed units label."""
+    total_proxies = int(e.get("totalProxies", 0))
+    shared_flows = int(e.get("sharedFlows", 0))
+    total_artifacts = int(e.get("totalArtifacts", total_proxies))
+    if include_sf:
+        return f"{total_artifacts} ({total_proxies}P + {shared_flows}SF)"
+    return f"{total_proxies}"
+
+
 def _build_env_row(
     e: Mapping[str, Any],
     *,
@@ -226,24 +256,12 @@ def _build_env_row(
     regions_list: Sequence[str] = e.get("regions") or ()
     regions_str = ", ".join(regions_list) if regions_list else "Unattached (0 regions)"
     region_count = int(e.get("regionCount", 0))
-    env_limit_pct = (
-        f"{(region_count / limit_envs) * 100:.2f}%" if limit_envs > 0 else "0.00%"
-    )
-    total_proxies = int(e.get("totalProxies", 0))
-    shared_flows = int(e.get("sharedFlows", 0))
-    total_artifacts = int(e.get("totalArtifacts", total_proxies))
-    units_label = (
-        f"{total_artifacts} ({total_proxies}P + {shared_flows}SF)"
-        if include_sf
-        else f"{total_proxies}"
-    )
+    env_limit_pct = f"{(region_count / limit_envs) * 100:.2f}%" if limit_envs > 0 else "0.00%"
+    units_label = _format_env_unit_label(e, include_sf)
     total_pdus = int(e.get("totalPdus", 0))
-    pdu_limit_pct = (
-        f"{(total_pdus / limit_pdu) * 100:.2f}%" if limit_pdu > 0 else "0.00%"
-    )
-    yearly_calls = int(e.get("yearlyApiCalls", 0))
-    call_limit_pct = (
-        f"{(yearly_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
+    pdu_limit_pct = f"{(total_pdus / limit_pdu) * 100:.2f}%" if limit_pdu > 0 else "0.00%"
+    std_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct = (
+        _resolve_env_calls_data(e, limit_calls)
     )
 
     return [
@@ -257,6 +275,9 @@ def _build_env_row(
         units_label,
         total_pdus,
         pdu_limit_pct,
+        std_calls,
+        ext_calls,
+        raw_calls,
         yearly_calls,
         call_limit_pct,
     ]
@@ -298,9 +319,9 @@ def generate_environments_csv(
     writer = csv.writer(buf)
 
     summary: Mapping[str, Any] = portfolio.get("summary", {})
-    limit_pdu = int(summary.get("entitlementPdu", 1500) or 1500)
-    limit_envs = int(summary.get("entitlementEnvs", 20) or 20)
-    limit_calls = int(summary.get("entitlementYearlyCalls", 100_000_000) or 100_000_000)
+    limit_pdu = int(summary.get("entitlementPdu", 500) or 500)
+    limit_envs = int(summary.get("entitlementEnvs", 6) or 6)
+    limit_calls = int(summary.get("entitlementYearlyCalls", 1_500_000_000) or 1_500_000_000)
     settings: Mapping[str, Any] = portfolio.get("settings", {})
     include_sf = bool(settings.get("includeSharedFlows", True))
     export_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")

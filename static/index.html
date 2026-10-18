@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Apigee Entitlement Tracker</title>
-  <link rel="icon" href="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png" />
+  <link rel="icon" href="/static/apigee-logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -17,7 +17,7 @@
     <div class="login-card glass-window">
       <div class="login-brand">
         <img
-          src="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png"
+          src="/static/apigee-logo.png"
           alt="Apigee"
           class="brand-logo login-brand-logo"
         />
@@ -114,7 +114,7 @@
         <header class="top-header">
           <div class="brand-group">
             <img
-              src="https://images.g2crowd.com/uploads/product/image/435de113380b3b0c3e42a96fcbdb892a/apigee-api-management.png"
+              src="/static/apigee-logo.png"
               alt="Apigee"
               class="brand-logo"
             />
@@ -235,8 +235,8 @@
                 <div class="entitlement-summary-pills">
                   <span class="entitlement-param-pill">Start: <strong id="pill-summary-contract-date">2026-01-01</strong></span>
                   <span class="entitlement-param-pill">PDUs: <strong id="pill-summary-pdu-limit">500</strong></span>
-                  <span class="entitlement-param-pill">Env Units: <strong id="pill-summary-env-limit">20</strong></span>
-                  <span class="entitlement-param-pill">Yearly Calls: <strong id="pill-summary-calls-limit">100M</strong></span>
+                  <span class="entitlement-param-pill">Env Units: <strong id="pill-summary-env-limit">6</strong></span>
+                  <span class="entitlement-param-pill">Yearly Calls: <strong id="pill-summary-calls-limit">1.5B</strong></span>
                 </div>
               </div>
 
@@ -272,14 +272,14 @@
 
                 <div class="config-field">
                   <label for="input-env-limit">Environment Entitlement (Env Units)</label>
-                  <input id="input-env-limit" type="number" min="1" step="1" class="glass-text-input" value="20" />
+                  <input id="input-env-limit" type="number" min="1" step="1" class="glass-text-input" value="6" />
                   <span class="config-help">Max Environment Units (Environment &times; Regions)</span>
                 </div>
 
                 <div class="config-field">
                   <label for="input-calls-limit">Yearly API Calls Entitlement (Millions of calls)</label>
-                  <input id="input-calls-limit" type="number" min="0.01" step="1" class="glass-text-input" value="100" />
-                  <span class="config-help" id="lbl-calls-limit-formatted">Max API Calls per contract year in Millions (e.g. 100 for 100M)</span>
+                  <input id="input-calls-limit" type="number" min="0.01" step="1" class="glass-text-input" value="1500" />
+                  <span class="config-help" id="lbl-calls-limit-formatted">Max API Calls per contract year in Millions (1.5B)</span>
                 </div>
               </div>
             </div>
@@ -323,7 +323,7 @@
                     <div>
                       <div class="metric-number">
                         <span id="val-consumed-envs">0</span>
-                        <span class="metric-slash">/ <span id="val-limit-envs">20</span></span>
+                        <span class="metric-slash">/ <span id="val-limit-envs">6</span></span>
                       </div>
                       <div class="metric-label">2. Environment Units (Env &times; Regions)</div>
                     </div>
@@ -345,11 +345,16 @@
                     <div>
                       <div class="metric-number">
                         <span id="val-consumed-calls">0</span>
-                        <span class="metric-slash">/ <span id="val-limit-calls">100M</span></span>
+                        <span class="metric-slash">/ <span id="val-limit-calls">1.5B</span></span>
                       </div>
                       <div class="metric-label">3. Yearly API Calls (Contract Year)</div>
                     </div>
                     <span id="pill-status-calls" class="chart-status-pill below">BELOW LIMIT</span>
+                  </div>
+                  <div class="calls-dimension-chips" id="calls-dimension-chips">
+                    <span class="call-chip std" id="chip-calls-std" title="Standard Calls (0.2&times; weighting)">Std: 0</span>
+                    <span class="call-chip ext" id="chip-calls-ext" title="Extensible Calls (1.0&times; weighting)">Ext: 0</span>
+                    <span class="call-chip raw" id="chip-calls-raw" title="Raw sum of all API calls">Raw: 0</span>
                   </div>
                   <div class="metric-sub" id="val-calls-formula">
                     Contract year: 2026-01-01 &rarr; 2027-01-01 &bull; Stored in <code>pdu_limit.json</code>
@@ -413,15 +418,19 @@
                   </div>
                   <div class="legend-row">
                     <div class="legend-label"><span class="dot dot-gold"></span>2. Env Units (Env&times;Reg)</div>
-                    <div class="legend-val" id="legend-env-summary">0 / 20 (0%)</div>
+                    <div class="legend-val" id="legend-env-summary">0 / 6 (0%)</div>
                   </div>
                   <div class="legend-row">
                     <div class="legend-label"><span class="dot dot-muted"></span>3. Yearly API Calls</div>
-                    <div class="legend-val" id="legend-calls-summary">0 / 100M (0%)</div>
+                    <div class="legend-val" id="legend-calls-summary">0 / 1.5B (0%)</div>
                   </div>
                   <div class="legend-row">
                     <div class="legend-label"><span class="dot dot-cyan" style="opacity:0.5;"></span>X vs Hybrid PDUs</div>
                     <div class="legend-val"><span id="legend-x-pdus">0</span> X &bull; <span id="legend-hybrid-pdus">0</span> Hyb (<span id="legend-active-envs">0</span> envs)</div>
+                  </div>
+                  <div class="legend-row">
+                    <div class="legend-label"><span class="dot dot-purple"></span>Std vs Ext Calls</div>
+                    <div class="legend-val" id="legend-calls-breakdown-summary"><span id="legend-std-calls">0 Std (0.2&times;)</span> &bull; <span id="legend-ext-calls">0 Ext (1.0&times;)</span></div>
                   </div>
                 </div>
               </div>
@@ -510,10 +519,13 @@
           <!-- Cloud Monitoring Time-Series Chart -->
           <section id="section-monitoring" class="chart-card glass-card" aria-label="PDUs and Environment Units Across Time">
             <div class="chart-header">
-              <div>
+              <div class="chart-header-main">
                 <div class="chart-title-row">
                   <h2 class="card-section-title" id="chart-main-title">PDUs Across Time (Cloud Monitoring)</h2>
                   <span id="chart-limit-pill" class="chart-status-pill below">UNDER LIMIT</span>
+                  <button id="btn-refresh-chart" type="button" class="btn btn-primary btn-sm chart-refresh-top-right">
+                    Refresh Monitoring
+                  </button>
                 </div>
                 <p class="chart-subtitle" id="chart-subtitle">
                   Metric: <code>apigee.googleapis.com/proxy/details</code> &bull; Loading time-series...
@@ -531,9 +543,6 @@
                   <button type="button" class="range-btn active" data-days="14">14d</button>
                   <button type="button" class="range-btn" data-days="30">30d</button>
                 </div>
-                <button id="btn-refresh-chart" type="button" class="btn btn-primary btn-sm">
-                  Refresh Monitoring
-                </button>
               </div>
             </div>
 
@@ -561,6 +570,36 @@
               </div>
             </div>
 
+            <!-- Calls Breakdown Banner: Standard (0.2x), Extensible (1.0x), and Entitlement Sum -->
+            <div class="calls-breakdown-banner" id="calls-breakdown-banner">
+              <div class="call-breakdown-card card-standard">
+                <div class="call-breakdown-header">
+                  <span class="call-breakdown-title">Standard Calls</span>
+                  <span class="call-weight-badge badge-std">0.2&times; Weight</span>
+                </div>
+                <div class="call-breakdown-val" id="banner-calls-std">0</div>
+                <div class="call-breakdown-sub" id="banner-calls-std-weighted">&rarr; 0 ent. calls (0.2&times;)</div>
+              </div>
+
+              <div class="call-breakdown-card card-extensible">
+                <div class="call-breakdown-header">
+                  <span class="call-breakdown-title">Extensible Calls</span>
+                  <span class="call-weight-badge badge-ext">1.0&times; Weight</span>
+                </div>
+                <div class="call-breakdown-val" id="banner-calls-ext">0</div>
+                <div class="call-breakdown-sub" id="banner-calls-ext-weighted">&rarr; 0 ent. calls (1.0&times;)</div>
+              </div>
+
+              <div class="call-breakdown-card card-total">
+                <div class="call-breakdown-header">
+                  <span class="call-breakdown-title">Entitlement Calls (Sum)</span>
+                  <span class="call-weight-badge badge-total">Ext + 0.2&times;Std</span>
+                </div>
+                <div class="call-breakdown-val" id="banner-calls-total-weighted">0</div>
+                <div class="call-breakdown-sub" id="banner-calls-raw-total">- 0 Ext + 0 Std Ent. &bull; Raw: 0</div>
+              </div>
+            </div>
+
             <div id="calls-monthly-chart-container" class="chart-canvas-wrap">
               <div class="chart-empty">Loading monthly API calls from Contract Starting Date...</div>
             </div>
@@ -570,7 +609,7 @@
           <section id="section-report" class="table-card glass-card">
             <div class="table-card-header">
               <h2 class="card-section-title">Environment Entitlement Detail Report (PDUs, Env Units &amp; Yearly Calls)</h2>
-              <span class="table-card-sub">Single-line footprint &bull; Matches CSV Export</span>
+              <span class="table-card-sub">This list exclusively includes environments that feature proxy deployments.</span>
             </div>
             <div class="table-responsive">
               <table class="data-table">
@@ -585,8 +624,10 @@
                     <th class="num-cell" id="th-deployed-units">Deployed Units (Proxies + SF)</th>
                     <th class="num-cell">Consumed PDUs</th>
                     <th class="num-cell">% of PDU Limit</th>
-                    <th class="num-cell">Number of call since period start</th>
-                    <th class="num-cell">% of call Limit</th>
+                    <th class="num-cell">Standard Calls (0.2&times;)</th>
+                    <th class="num-cell">Extensible Calls (1.0&times;)</th>
+                    <th class="num-cell">Entitlement Calls</th>
+                    <th class="num-cell">% of Call Limit</th>
                   </tr>
                 </thead>
                 <tbody id="tbody-pdu"></tbody>

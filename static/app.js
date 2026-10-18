@@ -64,7 +64,9 @@ function getSelectedOrgsLabel(totalOrgsCount) {
   if (selectedOrgs.size === 0) {
     return '0 Organizations Selected';
   }
-  const arr = Array.from(selectedOrgs);
+  const arr = Array.from(selectedOrgs).sort((a, b) =>
+    String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base', numeric: true })
+  );
   if (arr.length === 1) {
     return arr[0];
   }
@@ -453,10 +455,7 @@ async function startLiveScanWithProgress({
 } = {}) {
   const token = getStoredUserToken();
   const jur = jurisdiction || getStoredJurisdiction();
-  let url = `/api/scan/stream?account=${encodeURIComponent(account || '')}&jurisdiction=${encodeURIComponent(jur)}`;
-  if (token) {
-    url += `&token=${encodeURIComponent(token)}`;
-  }
+  const url = `/api/scan/stream?account=${encodeURIComponent(account || '')}&jurisdiction=${encodeURIComponent(jur)}`;
   const headers = {};
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -651,7 +650,7 @@ function renderMonitoringChart() {
   const summary = currentPortfolio?.summary || {};
   const limitVal =
     dim === 'environments'
-      ? summary.entitlementEnvs || 20
+      ? summary.entitlementEnvs || 6
       : summary.entitlementPdu || 500;
 
   const unitLabel = dim === 'environments' ? 'Env Units' : 'PDUs';
@@ -978,6 +977,47 @@ function renderMonitoringChart() {
 
 /* Monthly API Calls Chart */
 
+function updateCallsBreakdownBanner(stdCalls, extCalls, weightedCalls, rawCalls) {
+  const std = Number(stdCalls || 0);
+  const ext = Number(extCalls || 0);
+  const stdEntitlement = Math.round(std * 0.2);
+  const extEntitlement = Math.round(ext * 1.0);
+  const entitlementSum = stdEntitlement + extEntitlement;
+  const weighted = (std > 0 || ext > 0) ? entitlementSum : Number(weightedCalls ?? entitlementSum);
+  const raw = (std > 0 || ext > 0) ? (std + ext) : Number(rawCalls ?? (std + ext));
+
+  const stdEl = document.getElementById('banner-calls-std');
+  if (stdEl) {
+    stdEl.textContent = `${std.toLocaleString()} (${formatCompactCalls(std)})`;
+    stdEl.title = `${std.toLocaleString()} standard calls`;
+  }
+  const stdWeightedEl = document.getElementById('banner-calls-std-weighted');
+  if (stdWeightedEl) {
+    stdWeightedEl.innerHTML = `&rarr; <strong>${stdEntitlement.toLocaleString()}</strong> ent. calls (0.2&times;)`;
+  }
+
+  const extEl = document.getElementById('banner-calls-ext');
+  if (extEl) {
+    extEl.textContent = `${ext.toLocaleString()} (${formatCompactCalls(ext)})`;
+    extEl.title = `${ext.toLocaleString()} extensible calls`;
+  }
+  const extWeightedEl = document.getElementById('banner-calls-ext-weighted');
+  if (extWeightedEl) {
+    extWeightedEl.innerHTML = `&rarr; <strong>${extEntitlement.toLocaleString()}</strong> ent. calls (1.0&times;)`;
+  }
+
+  const totalWeightedEl = document.getElementById('banner-calls-total-weighted');
+  if (totalWeightedEl) {
+    totalWeightedEl.textContent = `${weighted.toLocaleString()} (${formatCompactCalls(weighted)})`;
+    totalWeightedEl.title = `Entitlement Calls = ${ext.toLocaleString()} Extensible + (${std.toLocaleString()} Standard × 0.2 = ${stdEntitlement.toLocaleString()}) = ${weighted.toLocaleString()}`;
+  }
+  const rawTotalEl = document.getElementById('banner-calls-raw-total');
+  if (rawTotalEl) {
+    rawTotalEl.innerHTML = `- <strong>${formatCompactCalls(extEntitlement)}</strong> Ext + <strong>${formatCompactCalls(stdEntitlement)}</strong> Std Ent. &bull; Raw: ${formatCompactCalls(raw)}`;
+    rawTotalEl.title = `Entitlement Sum = Extensible (${ext.toLocaleString()}) + 0.2 × Standard (${std.toLocaleString()} = ${stdEntitlement.toLocaleString()}) = ${weighted.toLocaleString()} | Raw Total: ${raw.toLocaleString()}`;
+  }
+}
+
 async function fetchMonthlyCallsSeries(refresh = false) {
   const container = document.getElementById('calls-monthly-chart-container');
   const subtitle = document.getElementById('calls-chart-subtitle');
@@ -1012,7 +1052,7 @@ function renderMonthlyCallsChart() {
   const envFilter = document.getElementById('filter-env')?.value || 'ALL';
   const footprintFilter = document.getElementById('filter-footprint')?.value || 'ALL';
   const summary = currentPortfolio?.summary || {};
-  const yearlyLimit = summary.entitlementYearlyCalls || 100_000_000;
+  const yearlyLimit = summary.entitlementYearlyCalls || 1_500_000_000;
   const monthlyPaceLimit = Math.round(yearlyLimit / 12);
 
   const periodStartStr =
@@ -1085,6 +1125,20 @@ function renderMonthlyCallsChart() {
   const isYearlyAbove = totalContractCalls > yearlyLimit;
   const pctYearly = yearlyLimit > 0 ? ((totalContractCalls / yearlyLimit) * 100).toFixed(1) : '0.0';
 
+  const seriesStdCalls = matchingSeries.reduce((sum, s) => sum + (s.standardApiCalls || 0), 0);
+  const seriesExtCalls = matchingSeries.reduce((sum, s) => sum + (s.extensibleApiCalls || 0), 0);
+  const seriesEntitlementCalls = Math.round(seriesStdCalls * 0.2 + seriesExtCalls * 1.0);
+  const seriesRawCalls = matchingSeries.reduce(
+    (sum, s) => sum + (s.rawApiCalls || (s.standardApiCalls || 0) + (s.extensibleApiCalls || 0)),
+    0
+  );
+  updateCallsBreakdownBanner(
+    seriesStdCalls,
+    seriesExtCalls,
+    seriesEntitlementCalls > 0 ? seriesEntitlementCalls : totalContractCalls,
+    seriesRawCalls
+  );
+
   if (callsPill) {
     if (isYearlyAbove) {
       callsPill.className = 'chart-status-pill above';
@@ -1096,15 +1150,10 @@ function renderMonthlyCallsChart() {
   }
 
   if (subtitle) {
-    subtitle.innerHTML = `Contract Period: <code>${escapeHtml(periodStartStr)} &rarr; ${escapeHtml(
-      periodEndStr
-    )}</code> &bull; Cumulative Calls: <strong style="color:${
-      isYearlyAbove ? '#f87171' : '#34d399'
-    };">${totalContractCalls.toLocaleString()} (${formatCompactCalls(
-      totalContractCalls
-    )})</strong> / <strong>${formatCompactCalls(yearlyLimit)}</strong> (${pctYearly}%) &bull; Monthly Avg Allowance: <strong>${formatCompactCalls(
-      monthlyPaceLimit
-    )}/mo</strong>`;
+    const periodDisplay = periodEndStr
+      ? `${escapeHtml(periodStartStr)} &rarr; ${escapeHtml(periodEndStr)}`
+      : escapeHtml(periodStartStr);
+    subtitle.innerHTML = `Contract Period: <code>${periodDisplay}</code>`;
   }
 
   const width = container.clientWidth || 960;
@@ -1261,7 +1310,12 @@ function populateOrgDropdown(portfolio) {
   const summaryBadge = document.getElementById('org-selection-summary');
   if (!listContainer || !portfolio) return;
 
-  const orgs = portfolio.organizations || [];
+  const orgs = [...(portfolio.organizations || [])].sort((a, b) =>
+    String(a.organization || '').localeCompare(String(b.organization || ''), undefined, {
+      sensitivity: 'base',
+      numeric: true,
+    })
+  );
   const validOrgSet = new Set(orgs.map((o) => o.organization));
 
   Array.from(selectedOrgs).forEach((name) => {
@@ -1351,7 +1405,12 @@ function populateEnvDropdown(portfolio) {
     envTotals.set(e.environment, (envTotals.get(e.environment) || 0) + e.totalPdus);
   });
 
-  const sortedEnvNames = Array.from(envTotals.keys()).sort();
+  const sortedEnvNames = Array.from(envTotals.keys()).sort((a, b) =>
+    String(a || '').localeCompare(String(b || ''), undefined, {
+      sensitivity: 'base',
+      numeric: true,
+    })
+  );
 
   envSelect.innerHTML =
     `<option value="ALL">All Environments (${sortedEnvNames.length})</option>` +
@@ -1374,8 +1433,8 @@ function renderSimplifiedDashboard() {
 
   const summary = currentPortfolio.summary;
   const limitPdu = summary.entitlementPdu || 500;
-  const limitEnvs = summary.entitlementEnvs || 20;
-  const limitCalls = summary.entitlementYearlyCalls || 100_000_000;
+  const limitEnvs = summary.entitlementEnvs || 6;
+  const limitCalls = summary.entitlementYearlyCalls || 1_500_000_000;
   const contractStartDate = summary.contractStartDate || '2026-01-01';
   const contractPeriodStart = summary.contractPeriodStart || contractStartDate;
   const contractPeriodEnd = summary.contractPeriodEnd || '';
@@ -1497,11 +1556,19 @@ function renderSimplifiedDashboard() {
   const pctEnvUsed = limitEnvs > 0 ? ((consumedEnvUnits / limitEnvs) * 100).toFixed(1) : '0.0';
 
   // 3. Yearly API Calls (Contract Period) metrics for filtered scope
+  const consumedStdCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.standardApiCalls || 0), 0);
+  const consumedExtCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.extensibleApiCalls || 0), 0);
+  const consumedRawCalls = allMatchingEnvs.reduce(
+    (sum, e) => sum + (e.rawApiCalls ?? ((e.standardApiCalls || 0) + (e.extensibleApiCalls || 0))),
+    0
+  );
   const consumedCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.yearlyApiCalls || 0), 0);
   const projectedCalls = Math.round(consumedCalls * (daysInPeriod / Math.max(1, daysElapsed)));
   const isCallsAbove = consumedCalls > limitCalls;
   const diffCalls = Math.abs(limitCalls - consumedCalls);
   const pctCallsUsed = limitCalls > 0 ? ((consumedCalls / limitCalls) * 100).toFixed(1) : '0.0';
+
+  updateCallsBreakdownBanner(consumedStdCalls, consumedExtCalls, consumedCalls, consumedRawCalls);
 
   const xPdus = allMatchingEnvs
     .filter((e) => e.runtimeType !== 'HYBRID')
@@ -1556,6 +1623,22 @@ function renderSimplifiedDashboard() {
     consumedCallsEl.className = isCallsAbove ? 'above' : 'below';
   }
   document.getElementById('val-limit-calls').textContent = formatCompactCalls(limitCalls);
+  const chipStd = document.getElementById('chip-calls-std');
+  if (chipStd) {
+    chipStd.textContent = `Std: ${formatCompactCalls(consumedStdCalls)}`;
+    chipStd.title = `Standard Calls: ${consumedStdCalls.toLocaleString()} (0.2× weighting)`;
+  }
+  const chipExt = document.getElementById('chip-calls-ext');
+  if (chipExt) {
+    chipExt.textContent = `Ext: ${formatCompactCalls(consumedExtCalls)}`;
+    chipExt.title = `Extensible Calls: ${consumedExtCalls.toLocaleString()} (1.0× weighting)`;
+  }
+  const chipRaw = document.getElementById('chip-calls-raw');
+  if (chipRaw) {
+    chipRaw.textContent = `Raw: ${formatCompactCalls(consumedRawCalls)}`;
+    chipRaw.title = `Raw API Calls: ${consumedRawCalls.toLocaleString()}`;
+  }
+
   document.getElementById('val-calls-formula').innerHTML = `Period: <code>${escapeHtml(
     contractPeriodStart
   )} &rarr; ${escapeHtml(contractPeriodEnd)}</code> (${daysElapsed}d elapsed) &bull; <strong>${pctCallsUsed}% used</strong> &bull; Run-rate: <strong>${formatCompactCalls(
@@ -1603,6 +1686,22 @@ function renderSimplifiedDashboard() {
   if (elX) elX.textContent = xPdus.toLocaleString();
   if (elHyb) elHyb.textContent = hybridPdus.toLocaleString();
   if (elEnvs) elEnvs.textContent = activeEnvsCount.toLocaleString();
+
+  const elStdCalls = document.getElementById('legend-std-calls');
+  const elExtCalls = document.getElementById('legend-ext-calls');
+  const legCallsBreakdown = document.getElementById('legend-calls-breakdown-summary');
+  if (elStdCalls) {
+    elStdCalls.textContent = `${formatCompactCalls(consumedStdCalls)} Std (0.2×)`;
+    elStdCalls.title = `${consumedStdCalls.toLocaleString()} standard calls`;
+  }
+  if (elExtCalls) {
+    elExtCalls.textContent = `${formatCompactCalls(consumedExtCalls)} Ext (1.0×)`;
+    elExtCalls.title = `${consumedExtCalls.toLocaleString()} extensible calls`;
+  }
+  if (legCallsBreakdown) {
+    const stdEnt = Math.round(consumedStdCalls * 0.2);
+    legCallsBreakdown.title = `Standard: ${consumedStdCalls.toLocaleString()} calls (0.2× = ${stdEnt.toLocaleString()} ent. calls) • Extensible: ${consumedExtCalls.toLocaleString()} calls (1.0×) • Entitlement Sum: ${(stdEnt + consumedExtCalls).toLocaleString()}`;
+  }
 
   // Determine active Gauge Dimension metrics
   let gaugeConsumed = consumedPdus;
@@ -1675,7 +1774,7 @@ function renderSimplifiedDashboard() {
   if (!visibleEnvs.length) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="11" style="text-align: center; padding: 1.5rem; color: var(--text-muted);">
+        <td colspan="13" style="text-align: center; padding: 1.5rem; color: var(--text-muted);">
           No environments match the current filter${hideZero ? ' (or all have 0 PDUs)' : ''}.
         </td>
       </tr>
@@ -1692,6 +1791,8 @@ function renderSimplifiedDashboard() {
         const unitsLabel = includeSf
           ? `${e.totalArtifacts} <span style="color:var(--text-muted);font-size:0.74rem;">(${e.totalProxies}P + ${e.sharedFlows}SF)</span>`
           : `${e.totalProxies}`;
+        const stdCalls = Number(e.standardApiCalls || 0);
+        const extCalls = Number(e.extensibleApiCalls || 0);
         const envCalls = Number(e.yearlyApiCalls || 0);
         const callLimitPct = limitCalls > 0 ? ((envCalls / limitCalls) * 100).toFixed(2) : '0.00';
 
@@ -1706,7 +1807,9 @@ function renderSimplifiedDashboard() {
             <td class="num-cell">${unitsLabel}</td>
             <td class="num-cell"><strong>${e.totalPdus.toLocaleString()}</strong></td>
             <td class="num-cell">${pduLimitPct}%</td>
-            <td class="num-cell" title="${envCalls.toLocaleString()} calls">${envCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envCalls)})</span></td>
+            <td class="num-cell" title="${stdCalls.toLocaleString()} standard calls">${stdCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(stdCalls)})</span></td>
+            <td class="num-cell" title="${extCalls.toLocaleString()} extensible calls">${extCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(extCalls)})</span></td>
+            <td class="num-cell" title="${envCalls.toLocaleString()} entitlement calls (weighted)"><strong>${envCalls.toLocaleString()}</strong> <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envCalls)})</span></td>
             <td class="num-cell">${callLimitPct}%</td>
           </tr>
         `;
@@ -1716,6 +1819,8 @@ function renderSimplifiedDashboard() {
 
   const visibleUnits = visibleEnvs.reduce((s, e) => s + e.totalArtifacts, 0);
   const visibleEnvUnits = visibleEnvs.reduce((s, e) => s + (e.regionCount || 0), 0);
+  const visibleStdCalls = visibleEnvs.reduce((s, e) => s + (e.standardApiCalls || 0), 0);
+  const visibleExtCalls = visibleEnvs.reduce((s, e) => s + (e.extensibleApiCalls || 0), 0);
   const visibleCalls = visibleEnvs.reduce((s, e) => s + (e.yearlyApiCalls || 0), 0);
 
   tfoot.innerHTML = `
@@ -1726,7 +1831,9 @@ function renderSimplifiedDashboard() {
       <td class="num-cell">${visibleUnits.toLocaleString()} units</td>
       <td class="num-cell">${consumedPdus.toLocaleString()} PDUs</td>
       <td class="num-cell">${pctPduUsed}%</td>
-      <td class="num-cell">${formatCompactCalls(visibleCalls)} / ${formatCompactCalls(limitCalls)}</td>
+      <td class="num-cell" title="${visibleStdCalls.toLocaleString()} standard calls">${formatCompactCalls(visibleStdCalls)}</td>
+      <td class="num-cell" title="${visibleExtCalls.toLocaleString()} extensible calls">${formatCompactCalls(visibleExtCalls)}</td>
+      <td class="num-cell" title="${visibleCalls.toLocaleString()} entitlement calls">${formatCompactCalls(visibleCalls)} / ${formatCompactCalls(limitCalls)}</td>
       <td class="num-cell">${pctCallsUsed}%</td>
     </tr>
   `;

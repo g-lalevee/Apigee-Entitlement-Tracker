@@ -21,6 +21,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import threading
@@ -48,6 +49,7 @@ __all__ = [
     "MONITORING_BASE_URL",
     "build_google_oidc_auth_url",
     "clear_active_oidc_session",
+    "clear_user_session",
     "collect_all_organizations",
     "collect_all_organizations_sync",
     "discover_authorized_organizations",
@@ -55,11 +57,13 @@ __all__ = [
     "exchange_google_oidc_code",
     "fetch_monitoring_pdu_timeseries",
     "fetch_monitoring_pdu_timeseries_sync",
+    "generate_session_id",
     "get_active_jurisdiction",
     "get_active_oidc_session",
     "get_apigee_base_url",
     "get_demo_dataset",
     "get_gcp_user_auth_info",
+    "get_user_session",
     "list_available_jurisdictions",
     "populate_contract_api_calls",
     "populate_contract_api_calls_sync",
@@ -68,8 +72,8 @@ __all__ = [
     "resolve_contract_period",
     "set_active_jurisdiction",
     "set_active_oidc_session",
+    "set_user_session",
     "switch_or_login_gcp_user",
-    "time",
     "validate_google_oauth_token",
 ]
 
@@ -204,30 +208,8 @@ def list_available_jurisdictions() -> list[dict[str, str]]:
     return list(APIGEE_JURISDICTIONS.values())
 
 
-def _register_custom_jurisdiction(url_str: str) -> dict[str, str]:
-    """Parse and configure a direct custom Apigee endpoint URL."""
-    global _ACTIVE_JURISDICTION
-    custom_base = url_str.rstrip("/")
-    if not custom_base.endswith("/v1"):
-        custom_base += "/v1"
-    endpoint = custom_base.replace("https://", "").replace("http://", "").replace("/v1", "")
-    info = {
-        "code": "custom",
-        "region": "Custom",
-        "name": "Custom",
-        "description": f"Custom Endpoint ({custom_base})",
-        "endpoint": endpoint,
-        "baseUrl": custom_base,
-    }
-    APIGEE_JURISDICTIONS["custom"] = info
-    _ACTIVE_JURISDICTION = "custom"
-    if hasattr(_thread_local, "session"):
-        delattr(_thread_local, "session")
-    return info
-
-
-def set_active_jurisdiction(code_or_url: str | None) -> dict[str, str]:
-    """Set active jurisdiction by code ('global', 'eu', 'us', etc.) or hostname/URL."""
+def set_active_jurisdiction(code_or_url: str | None) -> dict[str, str] | None:
+    """Set active jurisdiction by known canonical code ('global', 'eu', 'us', etc.) or endpoint."""
     global _ACTIVE_JURISDICTION
     if not code_or_url:
         return get_active_jurisdiction()
@@ -238,9 +220,7 @@ def set_active_jurisdiction(code_or_url: str | None) -> dict[str, str]:
             if hasattr(_thread_local, "session"):
                 delattr(_thread_local, "session")
             return info
-    if clean.startswith("http://") or clean.startswith("https://"):
-        return _register_custom_jurisdiction(clean)
-    return get_active_jurisdiction()
+    return None
 
 
 # Google OIDC & OAuth 2.0 endpoints
@@ -251,80 +231,71 @@ GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
 DEFAULT_GOOGLE_CLIENT_ID = ""
 
-ADC_LOGIN_SCOPES: list[str] = [
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/cloud-platform",
-]
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+ADC_LOGIN_SCOPES: list[str] = [
+    CLOUD_PLATFORM_SCOPE,
+]
 
 _thread_local = threading.local()
 
 _ACTIVE_OIDC_SESSION: dict[str, Any] = {}
+_USER_SESSIONS: dict[str, dict[str, Any]] = {}
 _OIDC_LOCK = threading.Lock()
-_SESSION_CACHE_FILE = Path(__file__).resolve().parent / "data" / ".session.json"
 
 
-def _save_session_to_disk(sess: dict[str, Any]) -> None:
-    """Safely persist active session dictionary to disk with secure permissions."""
-    try:
-        _SESSION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = _SESSION_CACHE_FILE.with_suffix(".tmp")
-        tmp_file.write_text(json.dumps(sess, indent=2), encoding="utf-8")
-        try:
-            os.chmod(tmp_file, 0o600)
-        except OSError as exc:
-            logger.debug("Failed setting file permissions on session cache: %s", exc)
-        tmp_file.replace(_SESSION_CACHE_FILE)
-    except OSError as exc:
-        logger.debug("Failed persisting session cache to disk: %s", exc)
+def generate_session_id() -> str:
+    """Generate a cryptographically secure random session identifier."""
+    return secrets.token_urlsafe(32)
 
 
-def _load_session_from_disk() -> dict[str, Any]:
-    """Load cached session dictionary from disk if available."""
-    try:
-        if _SESSION_CACHE_FILE.exists():
-            content = _SESSION_CACHE_FILE.read_text(encoding="utf-8")
-            if content.strip():
-                return json.loads(content)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.debug("Failed loading session cache from disk: %s", exc)
-    return {}
+def set_user_session(session_id: str, session: dict[str, Any]) -> None:
+    """Store user session data in memory keyed by session identifier."""
+    if not session_id:
+        return
+    with _OIDC_LOCK:
+        _USER_SESSIONS[session_id] = dict(session)
+
+
+def get_user_session(session_id: str | None) -> dict[str, Any]:
+    """Retrieve user session data from memory by session identifier."""
+    if not session_id:
+        return {}
+    with _OIDC_LOCK:
+        sess = _USER_SESSIONS.get(session_id)
+        return dict(sess) if sess else {}
+
+
+def clear_user_session(session_id: str | None) -> None:
+    """Evict user session from memory by session identifier."""
+    if not session_id:
+        return
+    with _OIDC_LOCK:
+        _USER_SESSIONS.pop(session_id, None)
 
 
 def set_active_oidc_session(session: dict[str, Any]) -> None:
-    """Set the active user session and persist to disk cache."""
+    """Set the in-memory active user session (retained for CLI workflows without disk caching)."""
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = dict(session)
     if hasattr(_thread_local, "session"):
         delattr(_thread_local, "session")
-    _save_session_to_disk(session)
 
 
 def get_active_oidc_session() -> dict[str, Any]:
-    """Retrieve the current active user session, restoring from disk cache if needed."""
+    """Retrieve the in-memory active CLI user session without disk reads."""
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
-        if not _ACTIVE_OIDC_SESSION:
-            disk_sess = _load_session_from_disk()
-            if disk_sess:
-                _ACTIVE_OIDC_SESSION = disk_sess
         return dict(_ACTIVE_OIDC_SESSION)
 
 
 def clear_active_oidc_session() -> None:
-    """Clear the active user session and delete disk cache."""
+    """Clear the in-memory active CLI user session."""
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = {}
     if hasattr(_thread_local, "session"):
         delattr(_thread_local, "session")
-    try:
-        if _SESSION_CACHE_FILE.exists():
-            _SESSION_CACHE_FILE.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("Failed unlinking session cache: %s", exc)
 
 
 def _validate_tokeninfo(clean_token: str) -> dict[str, Any] | None:
@@ -432,6 +403,11 @@ def _fetch_userinfo_for_token(access_token: str) -> dict[str, Any]:
             return ui_resp.json()
     except requests.RequestException as exc:
         logger.debug("Failed retrieving userinfo for access token: %s", exc)
+
+    info = _validate_tokeninfo(access_token)
+    if info and info.get("email"):
+        clean_email = str(info["email"])
+        return {"email": clean_email, "name": clean_email}
     return {}
 
 
@@ -602,21 +578,20 @@ def _restore_explicit_token(
     oidc_sess: dict[str, Any],
 ) -> dict[str, Any]:
     """Restore or update OIDC session from explicit request parameters."""
-    if explicit_token and _should_refresh_explicit_token(explicit_token, oidc_sess):
+    sess = dict(oidc_sess)
+    if explicit_token and _should_refresh_explicit_token(explicit_token, sess):
         new_sess = _build_explicit_session(
             explicit_token,
             explicit_refresh_token,
             explicit_account,
-            oidc_sess.get("refreshToken"),
+            sess.get("refreshToken"),
         )
         if new_sess:
-            set_active_oidc_session(new_sess)
             return new_sess
 
-    if explicit_refresh_token and not oidc_sess.get("refreshToken"):
-        oidc_sess["refreshToken"] = explicit_refresh_token
-        set_active_oidc_session(oidc_sess)
-    return oidc_sess
+    if explicit_refresh_token and not sess.get("refreshToken"):
+        sess["refreshToken"] = explicit_refresh_token
+    return sess
 
 
 def _attempt_token_refresh(refresh_tok: str | None) -> tuple[bool, bool, int | None]:
@@ -724,7 +699,6 @@ def _try_load_local_gcloud_token(gcloud_bin: str, active_account: str | None) ->
                     "expiresAt": time.time() + float(tok_info.get("expiresIn", 3600)),
                     "authMethod": "LOCAL_GCLOUD_ADC",
                 }
-                set_active_oidc_session(sess_data)
                 return sess_data
     except (subprocess.SubprocessError, OSError, ValueError) as exc:
         logger.debug("Local gcloud ADC token read failed: %s", exc)
@@ -745,7 +719,7 @@ def _build_oidc_user_auth_payload(
         if oidc_sess.get("expiresAt")
         else (int(expires_in) if expires_in else 3600)
     )
-    email = str(oidc_sess.get("email", ""))
+    email = str(oidc_sess.get("email") or oidc_sess.get("account") or "")
     return {
         "authenticated": token_valid,
         "hasUserToken": token_valid,
@@ -872,13 +846,15 @@ def get_gcp_user_auth_info(
     explicit_token: str | None = None,
     explicit_refresh_token: str | None = None,
     explicit_account: str | None = None,
+    user_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Inspect the active Google Cloud user or credentials and token expiration status."""
+    base_sess = dict(user_session) if user_session is not None else get_active_oidc_session()
     oidc_sess = _restore_explicit_token(
         explicit_token,
         explicit_refresh_token,
         explicit_account,
-        get_active_oidc_session(),
+        base_sess,
     )
     cur_jur = get_active_jurisdiction()
     all_jurisdictions = list(APIGEE_JURISDICTIONS.values())
@@ -887,7 +863,7 @@ def get_gcp_user_auth_info(
     refresh_tok = oidc_sess.get("refreshToken") or explicit_refresh_token
     token_valid, token_expired, expires_in = _evaluate_token_liveness(token, refresh_tok, oidc_sess.get("expiresAt"))
 
-    if oidc_sess.get("email") and (token_valid or token_expired):
+    if (oidc_sess.get("email") or oidc_sess.get("account")) and (token_valid or token_expired):
         return _build_oidc_user_auth_payload(
             oidc_sess, token_valid, token_expired, expires_in, cur_jur, all_jurisdictions
         )
@@ -906,7 +882,7 @@ def _resolve_non_oidc_auth(
     all_jurisdictions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Resolve authentication state via local gcloud CLI or Application Default Credentials."""
-    gcloud_bin = _find_gcloud_bin()
+    gcloud_bin = None if os.environ.get("K_SERVICE") else _find_gcloud_bin()
     active_account, all_accounts, project_id = (
         _probe_gcloud_active_account(gcloud_bin) if gcloud_bin else (None, [], None)
     )
@@ -947,7 +923,7 @@ def _login_via_gcloud_interactive(gcloud_bin: str, account: str | None) -> bool:
             "--quiet",
         ]
         if account:
-            cmd.append(account)
+            cmd.extend(["--account", account])
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
         if res.returncode == 0:
             tok_res = subprocess.run(
@@ -1014,23 +990,12 @@ def _handle_browser_login(
     return info
 
 
-def _apply_gcp_account_switch(account: str, gcloud_bin: str | None) -> None:
-    """Update active OIDC session and local gcloud CLI config for selected account."""
+def _apply_gcp_account_switch(account: str, gcloud_bin: str | None = None) -> None:
+    """Update active OIDC session for selected account without modifying workstation gcloud configuration."""
     oidc_sess = get_active_oidc_session()
     if oidc_sess:
         oidc_sess["email"] = account
         set_active_oidc_session(oidc_sess)
-    if gcloud_bin:
-        try:
-            subprocess.run(
-                [gcloud_bin, "config", "set", "account", account],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            logger.debug("Failed setting gcloud account config: %s", exc)
 
 
 def switch_or_login_gcp_user(
@@ -1406,6 +1371,9 @@ def _build_env_summary_record(
         "proxyOnlyPdus": total_proxies_env * region_count,
         "sharedFlowPdus": shared_flows_count * region_count,
         "totalPdus": total_artifacts_env * region_count,
+        "standardApiCalls": 0,
+        "extensibleApiCalls": 0,
+        "rawApiCalls": 0,
         "yearlyApiCalls": 0,
         "callsSource": "PENDING",
         "dailyCalls": {},
@@ -1636,34 +1604,81 @@ def resolve_contract_period(contract_start_date: str | None = None) -> dict[str,
     }
 
 
+def _extract_metric_daily_points(
+    metric_block: dict[str, Any],
+    daily_target: dict[str, int],
+) -> int:
+    """Extract timestamp points from an Apigee analytics metric block and add to daily_target."""
+    added = 0
+    for val_item in metric_block.get("values", []):
+        ts_ms = val_item.get("timestamp")
+        try:
+            cnt = int(round(float(val_item.get("value", 0))))
+        except (ValueError, TypeError):
+            cnt = 0
+        if ts_ms and cnt > 0:
+            day_key = datetime.datetime.fromtimestamp(
+                int(ts_ms) / 1000.0, tz=datetime.timezone.utc
+            ).strftime("%Y-%m-%d")
+            daily_target[day_key] = daily_target.get(day_key, 0) + cnt
+            added += cnt
+    return added
+
+
+def _parse_analytics_env_block(
+    env_block: dict[str, Any],
+    daily_std: dict[str, int],
+    daily_ext: dict[str, int],
+) -> tuple[int, int]:
+    """Parse dimensions or direct metrics from an Apigee analytics environment block."""
+    std_c = 0
+    ext_c = 0
+    dims = env_block.get("dimensions", [])
+    if dims:
+        for dim_item in dims:
+            dim_name = str(dim_item.get("name", "")).strip().lower()
+            target_map = daily_ext if "extensible" in dim_name else daily_std
+            for mb in dim_item.get("metrics", []):
+                added = _extract_metric_daily_points(mb, target_map)
+                if "extensible" in dim_name:
+                    ext_c += added
+                else:
+                    std_c += added
+    else:
+        for mb in env_block.get("metrics", []):
+            std_c += _extract_metric_daily_points(mb, daily_std)
+    return std_c, ext_c
+
+
 def _query_env_analytics_chunks(
     sess: requests.Session,
     base_url: str,
     org_name: str,
     env_name: str,
     chunks: list[tuple[datetime.datetime, datetime.datetime]],
-) -> tuple[dict[str, int], bool]:
-    """Query Apigee Analytics endpoint in 90-day time chunks."""
-    daily_map: dict[str, int] = {}
+) -> tuple[dict[str, int], int, int, bool]:
+    """Query Apigee Analytics endpoint with proxy_deployment_type dimension in 90-day time chunks."""
+    daily_std: dict[str, int] = {}
+    daily_ext: dict[str, int] = {}
     for c_start, c_end in chunks:
         tr_str = f"{c_start.strftime('%m/%d/%Y %H:%M')}~{c_end.strftime('%m/%d/%Y %H:%M')}"
-        stats_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/"
         params = {"select": "sum(message_count)", "timeRange": tr_str, "timeUnit": "day"}
-        data, err = _get_json_sync(sess, stats_url, params=params, timeout=15.0)
-        if err or not data:
-            return daily_map, False
+        dim_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/proxy_deployment_type"
+        data, err = _get_json_sync(sess, dim_url, params=params, timeout=15.0)
+        if err or not data or not data.get("environments"):
+            flat_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/"
+            data, err = _get_json_sync(sess, flat_url, params=params, timeout=15.0)
+            if err or not data:
+                return {}, 0, 0, False
         for env_block in data.get("environments", []):
-            for metric_block in env_block.get("metrics", []):
-                for val_item in metric_block.get("values", []):
-                    ts_ms = val_item.get("timestamp")
-                    try:
-                        cnt = int(round(float(val_item.get("value", 0))))
-                    except (ValueError, TypeError):
-                        cnt = 0
-                    if ts_ms and cnt > 0:
-                        day_key = datetime.datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
-                        daily_map[day_key] = daily_map.get(day_key, 0) + cnt
-    return daily_map, True
+            _parse_analytics_env_block(env_block, daily_std, daily_ext)
+
+    daily_map: dict[str, int] = {}
+    for k, v in daily_std.items():
+        daily_map[k] = daily_map.get(k, 0) + v
+    for k, v in daily_ext.items():
+        daily_map[k] = daily_map.get(k, 0) + v
+    return daily_map, sum(daily_std.values()), sum(daily_ext.values()), True
 
 
 def _process_monitoring_point(pt: dict[str, Any], env_data: dict[str, Any]) -> None:
@@ -1709,6 +1724,35 @@ def _query_monitoring_response_counts(
             _process_monitoring_point(pt, env_results[env_name])
 
 
+def _generate_time_chunks(
+    query_start: datetime.datetime,
+    query_end: datetime.datetime,
+    step_days: int = 90,
+) -> list[tuple[datetime.datetime, datetime.datetime]]:
+    """Split a date range into chronological time windows."""
+    chunks: list[tuple[datetime.datetime, datetime.datetime]] = []
+    cur = query_start
+    while cur < query_end:
+        nxt = min(query_end, cur + datetime.timedelta(days=step_days))
+        chunks.append((cur, nxt))
+        cur = nxt
+    return chunks
+
+
+def _init_env_call_results(envs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Initialize result structures for environment call queries."""
+    return {
+        e["environment"]: {
+            "daily": {},
+            "standardApiCalls": 0,
+            "extensibleApiCalls": 0,
+            "source": "APIGEE_ANALYTICS",
+            "analytics_ok": False,
+        }
+        for e in envs
+    }
+
+
 def _fetch_single_org_contract_calls_sync(
     org_obj: dict[str, Any],
     query_start: datetime.datetime,
@@ -1724,26 +1768,20 @@ def _fetch_single_org_contract_calls_sync(
         return {}
 
     sess, apigee_base_url, _ = _get_thread_session(account=account, explicit_token=explicit_token)
-
-    chunks: list[tuple[datetime.datetime, datetime.datetime]] = []
-    cur = query_start
-    while cur < query_end:
-        nxt = min(query_end, cur + datetime.timedelta(days=90))
-        chunks.append((cur, nxt))
-        cur = nxt
-
-    env_results: dict[str, dict[str, Any]] = {
-        e["environment"]: {"daily": {}, "source": "APIGEE_ANALYTICS", "analytics_ok": False}
-        for e in envs
-    }
+    chunks = _generate_time_chunks(query_start, query_end, step_days=90)
+    env_results = _init_env_call_results(envs)
 
     for e in envs:
         env_name = e["environment"]
         if int(e.get("totalArtifacts", 0)) <= 0 and int(e.get("totalPdus", 0)) <= 0:
             continue
-        daily_calls, ok = _query_env_analytics_chunks(sess, apigee_base_url, org_name, env_name, chunks)
+        daily_calls, std_c, ext_c, ok = _query_env_analytics_chunks(
+            sess, apigee_base_url, org_name, env_name, chunks
+        )
         if ok:
             env_results[env_name]["daily"] = daily_calls
+            env_results[env_name]["standardApiCalls"] = std_c
+            env_results[env_name]["extensibleApiCalls"] = ext_c
             env_results[env_name]["analytics_ok"] = True
         else:
             env_results[env_name]["source"] = "CLOUD_MONITORING"
@@ -1765,7 +1803,11 @@ def _generate_demo_calls(
             base_annual = int(e.get("demoAnnualCallsBase", e.get("totalPdus", 0) * 420_000))
             daily_avg = base_annual / 365.0
             daily_map: dict[str, int] = {}
-            total_c = 0
+            total_raw = 0
+            std_proxies = int(e.get("standardProxies", 0))
+            ext_proxies = int(e.get("extensibleProxies", 0))
+            tot_p = std_proxies + ext_proxies
+            std_ratio = (std_proxies / tot_p) if tot_p > 0 else 0.75
             for d_idx in range(num_days + 1):
                 day_dt = q_start + datetime.timedelta(days=d_idx)
                 if day_dt > q_end:
@@ -1773,8 +1815,14 @@ def _generate_demo_calls(
                 wave = 0.85 + 0.30 * math.sin((d_idx + len(e["environment"])) * 0.4)
                 c_val = max(0, int(round(daily_avg * wave)))
                 daily_map[day_dt.strftime("%Y-%m-%d")] = c_val
-                total_c += c_val
-            e["yearlyApiCalls"] = total_c
+                total_raw += c_val
+            std_c = int(round(total_raw * std_ratio))
+            ext_c = total_raw - std_c
+            weighted_c = int(round(std_c * 0.2 + ext_c * 1.0))
+            e["standardApiCalls"] = std_c
+            e["extensibleApiCalls"] = ext_c
+            e["rawApiCalls"] = total_raw
+            e["yearlyApiCalls"] = weighted_c
             e["callsSource"] = "APIGEE_ANALYTICS_DEMO"
             e["dailyCalls"] = daily_map
 
@@ -1793,7 +1841,21 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
     for e in org_obj.get("environments", []):
         e_info = org_res.get(e["environment"], {})
         daily_map = e_info.get("daily", {})
-        e["yearlyApiCalls"] = sum(daily_map.values())
+        std_c = int(e_info.get("standardApiCalls", 0))
+        ext_c = int(e_info.get("extensibleApiCalls", 0))
+        raw_c = std_c + ext_c
+        if raw_c == 0 and daily_map:
+            raw_c = sum(daily_map.values())
+            std_c = raw_c
+        total_from_daily = sum(daily_map.values())
+        if total_from_daily > raw_c:
+            std_c += total_from_daily - raw_c
+            raw_c = total_from_daily
+        weighted_c = int(round(std_c * 0.2 + ext_c * 1.0)) if (std_c > 0 or ext_c > 0) else raw_c
+        e["standardApiCalls"] = std_c
+        e["extensibleApiCalls"] = ext_c
+        e["rawApiCalls"] = raw_c
+        e["yearlyApiCalls"] = weighted_c
         e["callsSource"] = e_info.get("source", "APIGEE_ANALYTICS")
         e["dailyCalls"] = daily_map
 
@@ -2075,6 +2137,10 @@ def _extract_env_calls_series(
         "runtimeType": runtime_type,
         "source": env.get("callsSource", "APIGEE_ANALYTICS"),
         "points": pts,
+        "standardApiCalls": int(env.get("standardApiCalls", 0)),
+        "extensibleApiCalls": int(env.get("extensibleApiCalls", 0)),
+        "rawApiCalls": int(env.get("rawApiCalls", 0)),
+        "yearlyApiCalls": int(env.get("yearlyApiCalls", 0)),
     }
 
 
@@ -2331,9 +2397,9 @@ async def fetch_monitoring_pdu_timeseries(
 @dataclass(frozen=True)
 class RecalculateConfig:
     """Configuration thresholds and parameters for portfolio recalculation."""
-    entitlement_pdu: int = 1500
-    entitlement_envs: int = 20
-    entitlement_yearly_calls: int = 100_000_000
+    entitlement_pdu: int = 500
+    entitlement_envs: int = 6
+    entitlement_yearly_calls: int = 1_500_000_000
     include_shared_flows: bool = True
     region_overrides: dict[str, int] | None = None
 
@@ -2368,6 +2434,36 @@ def _resolve_effective_regions(
     return orig_regions + synthetic, r_count, True
 
 
+def _build_env_formula_and_shares(
+    tot_p: int,
+    sf_p: int,
+    r_count: int,
+    env_total_pdus: int,
+    env_yearly_calls: int,
+    cfg: RecalculateConfig,
+) -> dict[str, Any]:
+    """Calculate formula text and entitlement percentage shares for environment."""
+    sf_suffix = f" + {sf_p} shared flows" if cfg.include_shared_flows else ""
+    reg_suffix = "s" if r_count != 1 else ""
+    return {
+        "formulaText": f"({tot_p} proxies{sf_suffix}) × {r_count} region{reg_suffix} = {env_total_pdus} PDUs",
+        "entitlementSharePct": round((env_total_pdus / cfg.entitlement_pdu) * 100, 2),
+        "envEntitlementSharePct": round((r_count / cfg.entitlement_envs) * 100, 2),
+        "callsEntitlementSharePct": round((env_yearly_calls / cfg.entitlement_yearly_calls) * 100, 2),
+    }
+
+
+def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Extract standard, extensible, raw, and weighted yearly API calls."""
+    std_calls = int(env.get("standardApiCalls", 0))
+    ext_calls = int(env.get("extensibleApiCalls", 0))
+    raw_calls = int(env.get("rawApiCalls", std_calls + ext_calls))
+    env_yearly_calls = int(env.get("yearlyApiCalls", 0))
+    if env_yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
+        env_yearly_calls = int(round(std_calls * 0.2 + ext_calls * 1.0))
+    return std_calls, ext_calls, raw_calls, env_yearly_calls
+
+
 def _build_env_recalculated_record(
     env: dict[str, Any],
     meta: OrgRecalculateMeta,
@@ -2383,7 +2479,8 @@ def _build_env_recalculated_record(
     tot_p = std_p + ext_p
     sf_p = int(env.get("sharedFlows", 0))
     env_total_pdus = (tot_p * r_count) + ((sf_p * r_count) if cfg.include_shared_flows else 0)
-    env_yearly_calls = int(env.get("yearlyApiCalls", 0))
+    std_calls, ext_calls, raw_calls, env_yearly_calls = _resolve_env_call_metrics(env)
+    extra = _build_env_formula_and_shares(tot_p, sf_p, r_count, env_total_pdus, env_yearly_calls, cfg)
 
     return {
         "organization": meta.org_name,
@@ -2407,15 +2504,12 @@ def _build_env_recalculated_record(
         "proxyOnlyPdus": tot_p * r_count,
         "sharedFlowPdus": sf_p * r_count,
         "totalPdus": env_total_pdus,
+        "standardApiCalls": std_calls,
+        "extensibleApiCalls": ext_calls,
+        "rawApiCalls": raw_calls,
         "yearlyApiCalls": env_yearly_calls,
         "callsSource": env.get("callsSource", "APIGEE_ANALYTICS"),
-        "formulaText": (
-            f"({tot_p} proxies{' + ' + str(sf_p) + ' shared flows' if cfg.include_shared_flows else ''}) "
-            f"× {r_count} region{'s' if r_count != 1 else ''} = {env_total_pdus} PDUs"
-        ),
-        "entitlementSharePct": round((env_total_pdus / cfg.entitlement_pdu) * 100, 2),
-        "envEntitlementSharePct": round((r_count / cfg.entitlement_envs) * 100, 2),
-        "callsEntitlementSharePct": round((env_yearly_calls / cfg.entitlement_yearly_calls) * 100, 2),
+        **extra,
     }
 
 
@@ -2475,6 +2569,38 @@ def _recalculate_org_deployments(
     return org_deployments_out
 
 
+def _aggregate_org_env_totals(org_envs_out: list[dict[str, Any]]) -> dict[str, int]:
+    """Aggregate metrics across organization environments in a single pass."""
+    totals = {
+        "deployedProxies": 0,
+        "deployedSharedFlows": 0,
+        "environmentUnits": 0,
+        "standardProxyPdus": 0,
+        "extensibleProxyPdus": 0,
+        "proxyOnlyPdus": 0,
+        "sharedFlowPdus": 0,
+        "totalPdus": 0,
+        "standardApiCalls": 0,
+        "extensibleApiCalls": 0,
+        "rawApiCalls": 0,
+        "yearlyApiCalls": 0,
+    }
+    for e in org_envs_out:
+        totals["deployedProxies"] += e.get("totalProxies", 0)
+        totals["deployedSharedFlows"] += e.get("sharedFlows", 0)
+        totals["environmentUnits"] += e.get("environmentUnits", 0)
+        totals["standardProxyPdus"] += e.get("standardProxyPdus", 0)
+        totals["extensibleProxyPdus"] += e.get("extensibleProxyPdus", 0)
+        totals["proxyOnlyPdus"] += e.get("proxyOnlyPdus", 0)
+        totals["sharedFlowPdus"] += e.get("sharedFlowPdus", 0)
+        totals["totalPdus"] += e.get("totalPdus", 0)
+        totals["standardApiCalls"] += e.get("standardApiCalls", 0)
+        totals["extensibleApiCalls"] += e.get("extensibleApiCalls", 0)
+        totals["rawApiCalls"] += e.get("rawApiCalls", 0)
+        totals["yearlyApiCalls"] += e.get("yearlyApiCalls", 0)
+    return totals
+
+
 def _build_recalculated_org_record(
     org: dict[str, Any],
     meta: OrgRecalculateMeta,
@@ -2483,10 +2609,7 @@ def _build_recalculated_org_record(
     entitlement_pdu: int,
 ) -> dict[str, Any]:
     """Construct summary dictionary for a recalculated organization."""
-    org_deployed_proxies = sum(e["totalProxies"] for e in org_envs_out)
-    org_deployed_sfs = sum(e["sharedFlows"] for e in org_envs_out)
-    org_total_pdus = sum(e["totalPdus"] for e in org_envs_out)
-
+    t = _aggregate_org_env_totals(org_envs_out)
     return {
         "organization": meta.org_name,
         "projectId": meta.project_id,
@@ -2496,21 +2619,24 @@ def _build_recalculated_org_record(
         "billingType": meta.billing_type,
         "subscriptionPlan": org.get("subscriptionPlan", "Enterprise"),
         "state": org.get("state", "ACTIVE"),
-        "totalProxiesCreated": org.get("totalProxiesCreated", org_deployed_proxies),
-        "totalSharedFlowsCreated": org.get("totalSharedFlowsCreated", org_deployed_sfs),
+        "totalProxiesCreated": org.get("totalProxiesCreated", t["deployedProxies"]),
+        "totalSharedFlowsCreated": org.get("totalSharedFlowsCreated", t["deployedSharedFlows"]),
         "environmentCount": len(org_envs_out),
-        "environmentUnits": sum(e["environmentUnits"] for e in org_envs_out),
+        "environmentUnits": t["environmentUnits"],
         "uniqueRegionsCount": len(org_regions_set),
         "uniqueRegions": sorted(org_regions_set),
-        "deployedProxiesCount": org_deployed_proxies,
-        "deployedSharedFlowsCount": org_deployed_sfs,
-        "standardProxyPdus": sum(e["standardProxyPdus"] for e in org_envs_out),
-        "extensibleProxyPdus": sum(e["extensibleProxyPdus"] for e in org_envs_out),
-        "proxyOnlyPdus": sum(e["proxyOnlyPdus"] for e in org_envs_out),
-        "sharedFlowPdus": sum(e["sharedFlowPdus"] for e in org_envs_out),
-        "totalPdus": org_total_pdus,
-        "yearlyApiCalls": sum(e["yearlyApiCalls"] for e in org_envs_out),
-        "entitlementSharePct": round((org_total_pdus / entitlement_pdu) * 100, 2),
+        "deployedProxiesCount": t["deployedProxies"],
+        "deployedSharedFlowsCount": t["deployedSharedFlows"],
+        "standardProxyPdus": t["standardProxyPdus"],
+        "extensibleProxyPdus": t["extensibleProxyPdus"],
+        "proxyOnlyPdus": t["proxyOnlyPdus"],
+        "sharedFlowPdus": t["sharedFlowPdus"],
+        "totalPdus": t["totalPdus"],
+        "standardApiCalls": t["standardApiCalls"],
+        "extensibleApiCalls": t["extensibleApiCalls"],
+        "rawApiCalls": t["rawApiCalls"],
+        "yearlyApiCalls": t["yearlyApiCalls"],
+        "entitlementSharePct": round((t["totalPdus"] / entitlement_pdu) * 100, 2),
         "environments": org_envs_out,
     }
 
@@ -2543,6 +2669,39 @@ def _recalculate_organization(
     return org_record, org_envs_out, org_deployments_out
 
 
+def _compute_calls_quota_metrics(
+    portfolio_totals: dict[str, int],
+    period_info: dict[str, Any],
+    entitlement_yearly_calls: int,
+) -> dict[str, Any]:
+    """Compute API call quotas, standard/extensible metrics, and run-rate projections."""
+    total_calls = portfolio_totals["yearlyApiCalls"]
+    std_calls = portfolio_totals.get("standardApiCalls", 0)
+    ext_calls = portfolio_totals.get("extensibleApiCalls", 0)
+    raw_calls = portfolio_totals.get("rawApiCalls", std_calls + ext_calls)
+    calls_util_pct = round((total_calls / entitlement_yearly_calls) * 100, 1)
+
+    days_elapsed = period_info["daysElapsed"]
+    days_in_period = period_info["daysInPeriod"]
+    projected_calls = int(round(total_calls * (days_in_period / max(1, days_elapsed))))
+
+    return {
+        "totalStandardApiCalls": std_calls,
+        "totalExtensibleApiCalls": ext_calls,
+        "totalRawApiCalls": raw_calls,
+        "totalYearlyApiCalls": total_calls,
+        "projectedYearlyApiCalls": projected_calls,
+        "entitlementYearlyCalls": entitlement_yearly_calls,
+        "callsUtilizationPct": calls_util_pct,
+        "remainingYearlyCalls": max(0, entitlement_yearly_calls - total_calls),
+        "overageYearlyCalls": max(0, total_calls - entitlement_yearly_calls),
+        "callsQuotaStatus": (
+            "OVER_LIMIT" if total_calls > entitlement_yearly_calls
+            else ("WARNING" if calls_util_pct >= 85 else "HEALTHY")
+        ),
+    }
+
+
 def _compute_quota_summary(
     portfolio_totals: dict[str, int],
     period_info: dict[str, Any],
@@ -2553,16 +2712,10 @@ def _compute_quota_summary(
     """Compute overall quota health and utilization statistics across dimensions."""
     total_pdus = portfolio_totals["totalPdus"]
     total_env_units = portfolio_totals["totalEnvironmentUnits"]
-    total_calls = portfolio_totals["yearlyApiCalls"]
-
     util_pct = round((total_pdus / entitlement_pdu) * 100, 1)
     env_util_pct = round((total_env_units / entitlement_envs) * 100, 1)
-    calls_util_pct = round((total_calls / entitlement_yearly_calls) * 100, 1)
-
     overage_pdus = max(0, total_pdus - entitlement_pdu)
-    days_elapsed = period_info["daysElapsed"]
-    days_in_period = period_info["daysInPeriod"]
-    projected_calls = int(round(total_calls * (days_in_period / max(1, days_elapsed))))
+    calls_metrics = _compute_calls_quota_metrics(portfolio_totals, period_info, entitlement_yearly_calls)
 
     return {
         "entitlementPdu": entitlement_pdu,
@@ -2576,18 +2729,12 @@ def _compute_quota_summary(
         "remainingEnvs": max(0, entitlement_envs - total_env_units),
         "overageEnvs": max(0, total_env_units - entitlement_envs),
         "envQuotaStatus": "OVER_LIMIT" if total_env_units > entitlement_envs else ("WARNING" if env_util_pct >= 85 else "HEALTHY"),
-        "totalYearlyApiCalls": total_calls,
-        "projectedYearlyApiCalls": projected_calls,
-        "entitlementYearlyCalls": entitlement_yearly_calls,
-        "callsUtilizationPct": calls_util_pct,
-        "remainingYearlyCalls": max(0, entitlement_yearly_calls - total_calls),
-        "overageYearlyCalls": max(0, total_calls - entitlement_yearly_calls),
-        "callsQuotaStatus": "OVER_LIMIT" if total_calls > entitlement_yearly_calls else ("WARNING" if calls_util_pct >= 85 else "HEALTHY"),
+        **calls_metrics,
         "contractStartDate": period_info["contractStartDate"],
         "contractPeriodStart": period_info["periodStart"],
         "contractPeriodEnd": period_info["periodEnd"],
-        "daysElapsedInContract": days_elapsed,
-        "daysInContractPeriod": days_in_period,
+        "daysElapsedInContract": period_info["daysElapsed"],
+        "daysInContractPeriod": period_info["daysInPeriod"],
     }
 
 
@@ -2636,6 +2783,10 @@ def _build_portfolio_summary(
         "totalEnvironmentUnits": portfolio_totals["totalEnvironmentUnits"],
         "totalActiveEnvRegionAttachments": portfolio_totals["totalEnvironmentUnits"],
         "totalPdus": portfolio_totals["totalPdus"],
+        "totalStandardApiCalls": portfolio_totals.get("standardApiCalls", 0),
+        "totalExtensibleApiCalls": portfolio_totals.get("extensibleApiCalls", 0),
+        "totalRawApiCalls": portfolio_totals.get("rawApiCalls", 0),
+        "totalYearlyApiCalls": portfolio_totals["yearlyApiCalls"],
         **agg,
         **quota_summary,
     }
@@ -2697,14 +2848,14 @@ def _build_recalculated_portfolio_payload(
 
 def recalculate_portfolio(
     raw_data: dict[str, Any],
-    entitlement_pdu: int = 1500,
+    entitlement_pdu: int = 500,
     include_shared_flows: bool = True,
     region_overrides: dict[str, int] | None = None,
-    entitlement_envs: int = 20,
+    entitlement_envs: int = 6,
     **extra_settings: Any,
 ) -> dict[str, Any]:
     """Recalculate environment, organization, and cross-organization entitlement metrics."""
-    ent_calls = int(extra_settings.get("entitlement_yearly_calls", 100_000_000))
+    ent_calls = int(extra_settings.get("entitlement_yearly_calls", 1_500_000_000))
     contract_start = extra_settings.get("contract_start_date")
 
     cfg = RecalculateConfig(
@@ -2723,6 +2874,9 @@ def recalculate_portfolio(
     portfolio_totals = {
         "totalPdus": sum(o["totalPdus"] for o in organizations_out),
         "totalEnvironmentUnits": sum(o["environmentUnits"] for o in organizations_out),
+        "standardApiCalls": sum(o.get("standardApiCalls", 0) for o in organizations_out),
+        "extensibleApiCalls": sum(o.get("extensibleApiCalls", 0) for o in organizations_out),
+        "rawApiCalls": sum(o.get("rawApiCalls", 0) for o in organizations_out),
         "yearlyApiCalls": sum(o["yearlyApiCalls"] for o in organizations_out),
     }
     quota_summary = _compute_quota_summary(
@@ -3065,6 +3219,12 @@ def _build_demo_env(
         "proxyOnlyPdus": tot_p * r_cnt,
         "sharedFlowPdus": sf_c * r_cnt,
         "totalPdus": tot_art * r_cnt,
+        "standardApiCalls": 0,
+        "extensibleApiCalls": 0,
+        "rawApiCalls": 0,
+        "yearlyApiCalls": 0,
+        "callsSource": "PENDING",
+        "dailyCalls": {},
         "demoAnnualCallsBase": (tot_art * r_cnt) * 350_000,
     }
     return env_record, deps

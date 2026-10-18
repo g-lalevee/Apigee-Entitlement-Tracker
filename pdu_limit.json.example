@@ -1,7 +1,7 @@
 {
-  "entitlementPdu": 1500,
-  "entitlementEnvs": 20,
-  "entitlementYearlyCalls": 100000000,
+  "entitlementPdu": 500,
+  "entitlementEnvs": 6,
+  "entitlementYearlyCalls": 1500000000,
   "contractStartDate": "2026-01-01",
   "updatedAt": null
 }

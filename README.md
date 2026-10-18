@@ -28,13 +28,13 @@ In Google Cloud, Apigee subscription contracts (such as 2024 subscription plans)
 * **Environment Units (Environments &times; Attached Regions)**
 * **Yearly API Call Commitments**
 
-Enterprises typically manage several organizations across business units, environments (`dev`, `test`, `stage`, `prod`), and regions. In this cross-org context, it is extremely important to know overall subscription consumption and detect impending overages for PDU, Environments or calls.
+Enterprises typically manage several Apigee organizations across business units, environments (`dev`, `test`, `stage`, `prod`), and regions. In this cross-org context, it is extremely important to know overall subscription consumption and detect impending overages for PDU, Environments or calls.
 
 ### Unified Interface & Export Suite
 **Apigee Entitlement Tracker** solves this by providing:
 1. **Unified Single-Pane-of-Glass Interface**:
    * Automatically discovers all Apigee X and Hybrid organizations your Google identity is authorized to access.
-   * **Full DRZ (Data Residency Zones) & Regional Control Plane Support**: Allows selection of non-global Apigee Control Plane Hosting Jurisdictions (US, EU, Germany, France, Switzerland, Canada, Australia, India, Japan, Qatar, Saudi Arabia, Israel, or Global default).
+   * **Full DRZ (Data Residency Zones) & Regional Control Plane Support**: Allows selection of non-global Apigee Control Plane Hosting jurisdictions (US, EU, Germany, France, ... or Global default).
    * Real-time compliance indicators and status badges (`WITHIN COMMITMENT`, `OVERAGE RISK`, `ABOVE LIMIT`) across all 3 entitlement dimensions.
    * Multi-organization and multi-environment filtering.
    * Visual time-series analytics for historical PDU capacity trends and monthly API call run-rate pacing over your active contract year.
@@ -43,7 +43,7 @@ Enterprises typically manage several organizations across business units, enviro
 
 
 2. **Structured Export Suite**:
-   * One-click **Export CSV** generating a comprehensive, 12-column audit spreadsheet formatted for Google Sheets and Excel reporting.
+   * One-click **Export CSV** generating a comprehensive, 15-column audit spreadsheet formatted for Google Sheets and Excel reporting.
    * Headless CLI mode for automated reporting and CI/CD audit jobs.
 
 ---
@@ -101,12 +101,16 @@ $$\text{Total PDUs} = \sum_{\text{Environments}} \left[ (\text{Deployed Proxies}
 #### 2. Environment Units
 $$\text{Environment Units} = \sum_{\text{Environments}} (\text{Environment} \times \text{Attached Regions})$$
 
-#### 3. Yearly API Calls (Contract Year)
+#### 3. Yearly API Calls (Contract Year) & Deployment Type Weighting
 * Aggregates recorded API call traffic from your configured **Contract Starting Date** up to the current date.
-* Evaluates total consumption against your **Yearly API Calls Entitlement (configured in Millions of calls)** and calculates monthly run-rate pacing.
-
-> [!WARNING]  
-> In this version, Standard and Extensible API proxy calls are counted the same
+* Categorizes API calls using the Apigee Analytics dimension `proxy_deployment_type`:
+  * **Standard Calls (`standard`)**: Weighted at **0.2&times;** entitlement units ($1 \text{ standard call} = 0.2 \text{ call units}$).
+  * **Extensible Calls (`extensible`)**: Weighted at **1.0&times;** entitlement units ($1 \text{ extensible call} = 1.0 \text{ call unit}$).
+* Calculates the contractual entitlement consumption formula:
+  $$\text{Entitlement Calls (Weighted)} = \text{round}\left( \text{Standard Calls} \times 0.2 + \text{Extensible Calls} \times 1.0 \right)$$
+  $$\text{Raw Total Calls} = \text{Standard Calls} + \text{Extensible Calls}$$
+* Evaluates total weighted consumption against your **Yearly API Calls Entitlement (configured in Millions of calls)** and calculates monthly run-rate pacing.
+* Both individual counts (Standard and Extensible) and the sum (weighted entitlement sum + raw sum) are displayed in the KPI cards, monthly call section banner, and environment reports.
 
 ---
 
@@ -143,7 +147,7 @@ done
 ```
 
 #### Software Requirements
-* **Python 3.10+**
+* **Python 3.11+**
 * **Google Cloud SDK (`gcloud` CLI)** installed and configured in your `PATH`.
 
 ---
@@ -153,7 +157,7 @@ done
 #### Step 1: Authenticate with Google Cloud
 Ensure your local Application Default Credentials (ADC) are configured with the required OAuth scopes:
 ```bash
-gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/cloud-platform
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform
 ```
 *(Alternatively, an active `gcloud auth login` session is also recognized).*
 
@@ -188,9 +192,9 @@ python3 app.py
 2. **Live Discovery**: A modal progress popup streams real-time status while querying organizations, environments, and deployments.
 3. **Configure Entitlements**: Expand the top **Contract & Entitlement Parameters** card and configure:
    * **Contract Starting Date** (e.g. `2026-01-01`)
-   * **PDU Entitlement Limit** (e.g. `1500`)
-   * **Environment Entitlement** (e.g. `20`)
-   * **Yearly API Calls Entitlement in Millions** (e.g. `100` for 100M calls)
+   * **PDU Entitlement Limit** (e.g. `500`)
+   * **Environment Entitlement** (e.g. `6`)
+   * **Yearly API Calls Entitlement in Millions** (e.g. `10` for 100M calls)
 4. **Inspect Metrics**:
    * Review compliance status across the 3 top overview cards.
    * Filter by Organization (multi-select), Environment, or Footprint (`Apigee X` / `Hybrid`).
@@ -281,7 +285,7 @@ gcloud run deploy "${SERVICE_NAME}" \
 
 ## CSV Export Format Reference
 
-Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` containing 12 columns formatted for Google Sheets and Excel:
+Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` containing 15 columns formatted for Google Sheets and Excel:
 
 | Column | Description | Example |
 | :--- | :--- | :--- |
@@ -295,7 +299,10 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 | `Deployed Units (Proxies + SF)` | Total deployed artifacts | `236 (204P + 32SF)` |
 | `Consumed PDUs` | Total Proxy Deployment Units consumed | `472` |
 | `% of PDU Limit` | Share of total PDU entitlement | `31.47%` |
-| `Number of call since period start` | API calls recorded since Contract Starting Date | `14250000` |
+| `Standard Calls` | Raw calls for standard proxies (weighted at 0.2×) | `1000000` |
+| `Extensible Calls` | Raw calls for extensible proxies (weighted at 1.0×) | `14050000` |
+| `Raw Total Calls` | Unweighted total recorded calls (Standard + Extensible) | `15050000` |
+| `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (0.2× Std + 1.0× Ext) | `14250000` |
 | `% of call Limit` | Share of Yearly API Calls entitlement | `14.25%` |
 
 ---
@@ -306,21 +313,37 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 ├── app.py                      # FastAPI web server, OIDC endpoints, CLI runner & cleanup routine
 ├── collector.py                # Apigee & Cloud Monitoring collection engine (X & Hybrid, OAuth2/ADC)
 ├── exporter.py                 # Structured CSV audit exporter formatted for Google Sheets / Excel
-├── requirements.txt            # Python dependencies
+├── requirements.txt            # Pinned Python dependencies
+├── tests/                      # Unit and security regression test suite
+│   ├── test_app.py             # FastAPI endpoints and routing tests
+│   ├── test_collector.py       # Metrics, PDU arithmetic & weight aggregation tests
+│   ├── test_exporter.py        # CSV export formatting and column validation tests
+│   └── test_security.py        # Session isolation, SSRF whitelist & header security tests
 ├── scripts/
 │   ├── redeploy_cloudrun.sh    # One-click rebuild & deploy from source to Cloud Run
 │   └── setup_oauth_cloudrun.sh # Automated Secret Manager & Cloud Run OAuth configuration
-├── pdu_limit.json              # Active contract parameters & limits
 ├── pdu_limit.json.example      # Example contract parameters template
 ├── Dockerfile                  # Non-root container image for Cloud Run
+├── LICENSE                     # Apache 2.0 Open Source License
 └── static/
     ├── index.html              # Single-page dashboard application
     ├── styles.css              # Dark & light theme responsive styling
-    └── app.js                  # Frontend controllers, SVG time-series charts & live scan
+    ├── app.js                  # Frontend controllers, SVG time-series charts & live scan
+    └── apigee-logo.png         # Local static brand asset
+```
+
+---
+
+## Running Tests
+
+Execute the automated test suite using Python's built-in `unittest` runner:
+
+```bash
+python3 -m unittest discover tests
 ```
 
 ---
 
 ## Contributing & License
 Contributions are welcome! Please open an issue or submit a pull request.
-Distributed under the **Apache 2.0 License**.
+Distributed under the **Apache 2.0 License**. See [LICENSE](LICENSE) for details.

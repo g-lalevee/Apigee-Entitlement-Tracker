@@ -10,6 +10,7 @@ __pycache__/
 data/
 exports/
 pdu_limit.json
+tests/
 
 # Environment variables & secrets
 .env

@@ -23,6 +23,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -38,21 +39,22 @@ from collector import (
     APIGEE_JURISDICTIONS,
     DEFAULT_GOOGLE_CLIENT_ID,
     build_google_oidc_auth_url,
-    clear_active_oidc_session,
+    clear_user_session,
     collect_all_organizations,
     discover_authorized_organizations,
     exchange_google_oidc_code,
     fetch_monitoring_pdu_timeseries,
+    generate_session_id,
     get_active_jurisdiction,
-    get_active_oidc_session,
     get_apigee_base_url,
     get_demo_dataset,
     get_gcp_user_auth_info,
+    get_user_session,
     populate_contract_api_calls,
     recalculate_portfolio,
     refresh_google_oauth_token,
     set_active_jurisdiction,
-    set_active_oidc_session,
+    set_user_session,
     switch_or_login_gcp_user,
     validate_google_oauth_token,
 )
@@ -79,10 +81,10 @@ DISCOVERED_ORGS_PATH = DATA_DIR / "discovered_orgs.json"
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "entitlementPdu": 1500,          # Cross-organization manual PDU entitlement stored permanently in pdu_limit.json
-    "entitlementEnvs": 20,           # Cross-organization Environment Units (Env × Regions) entitlement
-    "entitlementYearlyCalls": 100_000_000,  # Cross-organization Yearly API Calls entitlement over Contract Period
-    "contractStartDate": f"{datetime.datetime.now(datetime.timezone.utc).year}-01-01",
+    "entitlementPdu": 500,           # Cross-organization manual PDU entitlement stored permanently in pdu_limit.json
+    "entitlementEnvs": 6,            # Cross-organization Environment Units (Env × Regions) entitlement
+    "entitlementYearlyCalls": 1_500_000_000,  # Cross-organization Yearly API Calls entitlement over Contract Period
+    "contractStartDate": "2026-01-01",
     "includeSharedFlows": True,
     "regionOverrides": {},           # Map of "org:env" -> region count
     "orgFilter": [],
@@ -111,19 +113,22 @@ def load_entitlement_limits() -> dict[str, Any]:
     return {}
 
 
-def save_entitlement_limits(cfg: dict[str, Any]) -> None:
+def save_entitlement_limits(cfg: dict[str, Any], *, updated: bool = True) -> None:
     """Permanently store PDU, Environment Unit, and Yearly API Call limits + Contract Start Date in pdu_limit.json."""
     PDU_LIMIT_PATH.write_text(
         json.dumps(
             {
-                "entitlementPdu": max(1, int(cfg.get("entitlementPdu", 1500))),
-                "entitlementEnvs": max(1, int(cfg.get("entitlementEnvs", 20))),
-                "entitlementYearlyCalls": max(1, int(cfg.get("entitlementYearlyCalls", 100_000_000))),
+                "entitlementPdu": max(1, int(cfg.get("entitlementPdu", 500))),
+                "entitlementEnvs": max(1, int(cfg.get("entitlementEnvs", 6))),
+                "entitlementYearlyCalls": max(1, int(cfg.get("entitlementYearlyCalls", 1_500_000_000))),
                 "contractStartDate": str(
-                    cfg.get("contractStartDate")
-                    or f"{datetime.datetime.now(datetime.timezone.utc).year}-01-01"
+                    cfg.get("contractStartDate") or "2026-01-01"
                 ).strip()[:10],
-                "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "updatedAt": (
+                    datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    if updated
+                    else None
+                ),
             },
             indent=2,
         ),
@@ -145,7 +150,7 @@ def load_config() -> dict[str, Any]:
     if perm_limits:
         cfg.update(perm_limits)
     else:
-        save_entitlement_limits(cfg)
+        save_entitlement_limits(cfg, updated=False)
 
     if cfg.get("controlPlaneJurisdiction"):
         set_active_jurisdiction(cfg["controlPlaneJurisdiction"])
@@ -273,6 +278,9 @@ def _merge_org_traffic_metrics(old_o: dict[str, Any], new_o: dict[str, Any]) -> 
             and old_e.get("dailyCalls")
         ):
             new_e["dailyCalls"] = old_e["dailyCalls"]
+            new_e["standardApiCalls"] = old_e.get("standardApiCalls", 0)
+            new_e["extensibleApiCalls"] = old_e.get("extensibleApiCalls", 0)
+            new_e["rawApiCalls"] = old_e.get("rawApiCalls", 0)
             new_e["yearlyApiCalls"] = old_e.get("yearlyApiCalls", 0)
             new_e["callsSource"] = old_e.get("callsSource", "APIGEE_ANALYTICS")
 
@@ -367,7 +375,7 @@ def append_history_snapshot(portfolio: dict[str, Any]) -> list[dict[str, Any]]:
         "apigeeHybridOrgs": summary.get("apigeeHybridOrgs", 0),
         "totalEnvironments": summary.get("totalEnvironments", 0),
         "totalEnvironmentUnits": summary.get("totalEnvironmentUnits", 0),
-        "entitlementEnvs": summary.get("entitlementEnvs", 20),
+        "entitlementEnvs": summary.get("entitlementEnvs", 6),
         "totalDeployedProxies": summary.get("totalDeployedProxies", 0),
         "totalDeployedSharedFlows": summary.get("totalDeployedSharedFlows", 0),
         "apigeeXPdus": summary.get("apigeeXPdus", 0),
@@ -376,13 +384,13 @@ def append_history_snapshot(portfolio: dict[str, Any]) -> list[dict[str, Any]]:
         "extensibleProxyPdus": summary.get("extensibleProxyPdus", 0),
         "sharedFlowPdus": summary.get("sharedFlowPdus", 0),
         "totalPdus": summary.get("totalPdus", 0),
-        "entitlementPdu": summary.get("entitlementPdu", 1500),
+        "entitlementPdu": summary.get("entitlementPdu", 500),
         "utilizationPct": summary.get("utilizationPct", 0),
         "remainingPdus": summary.get("remainingPdus", 0),
         "overagePdus": summary.get("overagePdus", 0),
         "quotaStatus": summary.get("quotaStatus", "HEALTHY"),
         "totalYearlyApiCalls": summary.get("totalYearlyApiCalls", 0),
-        "entitlementYearlyCalls": summary.get("entitlementYearlyCalls", 100_000_000),
+        "entitlementYearlyCalls": summary.get("entitlementYearlyCalls", 1_500_000_000),
         "contractStartDate": summary.get("contractStartDate", ""),
     }
     history.insert(0, entry)
@@ -398,11 +406,11 @@ def get_current_portfolio(jurisdiction_code: str | None = None) -> dict[str, Any
     raw = load_raw_dataset(cur_jur_code)
     portfolio = recalculate_portfolio(
         raw,
-        entitlement_pdu=cfg.get("entitlementPdu", 1500),
+        entitlement_pdu=cfg.get("entitlementPdu", 500),
         include_shared_flows=cfg.get("includeSharedFlows", True),
         region_overrides=cfg.get("regionOverrides", {}),
-        entitlement_envs=cfg.get("entitlementEnvs", 20),
-        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 100_000_000),
+        entitlement_envs=cfg.get("entitlementEnvs", 6),
+        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 1_500_000_000),
         contract_start_date=cfg.get("contractStartDate"),
     )
     history = load_history()
@@ -424,6 +432,16 @@ app = FastAPI(
     description="Cross-organization Proxy Deployment Unit (PDU), Environment Unit, and Yearly API Call monitoring dashboard and CSV/Sheets exporter.",
     version="1.2.0",
 )
+
+_RAW_ALLOWED_HOSTS = os.environ.get(
+    "ALLOWED_HOSTS",
+    "localhost,127.0.0.1,[::1],testserver,*.run.app,*.appspot.com,*.cloudshell.dev",
+)
+ALLOWED_HOSTS = [h.strip() for h in _RAW_ALLOWED_HOSTS.split(",") if h.strip()]
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ["*"]
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -471,6 +489,46 @@ class LiveScanRequest(BaseModel):
     jurisdiction: str | None = None
 
 
+def _is_allowed_origin_host(origin: str, request_host: str) -> bool:
+    """Verify whether the request Origin/Referer matches the host or trusted hosts."""
+    try:
+        parsed = urllib.parse.urlparse(origin)
+        origin_host = parsed.netloc.split(":")[0].lower()
+        clean_request_host = request_host.split(":")[0].lower()
+        if origin_host == clean_request_host:
+            return True
+        if origin_host in {"localhost", "127.0.0.1", "testserver"}:
+            return True
+        for pattern in ALLOWED_HOSTS:
+            if pattern.startswith("*.") and origin_host.endswith(pattern[1:]):
+                return True
+            if pattern == origin_host:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+@app.middleware("http")
+async def protect_csrf_and_origin(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Protect state-changing endpoints against cross-origin and DNS rebinding attacks."""
+    if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
+        origin = request.headers.get("Origin") or request.headers.get("origin")
+        referer = request.headers.get("Referer") or request.headers.get("referer")
+        target = origin or referer
+        if target:
+            req_host = request.headers.get("host", request.url.netloc)
+            if not _is_allowed_origin_host(target, req_host):
+                return JSONResponse(
+                    {"detail": "Forbidden: cross-origin request rejected"},
+                    status_code=403,
+                )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def disable_static_and_auth_cache(
     request: Request,
@@ -501,7 +559,7 @@ def _is_clean_token(tok: str | None) -> bool:
 
 
 def extract_bearer_token(request: Request, explicit_token: str | None = None) -> str | None:
-    """Extract a user OAuth access token from explicit arguments, headers, query params, cookies, or session."""
+    """Extract a user OAuth access token from explicit arguments, headers, cookies, or session."""
     if _is_clean_token(explicit_token):
         return explicit_token.strip() if explicit_token else None
 
@@ -511,18 +569,16 @@ def extract_bearer_token(request: Request, explicit_token: str | None = None) ->
         if _is_clean_token(candidate):
             return candidate
 
-    q_tok = request.query_params.get("token", "").strip()
-    if _is_clean_token(q_tok):
-        return q_tok
-
     cookie_tok = request.cookies.get("apigee_access_token", "").strip()
     if _is_clean_token(cookie_tok):
         return cookie_tok
 
-    oidc = get_active_oidc_session()
-    session_tok = str(oidc.get("accessToken", "")).strip()
-    if _is_clean_token(session_tok):
-        return session_tok
+    session_id = request.cookies.get("apigee_session_id", "").strip()
+    if session_id:
+        user_sess = get_user_session(session_id)
+        sess_tok = str(user_sess.get("accessToken", "")).strip()
+        if _is_clean_token(sess_tok):
+            return sess_tok
 
     return None
 
@@ -534,11 +590,16 @@ def get_request_user_account(request: Request, explicit_account: str | None = No
     iap_user = request.headers.get("x-goog-authenticated-user-email") or request.headers.get("X-Goog-Authenticated-User-Email")
     if iap_user:
         return iap_user.split(":")[-1].strip() if ":" in iap_user else iap_user.strip()
-    oidc = get_active_oidc_session()
-    if oidc.get("email"):
-        return oidc["email"]
-    cfg = load_config()
-    return cfg.get("gcpAccount")
+    session_id = request.cookies.get("apigee_session_id", "").strip()
+    if session_id:
+        user_sess = get_user_session(session_id)
+        user_acct = user_sess.get("email") or user_sess.get("account")
+        if user_acct:
+            return user_acct
+    if not os.environ.get("K_SERVICE"):
+        cfg = load_config()
+        return cfg.get("gcpAccount")
+    return None
 
 
 def _apply_iap_identity(request: Request, info: dict[str, Any]) -> None:
@@ -582,14 +643,17 @@ async def _verify_request_token(info: dict[str, Any], bearer_tok: str | None) ->
 async def check_auth_status(request: Request) -> JSONResponse:
     """Return comprehensive authentication status, token validity, and active jurisdiction."""
     auth_tok = extract_bearer_token(request)
-    cookie_refresh_tok = request.cookies.get("apigee_refresh_token")
-    cookie_access_tok = request.cookies.get("apigee_access_token")
+    session_id = request.cookies.get("apigee_session_id", "").strip()
+    user_sess = get_user_session(session_id) if session_id else {}
+    cookie_refresh_tok = request.cookies.get("apigee_refresh_token") or user_sess.get("refreshToken")
+    cookie_access_tok = request.cookies.get("apigee_access_token") or user_sess.get("accessToken")
     req_account = get_request_user_account(request)
     info = await asyncio.to_thread(
         get_gcp_user_auth_info,
         explicit_token=auth_tok or cookie_access_tok,
         explicit_refresh_token=cookie_refresh_tok,
         explicit_account=req_account,
+        user_session=user_sess if user_sess else None,
     )
     _apply_iap_identity(request, info)
     await _verify_request_token(info, auth_tok)
@@ -764,11 +828,21 @@ def _render_oidc_callback_html(email: str, access_token: str) -> str:
 
 def _attach_oidc_cookies(
     response: Response,
+    session_id: str,
     access_token: str,
     refresh_token: str,
     is_https: bool,
 ) -> None:
     """Attach secure HTTP-only session cookies to OAuth redirect response."""
+    if session_id:
+        response.set_cookie(
+            key="apigee_session_id",
+            value=session_id,
+            max_age=180 * 86400,
+            httponly=True,
+            secure=is_https,
+            samesite="lax",
+        )
     if access_token:
         response.set_cookie(
             key="apigee_access_token",
@@ -789,6 +863,30 @@ def _attach_oidc_cookies(
         )
 
 
+def _build_oidc_response(
+    request: Request,
+    session: dict[str, Any],
+) -> Response:
+    """Create HTML response with cookies and client tokens from successful OIDC exchange."""
+    email = session.get("email") or "google-user"
+    access_token = session.get("accessToken", "")
+    refresh_token = session.get("refreshToken", "")
+
+    session_id = request.cookies.get("apigee_session_id") or generate_session_id()
+    set_user_session(session_id, session)
+
+    if email and not os.environ.get("K_SERVICE"):
+        cfg = load_config()
+        cfg["gcpAccount"] = email
+        save_config(cfg)
+
+    html_content = _render_oidc_callback_html(email, access_token)
+    resp = HTMLResponse(content=html_content)
+    is_https = (request.headers.get("x-forwarded-proto") == "https") or (request.url.scheme == "https")
+    _attach_oidc_cookies(resp, session_id, access_token, refresh_token, is_https)
+    return resp
+
+
 @app.get("/api/auth/oidc/callback")
 async def api_oidc_callback(
     request: Request,
@@ -797,7 +895,8 @@ async def api_oidc_callback(
 ) -> Response:
     """Handle Google OIDC OAuth 2.0 redirect callback, exchange authorization code, and persist tokens."""
     if error or not code:
-        return RedirectResponse(url=f"/?oidc_error={error or 'no_code'}")
+        err_val = error or "no_code"
+        return RedirectResponse(url=f"/?oidc_error={err_val}")
 
     _, redirect_uri = _resolve_redirect_endpoints(request)
     try:
@@ -806,21 +905,7 @@ async def api_oidc_callback(
             code=code,
             redirect_uri=redirect_uri,
         )
-        email = session.get("email") or "google-user"
-        access_token = session.get("accessToken") or ""
-        refresh_token = session.get("refreshToken") or ""
-
-        cfg = load_config()
-        if email:
-            cfg["gcpAccount"] = email
-            save_config(cfg)
-
-        html_content = _render_oidc_callback_html(email, access_token)
-        resp = HTMLResponse(content=html_content)
-        forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-        is_https = (forwarded_proto == "https") or (request.url.scheme == "https")
-        _attach_oidc_cookies(resp, access_token, refresh_token, is_https)
-        return resp
+        return _build_oidc_response(request, session)
     except Exception as exc:
         logger.warning("OIDC code exchange failed: %s", exc)
         err_msg = urllib.parse.quote(str(exc))
@@ -837,21 +922,35 @@ async def api_oidc_set_token(request: Request, payload: OidcTokenRequest) -> JSO
             account=target_account,
             oidc_token=payload.accessToken,
         )
-        cfg = load_config()
-        if info.get("activeAccount"):
-            cfg["gcpAccount"] = info.get("activeAccount")
-            save_config(cfg)
+        session_id = request.cookies.get("apigee_session_id") or generate_session_id()
+        set_user_session(session_id, {
+            "email": info.get("activeAccount") or payload.email,
+            "accessToken": payload.accessToken,
+            "authenticated": True,
+        })
+        if not os.environ.get("K_SERVICE"):
+            cfg = load_config()
+            if info.get("activeAccount"):
+                cfg["gcpAccount"] = info.get("activeAccount")
+                save_config(cfg)
         info["hasUserToken"] = True
-        return JSONResponse(info)
+        resp = JSONResponse(info)
+        forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        is_https = (forwarded_proto == "https") or (request.url.scheme == "https")
+        _attach_oidc_cookies(resp, session_id, payload.accessToken, "", is_https)
+        return resp
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/auth/oidc/logout")
-async def api_oidc_logout() -> JSONResponse:
+async def api_oidc_logout(request: Request) -> JSONResponse:
     """Clear the active Google OIDC session and cookies."""
-    clear_active_oidc_session()
+    session_id = request.cookies.get("apigee_session_id")
+    if session_id:
+        clear_user_session(session_id)
     resp = JSONResponse({"success": True, "message": "OIDC session cleared"})
+    resp.delete_cookie("apigee_session_id")
     resp.delete_cookie("apigee_access_token")
     resp.delete_cookie("apigee_refresh_token")
     return resp
@@ -869,8 +968,13 @@ async def api_get_jurisdictions() -> JSONResponse:
 @app.post("/api/jurisdiction")
 async def api_set_jurisdiction(payload: JurisdictionUpdateRequest) -> JSONResponse:
     """Set the active Apigee Control Plane Hosting Jurisdiction."""
-    prev_jur = get_active_jurisdiction()["code"]
     jur_info = set_active_jurisdiction(payload.jurisdiction)
+    if jur_info is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid jurisdiction '{payload.jurisdiction}'. Must be one of: {', '.join(APIGEE_JURISDICTIONS.keys())}",
+        )
+    prev_jur = get_active_jurisdiction()["code"]
     cfg = load_config()
     cfg["controlPlaneJurisdiction"] = jur_info["code"]
     save_config(cfg)
@@ -890,8 +994,10 @@ def _switch_jurisdiction_on_login(jurisdiction: str | None) -> None:
     """Update active jurisdiction and clear cached discovered organizations if jurisdiction changed."""
     if not jurisdiction:
         return
-    prev_jur = get_active_jurisdiction()["code"]
     jur_info = set_active_jurisdiction(jurisdiction)
+    if jur_info is None:
+        return
+    prev_jur = get_active_jurisdiction()["code"]
     cfg = load_config()
     cfg["controlPlaneJurisdiction"] = jur_info["code"]
     save_config(cfg)
@@ -900,6 +1006,76 @@ def _switch_jurisdiction_on_login(jurisdiction: str | None) -> None:
             DISCOVERED_ORGS_PATH.unlink(missing_ok=True)
         except OSError as exc:
             logger.debug("Failed to unlink cached discovered orgs: %s", exc)
+
+async def _handle_token_login(
+    request: Request,
+    user_token: str,
+    user_account: str | None,
+) -> JSONResponse:
+    """Authenticate or switch session using an explicit OAuth bearer token."""
+    try:
+        info = await asyncio.to_thread(
+            switch_or_login_gcp_user,
+            account=user_account,
+            oidc_token=user_token,
+        )
+        session_id = request.cookies.get("apigee_session_id") or generate_session_id()
+        set_user_session(session_id, {
+            "email": info.get("activeAccount") or user_account,
+            "accessToken": user_token,
+            "authenticated": True,
+        })
+        if not os.environ.get("K_SERVICE"):
+            cfg = load_config()
+            cfg["gcpAccount"] = info.get("activeAccount")
+            save_config(cfg)
+        info["hasUserToken"] = True
+        resp = JSONResponse(info)
+        is_https = (request.headers.get("x-forwarded-proto") == "https") or (request.url.scheme == "https")
+        _attach_oidc_cookies(resp, session_id, user_token, "", is_https)
+        return resp
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _handle_account_only_login(
+    request: Request,
+    user_account: str,
+) -> JSONResponse:
+    """Return auth info for a known user account, indicating if an access token is needed."""
+    session_id = request.cookies.get("apigee_session_id", "").strip()
+    user_sess = get_user_session(session_id) if session_id else {}
+    info = get_gcp_user_auth_info(user_session=user_sess if user_sess else None)
+    if user_sess.get("accessToken"):
+        info["hasUserToken"] = True
+        return JSONResponse(info)
+    info["authenticated"] = True
+    info["activeAccount"] = user_account
+    info["hasUserToken"] = False
+    info["needsUserToken"] = True
+    return JSONResponse(info)
+
+
+async def _handle_browser_or_default_login(
+    payload: AuthLoginRequest,
+    redirect_uri: str,
+) -> JSONResponse:
+    """Execute standard gcloud/OIDC login or interactive browser authentication."""
+    try:
+        info = await asyncio.to_thread(
+            switch_or_login_gcp_user,
+            account=payload.account,
+            trigger_browser_login=payload.triggerBrowserLogin,
+            oidc_token=payload.accessToken,
+            redirect_uri=redirect_uri,
+        )
+        if not os.environ.get("K_SERVICE"):
+            cfg = load_config()
+            cfg["gcpAccount"] = info.get("activeAccount")
+            save_config(cfg)
+        return JSONResponse(info)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/auth/login")
@@ -912,46 +1088,10 @@ async def api_auth_login(request: Request, payload: AuthLoginRequest) -> JSONRes
     user_account = get_request_user_account(request, payload.account)
 
     if user_token:
-        try:
-            info = await asyncio.to_thread(
-                switch_or_login_gcp_user,
-                account=user_account,
-                oidc_token=user_token,
-            )
-            cfg = load_config()
-            cfg["gcpAccount"] = info.get("activeAccount")
-            save_config(cfg)
-            info["hasUserToken"] = True
-            return JSONResponse(info)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
+        return await _handle_token_login(request, user_token, user_account)
     if user_account:
-        oidc_sess = get_active_oidc_session()
-        info = get_gcp_user_auth_info()
-        if oidc_sess.get("accessToken"):
-            info["hasUserToken"] = True
-            return JSONResponse(info)
-        info["authenticated"] = True
-        info["activeAccount"] = user_account
-        info["hasUserToken"] = False
-        info["needsUserToken"] = True
-        return JSONResponse(info)
-
-    try:
-        info = await asyncio.to_thread(
-            switch_or_login_gcp_user,
-            account=payload.account,
-            trigger_browser_login=payload.triggerBrowserLogin,
-            oidc_token=payload.accessToken,
-            redirect_uri=redirect_uri,
-        )
-        cfg = load_config()
-        cfg["gcpAccount"] = info.get("activeAccount")
-        save_config(cfg)
-        return JSONResponse(info)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        return _handle_account_only_login(request, user_account)
+    return await _handle_browser_or_default_login(payload, redirect_uri)
 
 
 def _read_cached_discovered_orgs(
@@ -1242,11 +1382,11 @@ async def api_trigger_live_scan(request: Request, payload: LiveScanRequest) -> J
     raw_data = save_raw_dataset(raw_data, jurisdiction_code=payload.jurisdiction)
     portfolio = recalculate_portfolio(
         raw_data,
-        entitlement_pdu=cfg.get("entitlementPdu", 1500),
+        entitlement_pdu=cfg.get("entitlementPdu", 500),
         include_shared_flows=cfg.get("includeSharedFlows", True),
         region_overrides=cfg.get("regionOverrides", {}),
-        entitlement_envs=cfg.get("entitlementEnvs", 20),
-        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 100_000_000),
+        entitlement_envs=cfg.get("entitlementEnvs", 6),
+        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 1_500_000_000),
         contract_start_date=cfg.get("contractStartDate"),
     )
     history = append_history_snapshot(portfolio)
@@ -1262,19 +1402,18 @@ async def api_trigger_live_scan(request: Request, payload: LiveScanRequest) -> J
 async def _extract_stream_request_params(
     request: Request,
     account: str | None,
-    token: str | None,
     jurisdiction: str | None,
 ) -> tuple[str | None, str | None, str | None]:
     """Parse query parameters or JSON body parameters from streaming scan request."""
     target_account = account
-    body_token = token
+    body_token = None
     requested_jur = jurisdiction
     if request.method == "POST":
         try:
             body = await request.json()
             if isinstance(body, dict):
                 target_account = body.get("account") or target_account
-                body_token = body.get("accessToken") or body_token
+                body_token = body.get("accessToken")
                 requested_jur = body.get("jurisdiction") or requested_jur
         except (json.JSONDecodeError, ValueError) as exc:
             logger.debug("Failed to parse JSON body in scan stream: %s", exc)
@@ -1290,11 +1429,11 @@ def _build_stream_completion_portfolio(
     persisted_raw = save_raw_dataset(raw_data, jurisdiction_code=requested_jur)
     portfolio = recalculate_portfolio(
         persisted_raw,
-        entitlement_pdu=cfg.get("entitlementPdu", 1500),
+        entitlement_pdu=cfg.get("entitlementPdu", 500),
         include_shared_flows=cfg.get("includeSharedFlows", True),
         region_overrides=cfg.get("regionOverrides", {}),
-        entitlement_envs=cfg.get("entitlementEnvs", 20),
-        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 100_000_000),
+        entitlement_envs=cfg.get("entitlementEnvs", 6),
+        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 1_500_000_000),
         contract_start_date=cfg.get("contractStartDate"),
     )
     portfolio["history"] = append_history_snapshot(portfolio)
@@ -1376,7 +1515,6 @@ async def _stream_queue_generator(
 async def api_scan_stream(
     request: Request,
     account: str | None = Query(default=None),
-    token: str | None = Query(default=None),
     jurisdiction: str | None = Query(default=None),
 ) -> StreamingResponse:
     """Real-time streaming endpoint emitting Server-Sent Events (SSE) during live organization scanning."""
@@ -1384,7 +1522,7 @@ async def api_scan_stream(
     loop = asyncio.get_running_loop()
 
     target_account, body_token, requested_jur = await _extract_stream_request_params(
-        request, account, token, jurisdiction
+        request, account, jurisdiction
     )
     if requested_jur:
         set_active_jurisdiction(requested_jur)
@@ -1431,11 +1569,11 @@ async def api_load_demo_dataset() -> JSONResponse:
 
     portfolio = recalculate_portfolio(
         demo_data,
-        entitlement_pdu=cfg.get("entitlementPdu", 1500),
+        entitlement_pdu=cfg.get("entitlementPdu", 500),
         include_shared_flows=cfg.get("includeSharedFlows", True),
         region_overrides={},
-        entitlement_envs=cfg.get("entitlementEnvs", 20),
-        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 100_000_000),
+        entitlement_envs=cfg.get("entitlementEnvs", 6),
+        entitlement_yearly_calls=cfg.get("entitlementYearlyCalls", 1_500_000_000),
         contract_start_date=cfg.get("contractStartDate"),
     )
     history = append_history_snapshot(portfolio)

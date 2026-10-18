@@ -1272,15 +1272,16 @@ body {
   min-width: 180px;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.45rem;
 }
 
 .legend-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-bottom: 0.55rem;
+  padding-bottom: 0.35rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  gap: 0.5rem;
 }
 
 .legend-row:last-child {
@@ -1291,16 +1292,18 @@ body {
 .legend-label {
   display: flex;
   align-items: center;
-  gap: 0.45rem;
-  font-size: 0.8rem;
+  gap: 0.4rem;
+  font-size: 0.75rem;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   display: inline-block;
+  flex-shrink: 0;
 }
 
 .dot-cyan {
@@ -1311,15 +1314,21 @@ body {
   background: var(--accent-gold);
 }
 
+.dot-purple {
+  background: #a855f7;
+  box-shadow: 0 0 6px rgba(168, 85, 247, 0.5);
+}
+
 .dot-muted {
   background: rgba(255, 255, 255, 0.45);
 }
 
 .legend-val {
   font-family: var(--font-mono);
-  font-size: 0.92rem;
-  font-weight: 700;
+  font-size: 0.75rem;
+  font-weight: 600;
   color: #ffffff;
+  white-space: nowrap;
 }
 
 .limit-progress-track {
@@ -1356,11 +1365,21 @@ body {
   flex-wrap: wrap;
 }
 
+.chart-header-main {
+  width: 100%;
+  flex: 1 1 100%;
+}
+
 .chart-title-row {
   display: flex;
   align-items: center;
   gap: 0.65rem;
   flex-wrap: wrap;
+  width: 100%;
+}
+
+.chart-refresh-top-right {
+  margin-left: auto;
 }
 
 .chart-status-pill {
@@ -1839,6 +1858,11 @@ body[data-theme="light"] .dim-btn.active {
 
 body[data-theme="light"] .legend-row {
   border-bottom-color: rgba(15, 23, 42, 0.1);
+}
+
+body[data-theme="light"] .dot-purple {
+  background: #9333ea;
+  box-shadow: 0 0 4px rgba(147, 51, 234, 0.4);
 }
 
 body[data-theme="light"] .limit-progress-track {
@@ -2377,5 +2401,206 @@ body.light-theme .jurisdiction-pill {
   border-bottom: none;
   padding-bottom: 0;
 }
+
+/* Calls Dimension Chips (KPI Card 3) */
+.calls-dimension-chips {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin: 0.35rem 0 0.2rem 0;
+  flex-wrap: nowrap;
+}
+
+.call-chip {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 6px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.call-chip.std {
+  background: rgba(56, 189, 248, 0.15);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: #7dd3fc;
+}
+
+.call-chip.ext {
+  background: rgba(168, 85, 247, 0.15);
+  border: 1px solid rgba(168, 85, 247, 0.35);
+  color: #d8b4fe;
+}
+
+.call-chip.raw {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--text-secondary);
+}
+
+/* Calls Breakdown Banner (Monthly API Calls Section) */
+.calls-breakdown-banner {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.45rem;
+  margin-bottom: 0.6rem;
+}
+
+.call-breakdown-card {
+  background: rgba(15, 25, 32, 0.42);
+  border: 1px solid var(--glass-card-border);
+  border-radius: 8px;
+  padding: 0.35rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.call-breakdown-card:hover {
+  border-color: rgba(255, 255, 255, 0.25);
+  transform: translateY(-1px);
+}
+
+.call-breakdown-card.card-standard {
+  border-left: 3px solid #38bdf8;
+}
+
+.call-breakdown-card.card-extensible {
+  border-left: 3px solid #a855f7;
+}
+
+.call-breakdown-card.card-total {
+  border-left: 3px solid var(--status-green-bright);
+}
+
+.call-breakdown-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.call-breakdown-title {
+  font-size: 0.64rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
+.call-weight-badge {
+  font-size: 0.58rem;
+  font-family: var(--font-mono);
+  padding: 0.06rem 0.32rem;
+  border-radius: 3px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.badge-std {
+  background: rgba(56, 189, 248, 0.18);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.badge-ext {
+  background: rgba(168, 85, 247, 0.18);
+  color: #d8b4fe;
+  border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.badge-total {
+  background: rgba(52, 211, 153, 0.18);
+  color: #6ee7b7;
+  border: 1px solid rgba(52, 211, 153, 0.4);
+}
+
+.call-breakdown-val {
+  font-size: 0.95rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+  margin-top: 0.02rem;
+  line-height: 1.15;
+}
+
+.call-breakdown-sub {
+  font-size: 0.64rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.2;
+}
+
+/* Light theme overrides */
+body[data-theme="light"] .call-breakdown-card {
+  background: rgba(241, 245, 249, 0.85);
+  border-color: rgba(15, 23, 42, 0.12);
+}
+
+body[data-theme="light"] .call-breakdown-card.card-standard {
+  border-left-color: #0284c7;
+}
+
+body[data-theme="light"] .call-breakdown-card.card-extensible {
+  border-left-color: #9333ea;
+}
+
+body[data-theme="light"] .call-breakdown-card.card-total {
+  border-left-color: #059669;
+}
+
+body[data-theme="light"] .call-breakdown-title {
+  color: #475569;
+}
+
+body[data-theme="light"] .call-breakdown-val {
+  color: #0f172a;
+}
+
+body[data-theme="light"] .call-breakdown-sub {
+  color: #64748b;
+}
+
+body[data-theme="light"] .badge-std {
+  background: rgba(2, 132, 199, 0.12);
+  color: #0369a1;
+  border-color: rgba(2, 132, 199, 0.3);
+}
+
+body[data-theme="light"] .badge-ext {
+  background: rgba(147, 51, 234, 0.12);
+  color: #7e22ce;
+  border-color: rgba(147, 51, 234, 0.3);
+}
+
+body[data-theme="light"] .badge-total {
+  background: rgba(5, 150, 105, 0.12);
+  color: #047857;
+  border-color: rgba(5, 150, 105, 0.3);
+}
+
+body[data-theme="light"] .call-chip.std {
+  background: rgba(2, 132, 199, 0.1);
+  border-color: rgba(2, 132, 199, 0.25);
+  color: #0369a1;
+}
+
+body[data-theme="light"] .call-chip.ext {
+  background: rgba(147, 51, 234, 0.1);
+  border-color: rgba(147, 51, 234, 0.25);
+  color: #7e22ce;
+}
+
+body[data-theme="light"] .call-chip.raw {
+  background: rgba(15, 23, 42, 0.05);
+  border-color: rgba(15, 23, 42, 0.15);
+  color: #475569;
+}
+
 
 
