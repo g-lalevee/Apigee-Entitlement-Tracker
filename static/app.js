@@ -646,6 +646,16 @@ function renderMonitoringChart() {
   const dim = currentMonitoringTs.dimension === 'environments' ? 'environments' : 'pdu';
   const envFilter = document.getElementById('filter-env')?.value || 'ALL';
   const footprintFilter = document.getElementById('filter-footprint')?.value || 'ALL';
+  const hideZero = document.getElementById('chk-hide-zero')?.checked ?? true;
+
+  const zeroPduEnvKeys = new Set();
+  if (hideZero && currentPortfolio?.environments) {
+    for (const e of currentPortfolio.environments) {
+      if ((e.totalPdus || 0) === 0) {
+        zeroPduEnvKeys.add(`${e.organization}::${e.environment}`);
+      }
+    }
+  }
 
   const summary = currentPortfolio?.summary || {};
   const limitVal =
@@ -657,11 +667,12 @@ function renderMonitoringChart() {
   const formatVal = (v) => Number(v || 0).toLocaleString();
   const totalOrgsCount = currentPortfolio?.organizations?.length || 0;
 
-  // Filter series by active Multi-Select Orgs / Env / Footprint
+  // Filter series by active Multi-Select Orgs / Env / Footprint / Hide 0-PDU Envs
   const matchingSeries = (currentMonitoringTs.series || []).filter((s) => {
     if (!isOrgSelected(s.organization)) return false;
     if (envFilter !== 'ALL' && s.environment !== envFilter) return false;
     if (footprintFilter !== 'ALL' && s.runtimeType !== footprintFilter) return false;
+    if (hideZero && zeroPduEnvKeys.has(`${s.organization}::${s.environment}`)) return false;
     return true;
   });
 
@@ -1310,12 +1321,15 @@ function populateOrgDropdown(portfolio) {
   const summaryBadge = document.getElementById('org-selection-summary');
   if (!listContainer || !portfolio) return;
 
-  const orgs = [...(portfolio.organizations || [])].sort((a, b) =>
-    String(a.organization || '').localeCompare(String(b.organization || ''), undefined, {
-      sensitivity: 'base',
-      numeric: true,
-    })
-  );
+  const hideZero = Boolean(document.getElementById('chk-hide-zero')?.checked);
+  const orgs = [...(portfolio.organizations || [])]
+    .filter((o) => !hideZero || (o.totalPdus || 0) > 0)
+    .sort((a, b) =>
+      String(a.organization || '').localeCompare(String(b.organization || ''), undefined, {
+        sensitivity: 'base',
+        numeric: true,
+      })
+    );
   const validOrgSet = new Set(orgs.map((o) => o.organization));
 
   Array.from(selectedOrgs).forEach((name) => {
@@ -1395,10 +1409,13 @@ function populateEnvDropdown(portfolio) {
   const envSelect = document.getElementById('filter-env');
   if (!envSelect || !portfolio) return;
 
+  const hideZero = Boolean(document.getElementById('chk-hide-zero')?.checked);
   const prevEnv = envSelect.value || 'ALL';
-  const envs = (portfolio.environments || []).filter((e) =>
-    isOrgSelected(e.organization)
-  );
+  const envs = (portfolio.environments || []).filter((e) => {
+    if (!isOrgSelected(e.organization)) return false;
+    if (hideZero && (e.totalPdus || 0) <= 0) return false;
+    return true;
+  });
 
   const envTotals = new Map();
   envs.forEach((e) => {
@@ -1534,12 +1551,16 @@ function renderSimplifiedDashboard() {
   const qs = exportParams.toString();
   document.getElementById('btn-export-csv').href = `/api/export/environments${qs ? `?${qs}` : ''}`;
 
-  const allMatchingEnvs = (currentPortfolio.environments || []).filter((e) => {
+  const baseMatchingEnvs = (currentPortfolio.environments || []).filter((e) => {
     if (!isOrgSelected(e.organization)) return false;
     if (envFilter !== 'ALL' && e.environment !== envFilter) return false;
     if (footprintFilter !== 'ALL' && e.runtimeType !== footprintFilter) return false;
     return true;
   });
+
+  const allMatchingEnvs = hideZero
+    ? baseMatchingEnvs.filter((e) => (e.totalPdus || 0) > 0)
+    : baseMatchingEnvs;
 
   // 1. PDU metrics for filtered scope
   const consumedPdus = allMatchingEnvs.reduce((sum, e) => sum + e.totalPdus, 0);
@@ -1576,7 +1597,7 @@ function renderSimplifiedDashboard() {
   const hybridPdus = allMatchingEnvs
     .filter((e) => e.runtimeType === 'HYBRID')
     .reduce((sum, e) => sum + e.totalPdus, 0);
-  const activeEnvsCount = allMatchingEnvs.filter((e) => e.totalPdus > 0).length;
+  const activeEnvsCount = allMatchingEnvs.length;
 
   // Update Card 1 (PDUs)
   const consumedPduEl = document.getElementById('val-consumed-pdus');
@@ -1660,6 +1681,7 @@ function renderSimplifiedDashboard() {
   }
   if (envFilter !== 'ALL') scopeParts.push(`Env: ${envFilter}`);
   if (footprintFilter !== 'ALL') scopeParts.push(footprintFilter === 'HYBRID' ? 'Apigee Hybrid' : 'Apigee X');
+  if (!hideZero) scopeParts.push('Incl. 0-PDU Envs');
   scopeEl.textContent = scopeParts.length
     ? `Filtered Scope (${scopeParts.join(' • ')})`
     : `All Authorized Organizations (${totalOrgsCount} Orgs)`;
@@ -1762,9 +1784,15 @@ function renderSimplifiedDashboard() {
   if (donutSubText) donutSubText.textContent = gaugeSubLabel;
 
   // Render Detail Report Table
-  const visibleEnvs = hideZero
-    ? allMatchingEnvs.filter((e) => e.totalPdus > 0)
-    : allMatchingEnvs;
+  const visibleEnvs = [...allMatchingEnvs];
+  const hiddenZeroCount = Math.max(0, baseMatchingEnvs.length - visibleEnvs.length);
+
+  const reportSubEl = document.getElementById('table-report-subtitle');
+  if (reportSubEl) {
+    reportSubEl.textContent = hideZero
+      ? `This list exclusively includes environments that feature proxy deployments (${visibleEnvs.length} active environments shown, ${hiddenZeroCount} 0-PDU environments hidden).`
+      : `Showing all ${visibleEnvs.length} environments matching current filter (including ${baseMatchingEnvs.filter((e) => (e.totalPdus || 0) <= 0).length} environments with 0 PDUs).`;
+  }
 
   visibleEnvs.sort((a, b) => b.totalPdus - a.totalPdus || b.totalArtifacts - a.totalArtifacts);
 
@@ -2260,8 +2288,15 @@ document.addEventListener('DOMContentLoaded', () => {
     renderSimplifiedDashboard();
   });
 
-  document.getElementById('chk-hide-zero')?.addEventListener('change', () => {
+  document.getElementById('chk-hide-zero')?.addEventListener('change', (e) => {
+    populateOrgDropdown(currentPortfolio);
+    populateEnvDropdown(currentPortfolio);
     renderSimplifiedDashboard();
+    showToast(
+      e.target.checked
+        ? 'Hiding 0-PDU environments across dashboard & filters'
+        : 'Showing all environments (including 0-PDU environments)'
+    );
   });
 
   document.getElementById('chk-include-sf')?.addEventListener('change', (e) => {
@@ -2274,6 +2309,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-reset-filters')?.addEventListener('click', () => {
     allOrgsSelected = true;
     selectedOrgs.clear();
+    const hideZeroEl = document.getElementById('chk-hide-zero');
+    if (hideZeroEl) hideZeroEl.checked = true;
     populateOrgDropdown(currentPortfolio);
     populateEnvDropdown(currentPortfolio);
     document.getElementById('filter-env').value = 'ALL';
