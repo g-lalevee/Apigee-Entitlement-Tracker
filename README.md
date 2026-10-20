@@ -17,7 +17,7 @@
 
 > [!IMPORTANT]
 > - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
-> - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically via `GET /v1/organizations/{org}/environments/{env}/apis/{proxy}/revisions/{rev}/deployments` (or `/sharedflows/{sf}/revisions/{rev}/deployments`) by inspecting the `instances[]` array. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default).
+> - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically auditing API Proxy deployments. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default). **In this case, the recorded consumption metrics for environment units and PDU appear to be inaccurate.**
 
 ---
 
