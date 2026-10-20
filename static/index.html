@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261011-1" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261021-1" />
 </head>
 <body>
 
@@ -202,9 +202,11 @@
             <div class="dashboard-progress-inner">
               <div class="dashboard-progress-top">
                 <div class="dashboard-progress-label">
-                  <span class="scan-pulse-dot"></span>
-                  <strong id="dashboard-progress-status">Refreshing Live Apigee Scan...</strong>
-                  <span id="dashboard-progress-detail" class="dashboard-progress-sub"></span>
+                  <span class="scan-pulse-dot" style="margin-top: 0.3rem;"></span>
+                  <div class="dashboard-progress-text-stack">
+                    <strong id="dashboard-progress-status">Discovering Apigee organizations...</strong>
+                    <span id="dashboard-progress-detail" class="dashboard-progress-sub scan-org-subtitle"></span>
+                  </div>
                 </div>
                 <span id="dashboard-progress-percent" class="scan-progress-percent">0%</span>
               </div>
@@ -366,16 +368,16 @@
             <!-- Compliance Gauge Card -->
             <div class="glass-card overview-gauge-card">
               <div class="overview-card-header">
-                <div>
+                <div class="overview-header-top-row">
                   <h2 class="card-section-title">Entitlement Compliance</h2>
-                  <span id="verdict-scope-label" class="verdict-scope">All Authorized Organizations</span>
+                  <div class="overview-header-actions">
+                    <span id="verdict-badge" class="verdict-pill below">BELOW LIMITS</span>
+                    <a id="btn-export-csv" href="/api/export/environments" class="btn btn-secondary btn-sm">
+                      Export CSV
+                    </a>
+                  </div>
                 </div>
-                <div class="overview-header-actions">
-                  <span id="verdict-badge" class="verdict-pill below">BELOW LIMITS</span>
-                  <a id="btn-export-csv" href="/api/export/environments" class="btn btn-secondary btn-sm">
-                    Export CSV
-                  </a>
-                </div>
+                <span id="verdict-scope-label" class="verdict-scope">All Authorized Organizations</span>
               </div>
 
               <!-- Dimension Selector -->
@@ -497,7 +499,7 @@
               <label class="ios-switch-label" for="chk-hide-zero">
                 <span>Hide 0-PDU Envs</span>
                 <span class="ios-switch">
-                  <input type="checkbox" id="chk-hide-zero" checked />
+                  <input type="checkbox" id="chk-hide-zero" />
                   <span class="ios-switch-slider"></span>
                 </span>
               </label>
@@ -609,7 +611,7 @@
           <section id="section-report" class="table-card glass-card">
             <div class="table-card-header">
               <h2 class="card-section-title">Environment Entitlement Detail Report (PDUs, Env Units &amp; Yearly Calls)</h2>
-              <span class="table-card-sub" id="table-report-subtitle">This list exclusively includes environments that feature proxy deployments.</span>
+              <span class="table-card-sub" id="table-report-subtitle">Showing all environments (including 0-PDU environments).</span>
             </div>
             <div class="table-responsive">
               <table class="data-table">
@@ -678,17 +680,19 @@
   <!-- Modal: Live Scan & Loading Progress Popup (Home Page) -->
   <div id="modal-scan-progress" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="scan-modal-status">
     <div class="modal-card glass-window scan-progress-modal-card">
-      <div class="modal-header scan-modal-header">
-        <div style="display: flex; align-items: center; gap: 0.5rem;">
-          <span class="scan-pulse-dot"></span>
-          <h3 id="scan-modal-status" style="margin: 0; font-size: 1.05rem; font-weight: 600;">Scanning Apigee Entitlements...</h3>
+      <div class="modal-header scan-modal-header" style="align-items: flex-start;">
+        <div style="display: flex; align-items: flex-start; gap: 0.65rem;">
+          <span class="scan-pulse-dot" style="margin-top: 0.35rem;"></span>
+          <div class="dashboard-progress-text-stack">
+            <h3 id="scan-modal-status" style="margin: 0; font-size: 1.05rem; font-weight: 600;">Discovering Apigee organizations...</h3>
+            <div id="scan-modal-detail" class="dashboard-progress-sub scan-org-subtitle">
+              Querying Google Cloud Apigee API...
+            </div>
+          </div>
         </div>
         <span id="scan-modal-percent" class="scan-progress-percent">0%</span>
       </div>
-      <div class="modal-body" style="padding-top: 0.5rem; padding-bottom: 1.25rem;">
-        <div id="scan-modal-detail" class="dashboard-progress-sub" style="margin-bottom: 0.85rem; font-size: 0.85rem; color: var(--text-secondary);">
-          Connecting to Apigee APIs...
-        </div>
+      <div class="modal-body" style="padding-top: 0.25rem; padding-bottom: 1.25rem;">
         <div class="scan-progress-bar-track">
           <div id="scan-modal-progress-fill" class="scan-progress-bar-fill" style="width: 0%;"></div>
         </div>
@@ -697,7 +701,7 @@
   </div>
 
   <div id="toast" class="toast-notification" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261019-1"></script>
+  <script src="/static/app.js?v=20261021-3"></script>
 
 
 </body>

@@ -17,7 +17,7 @@
 
 > [!IMPORTANT]
 > - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
-> - **Apigee Hybrid Limitation**: For Apigee Hybrid, the number of runtime instances (clusters) is not retrieved, so the region/instance count defaults to **1**. As a result, the number of consumed PDUs and Environment Units may not be exact for multi-cluster/multi-region Hybrid deployments.
+> - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically via `GET /v1/organizations/{org}/environments/{env}/apis/{proxy}/revisions/{rev}/deployments` (or `/sharedflows/{sf}/revisions/{rev}/deployments`) by inspecting the `instances[]` array. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default).
 
 ---
 
@@ -59,18 +59,18 @@ flowchart TD
     User([Authenticated User / OAuth Token]) --> Backend[Apigee Entitlement Tracker Backend]
     
     Backend -->|1. Discover Authorized Orgs| ApigeeOrgs["Apigee API: GET /v1/organizations"]
-    Backend -->|2. Regional Instances| ApigeeInst["Apigee API: GET /v1/organizations/{org}/instances"]
-    Backend -->|3. Instance Attachments| ApigeeAttach["Apigee API: GET /instances/{inst}/attachments"]
-    Backend -->|4. Environment Inventory| ApigeeEnv["Apigee API: GET /v1/organizations/{org}/environments"]
-    Backend -->|5. Deployed Proxies & Shared Flows| ApigeeDep["Apigee API: GET /environments/{env}/deployments"]
-    Backend -->|6. Historical Traffic | ApigeeStats["Apigee API: GET /environments/{env}/stats/apis"]
+    Backend -->|2. Apigee X Regional Instances| ApigeeInst["Apigee API: GET /v1/organizations/{org}/instances"]
+    Backend -->|3. Apigee X Instance Attachments| ApigeeAttach["Apigee API: GET /instances/{inst}/attachments"]
+    Backend -->|4. Environment & Deployment Inventory| ApigeeDep["Apigee API: GET /v1/organizations/{org}/deployments"]
+    Backend -->|5. Apigee Hybrid Revision Instances| ApigeeRevDep["Apigee API: GET /environments/{env}/apis/{proxy}/revisions/{rev}/deployments"]
+    Backend -->|6. Historical Traffic | ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type"]
     Backend -->|7. Fallback & Time-Series Metrics| CloudMon["Cloud Monitoring API: Metric / TimeSeries"]
     
     ApigeeOrgs --> Engine[Entitlement Engine]
     ApigeeInst --> Engine
     ApigeeAttach --> Engine
-    ApigeeEnv --> Engine
     ApigeeDep --> Engine
+    ApigeeRevDep --> Engine
     ApigeeStats --> Engine
     CloudMon --> Engine
     
@@ -80,10 +80,10 @@ flowchart TD
 1. **Apigee Management API**:
    * **Control Plane Hosting Jurisdictions & Data Residency (DRZ)**: Full support for non-global hosting jurisdictions as defined in the official [Google Cloud Apigee Locations Documentation](https://docs.cloud.google.com/apigee/docs/locations#available-apigee-api-control-plane-hosting-jurisdictions). 
    * **Organization Discovery**: Calls `GET /v1/organizations` using the caller's OAuth token to enumerate all organizations the user has access to within the active jurisdiction.
-   * **Regional Footprint & Attachments**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regions each environment is attached to (instance attachments).
-   * **Environment Inventory**: Calls `GET /v1/organizations/{org}/environments` to inspect each environment.
-   * **Deployments Inspection**: Calls `GET /v1/organizations/{org}/environments/{env}/deployments` to inspect every active proxy and shared flow revision, automatically classifying proxies as Standard or Extensible.
-   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/apis?select=sum(message_count)` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date**.
+   * **Regional Footprint & Attachments (Apigee X)**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regional instances each Apigee X environment is attached to.
+   * **Deployments Inspection**: Calls `GET /v1/organizations/{org}/deployments` (and `?sharedFlows=true`) to inspect every active proxy and shared flow revision, automatically classifying proxies as Standard or Extensible.
+   * **Regional Footprint & PDU Multiplier (Apigee Hybrid)**: For each Apigee Hybrid environment with deployments, queries `GET /v1/organizations/{org}/environments/{env}/apis/{proxy}/revisions/{rev}/deployments` (or `/sharedflows/{sf}/revisions/{rev}/deployments`) and inspects the `instances[]` array to determine the attached runtime instances (`regionCount`) and PDU multiplier per deployment. *(Caution: if a Hybrid environment has no deployments, the attached instance count cannot be queried and defaults to `1`).*
+   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date**.
 
 2. **Cloud Monitoring API (`monitoring.googleapis.com/v3`)**:
    * Queries metric `apigee.googleapis.com/proxy/response_count` as an automatic fallback when the Analytics add-on is disabled on specific environments.

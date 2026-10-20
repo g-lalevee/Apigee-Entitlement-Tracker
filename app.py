@@ -173,15 +173,24 @@ def save_config(cfg: dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(disk_cfg, indent=2), encoding="utf-8")
 
 
+def _normalize_valid_jurisdiction(jurisdiction_code: str | None = None) -> str:
+    """Resolve and strictly whitelist jurisdiction code against APIGEE_JURISDICTIONS."""
+    candidate = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    if candidate in APIGEE_JURISDICTIONS:
+        return candidate
+    active_code = str(get_active_jurisdiction().get("code", "global")).strip().lower()
+    return active_code if active_code in APIGEE_JURISDICTIONS else "global"
+
+
 def get_raw_cache_path(jurisdiction_code: str | None = None) -> pathlib.Path:
     """Return the filesystem path for the raw cache of the specified or active jurisdiction."""
-    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    jur = _normalize_valid_jurisdiction(jurisdiction_code)
     return DATA_DIR / f"latest_raw_{jur}.json"
 
 
 def get_discovered_orgs_path(jurisdiction_code: str | None = None) -> pathlib.Path:
     """Return the filesystem path for cached discovered organizations of the specified jurisdiction."""
-    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    jur = _normalize_valid_jurisdiction(jurisdiction_code)
     return DATA_DIR / f"discovered_orgs_{jur}.json"
 
 
@@ -226,7 +235,7 @@ def _build_empty_jurisdiction_dataset(jur: str) -> dict[str, Any]:
 
 def load_raw_dataset(jurisdiction_code: str | None = None) -> dict[str, Any]:
     """Load the latest raw dataset for the active or given jurisdiction, falling back to demo data."""
-    jur = (jurisdiction_code or get_active_jurisdiction().get("code", "global")).strip().lower()
+    jur = _normalize_valid_jurisdiction(jurisdiction_code)
     target_path = get_raw_cache_path(jur)
     if not target_path.exists() and jur == "global" and RAW_CACHE_PATH.exists():
         target_path = RAW_CACHE_PATH
@@ -252,11 +261,9 @@ def _prepare_sanitized_payload(
         sanitized["authSource"] = "GCP User Account (OAuth2)"
 
     cur_jur_info = get_active_jurisdiction()
-    jur = (
-        jurisdiction_code
-        or sanitized.get("controlPlaneJurisdiction")
-        or cur_jur_info.get("code", "global")
-    ).strip().lower()
+    jur = _normalize_valid_jurisdiction(
+        jurisdiction_code or sanitized.get("controlPlaneJurisdiction")
+    )
 
     sanitized["controlPlaneJurisdiction"] = jur
     sanitized["jurisdiction"] = APIGEE_JURISDICTIONS.get(jur) or cur_jur_info
@@ -534,8 +541,11 @@ async def disable_static_and_auth_cache(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Disable browser caching for dashboard, static assets, and authentication endpoints."""
+    """Attach security headers and disable browser caching for dashboard and auth endpoints."""
     response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     path = request.url.path
     if path == "/" or path.startswith("/static/") or path.startswith("/api/auth"):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -821,8 +831,8 @@ def _render_oidc_callback_html(email: str, access_token: str) -> str:
     """Render client-side token storage and redirect template for OAuth callback."""
     return _OIDC_CALLBACK_HTML_TEMPLATE.format(
         safe_email=html.escape(email),
-        json_token=json.dumps(access_token),
-        json_email=json.dumps(email),
+        json_token=json.dumps(access_token).replace("</", "<\\/"),
+        json_email=json.dumps(email).replace("</", "<\\/"),
     )
 
 
@@ -895,7 +905,7 @@ async def api_oidc_callback(
 ) -> Response:
     """Handle Google OIDC OAuth 2.0 redirect callback, exchange authorization code, and persist tokens."""
     if error or not code:
-        err_val = error or "no_code"
+        err_val = urllib.parse.quote(str(error or "no_code"), safe="")
         return RedirectResponse(url=f"/?oidc_error={err_val}")
 
     _, redirect_uri = _resolve_redirect_endpoints(request)
@@ -965,16 +975,31 @@ async def api_get_jurisdictions() -> JSONResponse:
     })
 
 
+def _activate_validated_jurisdiction(jurisdiction: str | None) -> str:
+    """Validate optional jurisdiction parameter, activate it if provided, and return active code."""
+    if jurisdiction:
+        jur_info = set_active_jurisdiction(jurisdiction)
+        if jur_info is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid jurisdiction '{jurisdiction}'. Must be one of: "
+                    f"{', '.join(APIGEE_JURISDICTIONS.keys())}"
+                ),
+            )
+    return get_active_jurisdiction()["code"]
+
+
 @app.post("/api/jurisdiction")
 async def api_set_jurisdiction(payload: JurisdictionUpdateRequest) -> JSONResponse:
     """Set the active Apigee Control Plane Hosting Jurisdiction."""
+    prev_jur = get_active_jurisdiction()["code"]
     jur_info = set_active_jurisdiction(payload.jurisdiction)
     if jur_info is None:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid jurisdiction '{payload.jurisdiction}'. Must be one of: {', '.join(APIGEE_JURISDICTIONS.keys())}",
         )
-    prev_jur = get_active_jurisdiction()["code"]
     cfg = load_config()
     cfg["controlPlaneJurisdiction"] = jur_info["code"]
     save_config(cfg)
@@ -994,10 +1019,10 @@ def _switch_jurisdiction_on_login(jurisdiction: str | None) -> None:
     """Update active jurisdiction and clear cached discovered organizations if jurisdiction changed."""
     if not jurisdiction:
         return
+    prev_jur = get_active_jurisdiction()["code"]
     jur_info = set_active_jurisdiction(jurisdiction)
     if jur_info is None:
         return
-    prev_jur = get_active_jurisdiction()["code"]
     cfg = load_config()
     cfg["controlPlaneJurisdiction"] = jur_info["code"]
     save_config(cfg)
@@ -1131,9 +1156,7 @@ async def api_discover_organizations(
     jurisdiction: str | None = Query(default=None, description="Control plane hosting jurisdiction"),
 ) -> JSONResponse:
     """Discover all authorized Apigee organizations for the current user and jurisdiction."""
-    if jurisdiction:
-        set_active_jurisdiction(jurisdiction)
-    cur_jur_code = get_active_jurisdiction()["code"]
+    cur_jur_code = _activate_validated_jurisdiction(jurisdiction)
     disc_path = get_discovered_orgs_path(cur_jur_code)
     cached, existing_orgs = _read_cached_discovered_orgs(disc_path, cur_jur_code)
     if cached and not refresh:
@@ -1169,9 +1192,8 @@ async def api_get_portfolio(
     jurisdiction: str | None = Query(default=None, description="Apigee control plane jurisdiction"),
 ) -> JSONResponse:
     """Retrieve recalculated portfolio summary, inventory breakdown, and current user auth info."""
-    if jurisdiction:
-        set_active_jurisdiction(jurisdiction)
-    portfolio = get_current_portfolio(jurisdiction)
+    cur_jur_code = _activate_validated_jurisdiction(jurisdiction)
+    portfolio = get_current_portfolio(cur_jur_code)
     user_account = get_request_user_account(request)
     user_token = extract_bearer_token(request)
     if "auth" not in portfolio or not isinstance(portfolio["auth"], dict):
@@ -1191,9 +1213,11 @@ def _compute_ts_cache_path(
     contract_start_date: str | None,
 ) -> pathlib.Path:
     """Generate cache file path for Cloud Monitoring timeseries based on dimension and lookback."""
-    contract_dt = str(contract_start_date or "default").replace("-", "")
-    cache_suffix = f"_{contract_dt}" if dim == "calls" else f"_{days}d"
-    return DATA_DIR / f"monitoring_ts_{cur_jur_code}_{dim}{cache_suffix}.json"
+    safe_jur = _normalize_valid_jurisdiction(cur_jur_code)
+    raw_dt = str(contract_start_date or "default")
+    contract_dt = "".join(ch for ch in raw_dt if ch.isalnum()) or "default"
+    cache_suffix = f"_{contract_dt}" if dim == "calls" else f"_{int(days)}d"
+    return DATA_DIR / f"monitoring_ts_{safe_jur}_{dim}{cache_suffix}.json"
 
 
 def _read_cached_timeseries(cache_file: pathlib.Path, cur_jur_code: str) -> dict[str, Any] | None:
@@ -1244,11 +1268,14 @@ async def api_get_monitoring_timeseries(
     jurisdiction: str | None = Query(default=None, description="Apigee control plane jurisdiction"),
 ) -> JSONResponse:
     """Query Cloud Monitoring and Apigee Analytics for PDU, Environment Unit, or Call timeseries."""
-    if jurisdiction:
-        set_active_jurisdiction(jurisdiction)
-    cur_jur_code = get_active_jurisdiction()["code"]
-    cfg = load_config()
+    cur_jur_code = _activate_validated_jurisdiction(jurisdiction)
     dim = (dimension or "pdu").strip().lower()
+    if dim not in {"pdu", "environments", "calls"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid dimension. Must be one of: pdu, environments, calls",
+        )
+    cfg = load_config()
     cache_file = _compute_ts_cache_path(cur_jur_code, dim, days, cfg.get("contractStartDate"))
     existing_cached = _read_cached_timeseries(cache_file, cur_jur_code)
     if existing_cached and not refresh:
@@ -1698,28 +1725,21 @@ def _build_cli_arg_parser(default_host: str, default_port: int) -> argparse.Argu
     parser = argparse.ArgumentParser(
         description="Apigee Entitlement Tracker (X & Hybrid) — Web Dashboard & CSV Exporter"
     )
-    parser.add_argument(
-        "--host",
-        default=default_host,
-        help=f"Bind host (default: {default_host})",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=default_port,
-        help=f"Bind port (default: {default_port})",
-    )
-    parser.add_argument(
-        "--entitlement",
-        type=int,
-        default=None,
-        help="Set cross-organization PDU entitlement number",
-    )
+    parser.add_argument("--host", default=default_host, help=f"Bind host (default: {default_host})")
+    parser.add_argument("--port", type=int, default=default_port, help=f"Bind port (default: {default_port})")
+    parser.add_argument("--entitlement", type=int, default=None, help="Set cross-organization PDU entitlement number")
     parser.add_argument(
         "--account",
         type=str,
         default=None,
         help="GCP User Account email to authenticate with (defaults to active gcloud user account)",
+    )
+    parser.add_argument(
+        "--jurisdiction",
+        type=str,
+        choices=tuple(APIGEE_JURISDICTIONS.keys()),
+        default=None,
+        help="Apigee Control Plane hosting jurisdiction (global, us, eu, asia-northeast1, australia-southeast1)",
     )
     parser.add_argument(
         "--scan-live",
@@ -1770,7 +1790,11 @@ def _run_cli_live_scan(account: str | None) -> None:
         """Log real-time scan event percentages to console."""
         pct = evt.get("percent", 0)
         msg = evt.get("message", "")
-        logger.info("[%3d%%] %s", pct, msg)
+        detail = evt.get("organization") or evt.get("detail") or ""
+        if detail:
+            logger.info("[%3d%%] %s — %s", pct, msg, detail)
+        else:
+            logger.info("[%3d%%] %s", pct, msg)
 
     raw_data = asyncio.run(collect_all_organizations(account=acct, progress_callback=_cli_progress))
     save_raw_dataset(raw_data)
@@ -1803,6 +1827,20 @@ def _run_cli_export(export_dir: str) -> None:
     logger.info("Exported 4 CSV reports to %s", out_dir)
 
 
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    """Apply optional CLI jurisdiction and entitlement overrides to runtime configuration."""
+    if args.jurisdiction:
+        jur_info = set_active_jurisdiction(args.jurisdiction)
+        if jur_info:
+            cfg = load_config()
+            cfg["controlPlaneJurisdiction"] = jur_info["code"]
+            save_config(cfg)
+    if args.entitlement is not None:
+        cfg = load_config()
+        cfg["entitlementPdu"] = max(1, args.entitlement)
+        save_config(cfg)
+
+
 def main() -> None:
     """CLI entry point for running server, scanning live data, or generating exports."""
     import threading
@@ -1821,10 +1859,7 @@ def main() -> None:
         _clean_cached_data_and_exports()
         return
 
-    if args.entitlement is not None:
-        cfg = load_config()
-        cfg["entitlementPdu"] = max(1, args.entitlement)
-        save_config(cfg)
+    _apply_cli_overrides(args)
 
     if args.scan_live:
         _run_cli_live_scan(args.account)

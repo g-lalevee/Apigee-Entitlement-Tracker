@@ -280,7 +280,7 @@ function updateJurisdictionHint(jurCode) {
   }
 }
 
-function showScanProgressModal(title = 'Scanning Apigee Entitlements...', detail = 'Connecting to APIs...', percent = 0) {
+function showScanProgressModal(title = 'Discovering Apigee organizations...', detail = 'Querying Google Cloud Apigee API...', percent = 0) {
   const modal = document.getElementById('modal-scan-progress');
   const statusEl = document.getElementById('scan-modal-status');
   const detailEl = document.getElementById('scan-modal-detail');
@@ -309,7 +309,8 @@ function updateScanProgressModal(evt) {
 
   const pct = Math.max(0, Math.min(100, Math.round(evt.percent || 0)));
   if (statusEl && evt.message) statusEl.textContent = evt.message;
-  if (detailEl && evt.detail !== undefined) detailEl.textContent = evt.detail;
+  const subText = evt.organization || evt.detail;
+  if (detailEl && subText !== undefined) detailEl.textContent = subText;
   if (percentEl) percentEl.textContent = `${pct}%`;
   if (fillEl) fillEl.style.width = `${pct}%`;
 }
@@ -515,11 +516,11 @@ async function openDashboardForAccount(account, runLiveScan = true) {
   document.getElementById('dashboard-screen').style.display = 'flex';
 
   // Display scan progress modal popup on the home page
-  showScanProgressModal('Connecting to Apigee APIs...', 'Initializing scan session', 5);
+  showScanProgressModal('Discovering Apigee organizations...', 'Querying Google Cloud Apigee API...', 5);
 
   try {
     if (runLiveScan) {
-      showScanProgressModal('Connecting to Google Cloud Apigee APIs...', 'Scanning organizations and environments', 10);
+      showScanProgressModal('Discovering Apigee organizations...', 'Querying Google Cloud Apigee API...', 5);
       try {
         currentPortfolio = await startLiveScanWithProgress({
           account: account || null,
@@ -646,7 +647,7 @@ function renderMonitoringChart() {
   const dim = currentMonitoringTs.dimension === 'environments' ? 'environments' : 'pdu';
   const envFilter = document.getElementById('filter-env')?.value || 'ALL';
   const footprintFilter = document.getElementById('filter-footprint')?.value || 'ALL';
-  const hideZero = document.getElementById('chk-hide-zero')?.checked ?? true;
+  const hideZero = document.getElementById('chk-hide-zero')?.checked ?? false;
 
   const zeroPduEnvKeys = new Set();
   if (hideZero && currentPortfolio?.environments) {
@@ -1794,7 +1795,11 @@ function renderSimplifiedDashboard() {
       : `Showing all ${visibleEnvs.length} environments matching current filter (including ${baseMatchingEnvs.filter((e) => (e.totalPdus || 0) <= 0).length} environments with 0 PDUs).`;
   }
 
-  visibleEnvs.sort((a, b) => b.totalPdus - a.totalPdus || b.totalArtifacts - a.totalArtifacts);
+  visibleEnvs.sort(
+    (a, b) =>
+      String(a.organization || '').localeCompare(String(b.organization || '')) ||
+      String(a.environment || '').localeCompare(String(b.environment || ''))
+  );
 
   const tbody = document.getElementById('tbody-pdu');
   const tfoot = document.getElementById('tfoot-pdu');
@@ -1813,6 +1818,9 @@ function renderSimplifiedDashboard() {
         const regionsHtml = (e.regions || [])
           .map((r) => `<span class="region-tag">${escapeHtml(r)}</span>`)
           .join('');
+        const cautionBadgeHtml = e.regionCaution
+          ? ` <span class="region-caution-badge" title="${escapeHtml(e.regionCaution)}" style="color:#f59e0b;cursor:help;font-size:0.75rem;font-weight:600;margin-left:0.25rem;white-space:nowrap;">&#9888;&#65039; Caution</span>`
+          : '';
         const regionCount = Number(e.regionCount || 0);
         const envLimitPct = limitEnvs > 0 ? ((regionCount / limitEnvs) * 100).toFixed(2) : '0.00';
         const pduLimitPct = limitPdu > 0 ? ((e.totalPdus / limitPdu) * 100).toFixed(2) : '0.00';
@@ -1829,8 +1837,8 @@ function renderSimplifiedDashboard() {
             <td class="mono-cell"><strong>${escapeHtml(e.organization)}</strong></td>
             <td class="footprint-col">${formatFootprint(e.runtimeType)}</td>
             <td class="mono-cell">${escapeHtml(e.environment)}</td>
-            <td>${regionsHtml || '<span style="color:var(--text-muted);">Unattached (0 regions)</span>'}</td>
-            <td class="num-cell">${regionCount}</td>
+            <td>${regionsHtml || '<span style="color:var(--text-muted);">Unattached (0 regions)</span>'}${cautionBadgeHtml}</td>
+            <td class="num-cell" title="${e.regionCaution ? escapeHtml(e.regionCaution) : ''}">${regionCount}</td>
             <td class="num-cell">${envLimitPct}%</td>
             <td class="num-cell">${unitsLabel}</td>
             <td class="num-cell"><strong>${e.totalPdus.toLocaleString()}</strong></td>
@@ -2196,15 +2204,15 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.disabled = true;
     btn.classList.add('is-refreshing');
     btn.setAttribute('title', 'Refreshing live scan in progress...');
-    showScanProgressModal('Refreshing Live Scan...', 'Connecting to Apigee APIs...', 5);
+    showScanProgressModal('Discovering Apigee organizations...', 'Querying Google Cloud Apigee API...', 5);
 
     function updateDashboardProgress(evt) {
       updateScanProgressModal(evt);
       const pct = Math.max(0, Math.min(100, evt.percent || 0));
       if (dPercent) dPercent.textContent = `${pct}%`;
       if (dFill) dFill.style.width = `${pct}%`;
-      if (dStatus) dStatus.textContent = evt.message || 'Auditing live Apigee organizations...';
-      if (dDetail) dDetail.textContent = evt.detail || '';
+      if (dStatus) dStatus.textContent = evt.message || 'Discovering Apigee organizations...';
+      if (dDetail) dDetail.textContent = evt.organization || evt.detail || '';
     }
 
     try {
@@ -2225,7 +2233,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }),
       });
 
-      updateDashboardProgress({ percent: 5, message: 'Initiating live Apigee scan...' });
+      updateDashboardProgress({ percent: 5, message: 'Discovering Apigee organizations...', detail: 'Querying Google Cloud Apigee API...' });
       currentPortfolio = await startLiveScanWithProgress({
         account: null,
         jurisdiction: getStoredJurisdiction(),
@@ -2310,7 +2318,7 @@ document.addEventListener('DOMContentLoaded', () => {
     allOrgsSelected = true;
     selectedOrgs.clear();
     const hideZeroEl = document.getElementById('chk-hide-zero');
-    if (hideZeroEl) hideZeroEl.checked = true;
+    if (hideZeroEl) hideZeroEl.checked = false;
     populateOrgDropdown(currentPortfolio);
     populateEnvDropdown(currentPortfolio);
     document.getElementById('filter-env').value = 'ALL';

@@ -109,6 +109,21 @@ HISTORY_CSV_HEADER: tuple[str, ...] = (
 )
 
 
+_CSV_FORMULA_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_cell(value: Any) -> Any:
+    """Neutralize spreadsheet formula triggers in string CSV cells."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+def _sanitize_csv_row(row: Sequence[Any]) -> list[Any]:
+    """Sanitize all cells in a CSV row against formula injection."""
+    return [_sanitize_csv_cell(cell) for cell in row]
+
+
 def _format_epoch_ms(ms_val: Any) -> str:
     """Convert epoch milliseconds string or int to ISO-8601 UTC timestamp string.
 
@@ -207,10 +222,10 @@ def generate_organizations_csv(portfolio: Mapping[str, Any]) -> str:
 
     writer.writerow(ORGANIZATIONS_CSV_HEADER)
     for org in portfolio.get("organizations", ()):
-        writer.writerow(_build_org_summary_row(org, entitlement))
+        writer.writerow(_sanitize_csv_row(_build_org_summary_row(org, entitlement)))
 
     writer.writerow([])
-    writer.writerow(_build_portfolio_total_row(summary, entitlement))
+    writer.writerow(_sanitize_csv_row(_build_portfolio_total_row(summary, entitlement)))
     return buf.getvalue()
 
 
@@ -288,15 +303,17 @@ def _filter_and_sort_environments(
     *,
     hide_zero: bool,
 ) -> list[Mapping[str, Any]]:
-    """Filter and sort environment entries by total PDUs descending."""
+    """Filter and sort environment entries alphabetically by organization then environment."""
     filtered = (
         [e for e in environments if e.get("totalPdus", 0) > 0]
         if hide_zero
         else list(environments)
     )
     filtered.sort(
-        key=lambda e: (e.get("totalPdus", 0), e.get("totalArtifacts", 0)),
-        reverse=True,
+        key=lambda e: (
+            str(e.get("organization", "")).lower(),
+            str(e.get("environment", "")).lower(),
+        )
     )
     return filtered
 
@@ -330,13 +347,15 @@ def generate_environments_csv(
     envs = _filter_and_sort_environments(portfolio.get("environments", ()), hide_zero=hide_zero)
     for env in envs:
         writer.writerow(
-            _build_env_row(
-                env,
-                limit_pdu=limit_pdu,
-                limit_envs=limit_envs,
-                limit_calls=limit_calls,
-                include_sf=include_sf,
-                export_date=export_date,
+            _sanitize_csv_row(
+                _build_env_row(
+                    env,
+                    limit_pdu=limit_pdu,
+                    limit_envs=limit_envs,
+                    limit_calls=limit_calls,
+                    include_sf=include_sf,
+                    export_date=export_date,
+                )
             )
         )
 
@@ -379,7 +398,7 @@ def generate_deployments_csv(portfolio: Mapping[str, Any]) -> str:
 
     writer.writerow(DEPLOYMENTS_CSV_HEADER)
     for dep in portfolio.get("deployments", ()):
-        writer.writerow(_build_deployment_row(dep))
+        writer.writerow(_sanitize_csv_row(_build_deployment_row(dep)))
 
     return buf.getvalue()
 
@@ -423,7 +442,7 @@ def generate_history_csv(history_entries: Sequence[Mapping[str, Any]]) -> str:
 
     writer.writerow(HISTORY_CSV_HEADER)
     for item in history_entries:
-        writer.writerow(_build_history_row(item))
+        writer.writerow(_sanitize_csv_row(_build_history_row(item)))
 
     return buf.getvalue()
 

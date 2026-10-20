@@ -1176,17 +1176,32 @@ body {
 
 .overview-card-header {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 100%;
+}
+
+.overview-header-top-row {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
-  gap: 0.75rem;
-  flex-wrap: wrap;
+  gap: 0.6rem;
+  flex-wrap: nowrap;
+  width: 100%;
 }
 
 .overview-header-actions {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
-  flex-wrap: wrap;
+  gap: 0.45rem;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.overview-header-actions .btn {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .card-section-title {
@@ -1196,23 +1211,29 @@ body {
   color: #ffffff;
 }
 
+.overview-header-top-row .card-section-title {
+  white-space: nowrap;
+}
+
 .verdict-scope {
   display: block;
   font-size: 0.78rem;
   color: var(--text-secondary);
-  margin-top: 0.15rem;
+  margin-top: 0.05rem;
 }
 
 /* Status Pill */
 .verdict-pill {
   display: inline-flex;
   align-items: center;
-  padding: 0.36rem 0.95rem;
+  padding: 0.28rem 0.78rem;
   border-radius: var(--radius-pill);
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.02em;
   color: #ffffff;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .verdict-pill.below {
@@ -2056,22 +2077,35 @@ body[data-theme="light"] .region-tag {
 
 .dashboard-progress-top {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
 }
 
 .dashboard-progress-label {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.65rem;
   font-size: 0.85rem;
   color: #f8fafc;
+}
+
+.dashboard-progress-text-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
 }
 
 .dashboard-progress-sub {
   font-size: 0.76rem;
   color: #94a3b8;
   font-weight: 400;
+}
+
+.scan-org-subtitle {
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  color: var(--accent-cyan);
+  min-height: 1.2rem;
 }
 
 /* Light Theme overrides for progression bar */

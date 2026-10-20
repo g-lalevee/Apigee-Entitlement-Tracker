@@ -1246,22 +1246,154 @@ def _map_cloud_env_regions(
     return env_to_regions, instances_summary
 
 
+def _extract_deployment_instances(dep_detail: dict[str, Any] | None) -> list[str]:
+    """Extract deduplicated runtime instance identifiers from revision deployment status."""
+    if not dep_detail or not isinstance(dep_detail, dict):
+        return []
+    discovered: list[str] = []
+    for inst_item in dep_detail.get("instances", []):
+        inst_id = (
+            str(inst_item.get("instance", "")).strip()
+            if isinstance(inst_item, dict)
+            else str(inst_item).strip()
+        )
+        if inst_id and inst_id not in discovered:
+            discovered.append(inst_id)
+    return discovered
+
+
+def _inspect_hybrid_deployment_candidate(
+    sess: requests.Session,
+    org_base: str,
+    env_name: str,
+    path_seg: str,
+    dep_item: dict[str, Any],
+) -> list[str]:
+    """Query a single revision deployment resource and extract active Hybrid instance IDs."""
+    art_name = str(dep_item.get("apiProxy") or dep_item.get("name") or "").strip()
+    if not art_name:
+        return []
+    rev = str(dep_item.get("revision") or "1").strip()
+    url = f"{org_base}/environments/{env_name}/{path_seg}/{art_name}/revisions/{rev}/deployments"
+    dep_detail, err = _get_json_sync(sess, url)
+    if err or not dep_detail:
+        return []
+    if (
+        path_seg == "apis"
+        and dep_detail.get("proxyDeploymentType")
+        and not dep_item.get("proxyDeploymentType")
+    ):
+        dep_item["proxyDeploymentType"] = dep_detail["proxyDeploymentType"]
+    return _extract_deployment_instances(dep_detail)
+
+
+def _fetch_hybrid_env_deployment_instances(
+    sess: requests.Session,
+    org_base: str,
+    env_name: str,
+    env_proxies: list[dict[str, Any]],
+    env_sfs: list[dict[str, Any]],
+) -> list[str]:
+    """Query revision deployment details for a Hybrid environment to discover active instances."""
+    candidates: list[tuple[str, dict[str, Any]]] = [
+        *[("apis", p) for p in env_proxies[:2]],
+        *[("sharedflows", sf) for sf in env_sfs[:2]],
+    ]
+    for path_seg, dep_item in candidates[:2]:
+        instances_found = _inspect_hybrid_deployment_candidate(
+            sess, org_base, env_name, path_seg, dep_item
+        )
+        if instances_found:
+            return instances_found
+    return []
+
+
+@dataclass(frozen=True)
+class OrgDiscoveryContext:
+    """Session and API endpoints for an organization."""
+    sess: requests.Session
+    org_base: str
+    org_name: str
+    instances: list[dict[str, Any]]
+    proxies_by_env: dict[str, list[dict[str, Any]]] | None = None
+    sfs_by_env: dict[str, list[dict[str, Any]]] | None = None
+    env_cautions: dict[str, str] | None = None
+
+
+def _set_hybrid_env_caution(ctx: OrgDiscoveryContext, env_name: str, msg: str) -> None:
+    """Record a caution message for a Hybrid environment if caution tracking is enabled."""
+    if ctx.env_cautions is not None:
+        ctx.env_cautions[env_name] = msg
+
+
+def _resolve_single_hybrid_env_regions(
+    env_name: str,
+    hybrid_region_overrides: dict[str, int],
+    ctx: OrgDiscoveryContext,
+    hybrid_inst_envs: dict[str, list[str]],
+) -> list[str]:
+    """Resolve active Hybrid instances or fallback cluster for a single environment."""
+    override_count = hybrid_region_overrides.get(
+        f"{ctx.org_name}:{env_name}",
+        hybrid_region_overrides.get(ctx.org_name, 0),
+    )
+    if override_count > 0:
+        return [f"hybrid-region-{i + 1}" for i in range(override_count)]
+
+    env_proxies = (ctx.proxies_by_env or {}).get(env_name, [])
+    env_sfs = (ctx.sfs_by_env or {}).get(env_name, [])
+    if not env_proxies and not env_sfs:
+        _set_hybrid_env_caution(
+            ctx,
+            env_name,
+            "Caution: No deployed proxies or shared flows in this Apigee Hybrid environment; "
+            "attached instance count cannot be queried and defaults to 1.",
+        )
+        return ["hybrid-k8s-cluster"]
+
+    discovered = _fetch_hybrid_env_deployment_instances(
+        ctx.sess, ctx.org_base, env_name, env_proxies, env_sfs
+    )
+    if discovered:
+        for inst_id in discovered:
+            hybrid_inst_envs.setdefault(inst_id, []).append(env_name)
+        return discovered
+
+    _set_hybrid_env_caution(
+        ctx,
+        env_name,
+        "Caution: No active Apigee Hybrid runtime instance reported status for deployments "
+        "in this environment; instance count defaults to 1.",
+    )
+    return ["hybrid-k8s-cluster"]
+
+
 def _map_hybrid_env_regions(
     env_names: list[str],
-    org_name: str,
     hybrid_region_overrides: dict[str, int],
+    ctx: OrgDiscoveryContext,
+    instances_summary: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
-    """Map Hybrid environments to their regional clusters or user overrides."""
+    """Map Hybrid environments to their regional clusters via revision deployment status or overrides."""
     env_to_regions: dict[str, list[str]] = {}
+    hybrid_inst_envs: dict[str, list[str]] = {}
+
     for env_name in env_names:
-        override_count = hybrid_region_overrides.get(
-            f"{org_name}:{env_name}",
-            hybrid_region_overrides.get(org_name, 0),
+        env_to_regions[env_name] = _resolve_single_hybrid_env_regions(
+            env_name, hybrid_region_overrides, ctx, hybrid_inst_envs
         )
-        if override_count and override_count > 0:
-            env_to_regions[env_name] = [f"hybrid-region-{i + 1}" for i in range(override_count)]
-        else:
-            env_to_regions[env_name] = ["hybrid-k8s-cluster"]
+
+    if instances_summary is not None:
+        for inst_id, attached_envs in hybrid_inst_envs.items():
+            instances_summary.append(
+                {
+                    "name": inst_id,
+                    "location": inst_id,
+                    "state": "ACTIVE",
+                    "runtimeVersion": "HYBRID",
+                    "attachedEnvironments": attached_envs,
+                }
+            )
     return env_to_regions
 
 
@@ -1344,11 +1476,11 @@ def _build_env_summary_record(
     ctx: OrgEnvRecordContext,
     env_name: str,
     regions: list[str],
-    std_proxies: int,
-    ext_proxies: int,
-    shared_flows_count: int,
+    artifact_counts: tuple[int, int, int],
+    region_caution: str | None = None,
 ) -> dict[str, Any]:
     """Build summary dictionary for an environment."""
+    std_proxies, ext_proxies, shared_flows_count = artifact_counts
     region_count = len(regions)
     total_proxies_env = std_proxies + ext_proxies
     total_artifacts_env = total_proxies_env + shared_flows_count
@@ -1361,6 +1493,7 @@ def _build_env_summary_record(
         "regions": regions,
         "regionCount": region_count,
         "environmentUnits": region_count,
+        "regionCaution": region_caution,
         "standardProxies": std_proxies,
         "extensibleProxies": ext_proxies,
         "totalProxies": total_proxies_env,
@@ -1386,10 +1519,12 @@ def _build_env_and_deployment_records(
     proxies_by_env: dict[str, list[dict[str, Any]]],
     sfs_by_env: dict[str, list[dict[str, Any]]],
     ctx: OrgEnvRecordContext,
+    env_cautions: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Construct environments and deployments summary list for an organization."""
     environments_list: list[dict[str, Any]] = []
     deployments_list: list[dict[str, Any]] = []
+    cautions_map = env_cautions or {}
 
     for env_name in env_names:
         regions = env_to_regions.get(env_name, [])
@@ -1402,7 +1537,13 @@ def _build_env_and_deployment_records(
         deployments_list.extend(proxy_deps)
         deployments_list.extend(sf_deps)
         environments_list.append(
-            _build_env_summary_record(ctx, env_name, regions, std_proxies, ext_proxies, len(env_sfs))
+            _build_env_summary_record(
+                ctx,
+                env_name,
+                regions,
+                (std_proxies, ext_proxies, len(env_sfs)),
+                region_caution=cautions_map.get(env_name),
+            )
         )
 
     return environments_list, deployments_list
@@ -1460,15 +1601,6 @@ def _group_deployments_by_env(
     return grouped
 
 
-@dataclass(frozen=True)
-class OrgDiscoveryContext:
-    """Session and API endpoints for an organization."""
-    sess: requests.Session
-    org_base: str
-    org_name: str
-    instances: list[dict[str, Any]]
-
-
 def _resolve_regions_for_runtime(
     runtime_type: str,
     env_names: list[str],
@@ -1478,7 +1610,14 @@ def _resolve_regions_for_runtime(
     """Map environments to regions based on Cloud or Hybrid deployment model."""
     if runtime_type == "CLOUD":
         return _map_cloud_env_regions(ctx.instances, env_names, ctx.sess, ctx.org_base)
-    return _map_hybrid_env_regions(env_names, ctx.org_name, overrides), []
+    instances_summary: list[dict[str, Any]] = []
+    env_to_regions = _map_hybrid_env_regions(
+        env_names,
+        overrides,
+        ctx,
+        instances_summary=instances_summary,
+    )
+    return env_to_regions, instances_summary
 
 
 def _resolve_org_plans(org_meta: dict[str, Any]) -> tuple[str, str]:
@@ -1519,7 +1658,6 @@ def _fetch_single_organization_sync(
     hybrid_region_overrides: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Fetch complete PDU data for a single Apigee Organization (X or Hybrid)."""
-    hybrid_overrides = hybrid_region_overrides or {}
     project_id = project_ids[0] if project_ids else org_name
     sess, base_url, _ = _get_thread_session(account=account, explicit_token=explicit_token)
     org_base = f"{base_url}/organizations/{org_name}"
@@ -1530,21 +1668,19 @@ def _fetch_single_organization_sync(
 
     billing_type, subscription_plan = _resolve_org_plans(org_meta)
     env_names: list[str] = [str(e) for e in org_meta.get("environments", [])]
-
     runtime_type, instances = _resolve_instances_and_runtime(sess, org_base, org_name, org_meta)
-    discovery_ctx = OrgDiscoveryContext(sess=sess, org_base=org_base, org_name=org_name, instances=instances)
+    proxies_by_env, sfs_by_env = _fetch_deployments_grouped(sess, org_base, env_names, {}, runtime_type)
+    env_cautions: dict[str, str] = {}
+    discovery_ctx = OrgDiscoveryContext(
+        sess, org_base, org_name, instances, proxies_by_env, sfs_by_env, env_cautions
+    )
     env_to_regions, instances_summary = _resolve_regions_for_runtime(
-        runtime_type, env_names, hybrid_overrides, discovery_ctx
+        runtime_type, env_names, hybrid_region_overrides or {}, discovery_ctx
     )
-    proxies_by_env, sfs_by_env = _fetch_deployments_grouped(
-        sess, org_base, env_names, env_to_regions, runtime_type
-    )
-
     ctx = OrgEnvRecordContext(org_name=org_name, project_id=project_id, runtime_type=runtime_type)
     environments_list, deployments_list = _build_env_and_deployment_records(
-        env_names, env_to_regions, proxies_by_env, sfs_by_env, ctx
+        env_names, env_to_regions, proxies_by_env, sfs_by_env, ctx, env_cautions=env_cautions
     )
-
     return {
         "organization": org_name,
         "projectId": project_id,
@@ -1868,18 +2004,26 @@ def _notify_traffic_progress(
     env_count: int,
 ) -> None:
     """Send traffic collection progress notification to callback."""
-    pct = 68 + int((completed / total) * 28)
+    pct = 68 + int((completed / max(1, total)) * 28)
     try:
         callback({
             "percent": pct,
-            "message": f"Audited API traffic for {org_name} ({completed}/{total})",
+            "message": "Auditing API traffic...",
             "stage": "TRAFFIC",
             "current": completed,
             "total": total,
-            "detail": f"{env_count} envs queried across contract period",
+            "organization": org_name,
+            "detail": org_name,
         })
     except Exception as exc:
         logger.debug("Traffic progress callback failed: %s", exc)
+
+
+def _pop_in_flight_org(in_flight: list[str], org_name: str) -> str:
+    """Remove completed org from in-flight list and return active org label."""
+    if org_name in in_flight:
+        in_flight.remove(org_name)
+    return in_flight[0] if in_flight else org_name
 
 
 def _collect_traffic_for_active_orgs(
@@ -1893,21 +2037,30 @@ def _collect_traffic_for_active_orgs(
     """Execute concurrent queries for org traffic across active environments."""
     if not active_orgs:
         return
-    max_workers = min(10, max(1, len(active_orgs)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_fetch_single_org_contract_calls_sync, o, q_start, q_end, account, explicit_token): o
-            for o in active_orgs
-        }
-        traffic_done = 0
-        for fut in as_completed(futures):
-            o = futures[fut]
-            _apply_org_traffic_result(o, fut.result())
+    total = len(active_orgs)
+    lock = threading.Lock()
+    in_flight: list[str] = []
+    traffic_done = 0
+
+    def _run_org_traffic(org_obj: dict[str, Any]) -> dict[str, Any]:
+        """Fetch traffic for a single organization while emitting progress events."""
+        nonlocal traffic_done
+        org_name = org_obj["organization"]
+        env_count = len(org_obj.get("environments", []))
+        with lock:
+            in_flight.append(org_name)
+            _notify_traffic_progress(progress_callback, org_name, traffic_done, total, env_count)
+        res = _fetch_single_org_contract_calls_sync(org_obj, q_start, q_end, account, explicit_token)
+        with lock:
             traffic_done += 1
-            if progress_callback:
-                _notify_traffic_progress(
-                    progress_callback, o["organization"], traffic_done, len(active_orgs), len(o.get("environments", []))
-                )
+            display_org = _pop_in_flight_org(in_flight, org_name)
+            _notify_traffic_progress(progress_callback, display_org, traffic_done, total, env_count)
+        return res
+
+    with ThreadPoolExecutor(max_workers=min(10, total)) as executor:
+        futures = {executor.submit(_run_org_traffic, o): o for o in active_orgs}
+        for fut in as_completed(futures):
+            _apply_org_traffic_result(futures[fut], fut.result())
 
 
 def populate_contract_api_calls_sync(
@@ -1955,6 +2108,25 @@ async def populate_contract_api_calls(
     )
 
 
+def _emit_org_audit_progress(
+    notify: Callable[..., None],
+    completed: int,
+    total: int,
+    org_name: str,
+) -> None:
+    """Emit organization audit progress percentage and active organization label."""
+    pct = 10 + int((completed / max(1, total)) * 58)
+    notify(
+        pct,
+        "Auditing environments & PDUs...",
+        stage="ORGANIZATIONS",
+        current=completed,
+        total=total,
+        organization=org_name,
+        detail=org_name,
+    )
+
+
 def _collect_targets_concurrently(
     selected_targets: list[tuple[str, list[str]]],
     account: str | None,
@@ -1963,35 +2135,39 @@ def _collect_targets_concurrently(
     notify: Callable[..., None],
 ) -> list[dict[str, Any]]:
     """Query organization details concurrently across target organizations."""
-    max_workers = min(10, max(1, len(selected_targets)))
+    total = len(selected_targets)
+    max_workers = min(10, max(1, total))
     organizations: list[dict[str, Any]] = []
+    lock = threading.Lock()
+    in_flight: list[str] = []
+    completed_count = 0
+
+    def _run_org_audit(org_name: str, project_ids: list[str]) -> dict[str, Any]:
+        """Audit a single target organization and report progress."""
+        nonlocal completed_count
+        with lock:
+            in_flight.append(org_name)
+            _emit_org_audit_progress(notify, completed_count, total, org_name)
+        org_res = _fetch_single_organization_sync(
+            org_name,
+            project_ids,
+            account=account,
+            explicit_token=explicit_token,
+            hybrid_region_overrides=hybrid_region_overrides,
+        )
+        with lock:
+            completed_count += 1
+            display_org = _pop_in_flight_org(in_flight, org_name)
+            _emit_org_audit_progress(notify, completed_count, total, display_org)
+        return org_res
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(
-                _fetch_single_organization_sync,
-                org_name,
-                project_ids,
-                account=account,
-                explicit_token=explicit_token,
-                hybrid_region_overrides=hybrid_region_overrides,
-            ): org_name
+            executor.submit(_run_org_audit, org_name, project_ids): org_name
             for org_name, project_ids in selected_targets
         }
-        completed_count = 0
         for future in as_completed(futures):
-            org_name = futures[future]
-            completed_count += 1
-            org_res = future.result()
-            organizations.append(org_res)
-            pct = 10 + int((completed_count / len(selected_targets)) * 58)
-            notify(
-                pct,
-                f"Audited {org_name} ({completed_count}/{len(selected_targets)})",
-                stage="ORGANIZATIONS",
-                current=completed_count,
-                total=len(selected_targets),
-                detail=f"{len(org_res.get('environments', []))} envs, {len(org_res.get('deployments', []))} deployments",
-            )
+            organizations.append(future.result())
     return organizations
 
 
@@ -2012,6 +2188,7 @@ def _notify_scan_progress(
             "stage": stage,
             "current": int(meta.get("current", 0)),
             "total": int(meta.get("total", 0)),
+            "organization": str(meta.get("organization", "")),
             "detail": str(meta.get("detail", "")),
         })
     except Exception as exc:
@@ -2056,7 +2233,8 @@ def collect_all_organizations_sync(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Discover authorized Apigee organizations and collect live metrics in parallel."""
-    _notify_scan_progress(progress_callback, 5, "Discovering authorized Apigee organizations via Google Cloud API...", stage="DISCOVERY")
+    initial_hint = org_filter[0] if org_filter and len(org_filter) == 1 else "Querying Google Cloud Apigee API..."
+    _notify_scan_progress(progress_callback, 5, "Discovering Apigee organizations...", stage="DISCOVERY", detail=initial_hint)
     discovery = discover_authorized_organizations_sync(account=account, explicit_token=explicit_token)
     selected_targets = _resolve_selected_targets(discovery["organizations"], org_filter)
 
@@ -2076,15 +2254,9 @@ def collect_all_organizations_sync(
         "totalAuthorizedOrgs": len(discovery["organizations"]),
         "organizations": organizations,
     }
-
-    _notify_scan_progress(progress_callback, 68, "Auditing annual API traffic over active contract period...", stage="TRAFFIC")
-    populate_contract_api_calls_sync(
-        raw_payload,
-        contract_start_date=contract_start_date,
-        account=account,
-        explicit_token=explicit_token,
-        progress_callback=progress_callback,
-    )
+    first_org = next((o["organization"] for o in organizations if o.get("environments")), organizations[0]["organization"])
+    _notify_scan_progress(progress_callback, 68, "Auditing API traffic...", stage="TRAFFIC", organization=first_org, detail=first_org)
+    populate_contract_api_calls_sync(raw_payload, contract_start_date, account, explicit_token, progress_callback)
     _notify_scan_progress(progress_callback, 100, "Collection completed successfully.", stage="COMPLETE")
     return raw_payload
 
@@ -2464,6 +2636,24 @@ def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int]:
     return std_calls, ext_calls, raw_calls, env_yearly_calls
 
 
+def _resolve_env_region_caution(
+    env: dict[str, Any],
+    meta: OrgRecalculateMeta,
+    total_artifacts: int,
+    is_overridden: bool,
+) -> str | None:
+    """Resolve caution message when Hybrid environment instance count cannot be determined."""
+    if is_overridden:
+        return None
+    region_caution = env.get("regionCaution")
+    if not region_caution and meta.runtime_type == "HYBRID" and total_artifacts == 0:
+        return (
+            "Caution: No deployed proxies or shared flows in this Apigee Hybrid environment; "
+            "attached instance count cannot be queried and defaults to 1."
+        )
+    return region_caution
+
+
 def _build_env_recalculated_record(
     env: dict[str, Any],
     meta: OrgRecalculateMeta,
@@ -2481,6 +2671,7 @@ def _build_env_recalculated_record(
     env_total_pdus = (tot_p * r_count) + ((sf_p * r_count) if cfg.include_shared_flows else 0)
     std_calls, ext_calls, raw_calls, env_yearly_calls = _resolve_env_call_metrics(env)
     extra = _build_env_formula_and_shares(tot_p, sf_p, r_count, env_total_pdus, env_yearly_calls, cfg)
+    region_caution = _resolve_env_region_caution(env, meta, tot_p + sf_p, is_overridden)
 
     return {
         "organization": meta.org_name,
@@ -2493,6 +2684,7 @@ def _build_env_recalculated_record(
         "originalRegionCount": len(orig_regions),
         "regionCount": r_count,
         "environmentUnits": r_count,
+        "regionCaution": region_caution,
         "isOverridden": is_overridden,
         "standardProxies": std_p,
         "extensibleProxies": ext_p,
