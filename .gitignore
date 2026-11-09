@@ -26,4 +26,5 @@ credentials.json
 *.swp
 *.swo
 
-
+# Others
+.cm*

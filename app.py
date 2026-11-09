@@ -496,20 +496,58 @@ class LiveScanRequest(BaseModel):
     jurisdiction: str | None = None
 
 
+_MULTI_TENANT_PUBLIC_DOMAINS = {
+    "run.app",
+    "appspot.com",
+    "cloudshell.dev",
+    "azurewebsites.net",
+    "herokuapp.com",
+    "firebaseapp.com",
+    "web.app",
+    "github.io",
+}
+
+
+def _is_multi_tenant_domain(domain: str) -> bool:
+    """Check if domain is a known multi-tenant public cloud or hosting domain."""
+    clean = domain.lower().strip(".")
+    return any(clean == pub or clean.endswith("." + pub) for pub in _MULTI_TENANT_PUBLIC_DOMAINS)
+
+
 def _is_allowed_origin_host(origin: str, request_host: str) -> bool:
     """Verify whether the request Origin/Referer matches the host or trusted hosts."""
     try:
+        if not origin or not isinstance(origin, str) or origin.strip().lower() == "null":
+            return False
         parsed = urllib.parse.urlparse(origin)
-        origin_host = parsed.netloc.split(":")[0].lower()
-        clean_request_host = request_host.split(":")[0].lower()
-        if origin_host == clean_request_host:
+        origin_host = (parsed.hostname or parsed.netloc.split(":")[0]).lower()
+        if not origin_host:
+            return False
+
+        clean_request_host = ""
+        if request_host:
+            req_parsed = urllib.parse.urlsplit(
+                request_host if "://" in request_host or request_host.startswith("//") else f"//{request_host}"
+            )
+            clean_request_host = (req_parsed.hostname or request_host.split(":")[0]).lower()
+
+        if clean_request_host and origin_host == clean_request_host:
             return True
-        if origin_host in {"localhost", "127.0.0.1", "testserver"}:
+
+        local_hosts = {"localhost", "127.0.0.1", "::1", "testserver"}
+        if origin_host in local_hosts and clean_request_host in local_hosts:
             return True
+
         for pattern in ALLOWED_HOSTS:
-            if pattern.startswith("*.") and origin_host.endswith(pattern[1:]):
-                return True
-            if pattern == origin_host:
+            if pattern == "*":
+                continue
+            if pattern.startswith("*."):
+                base = pattern[2:].lower().strip(".")
+                if not base or _is_multi_tenant_domain(base):
+                    continue
+                if origin_host == base or origin_host.endswith("." + base):
+                    return True
+            elif pattern.lower() == origin_host:
                 return True
     except Exception:
         return False
@@ -525,14 +563,26 @@ async def protect_csrf_and_origin(
     if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
         origin = request.headers.get("Origin") or request.headers.get("origin")
         referer = request.headers.get("Referer") or request.headers.get("referer")
-        target = origin or referer
-        if target:
-            req_host = request.headers.get("host", request.url.netloc)
-            if not _is_allowed_origin_host(target, req_host):
-                return JSONResponse(
-                    {"detail": "Forbidden: cross-origin request rejected"},
-                    status_code=403,
-                )
+        if not origin and not referer:
+            return JSONResponse(
+                {"detail": "Forbidden: cross-origin request rejected"},
+                status_code=403,
+            )
+        req_host = (
+            request.headers.get("x-forwarded-host")
+            or request.headers.get("host")
+            or request.url.netloc
+        )
+        if origin and not _is_allowed_origin_host(origin, req_host):
+            return JSONResponse(
+                {"detail": "Forbidden: cross-origin request rejected"},
+                status_code=403,
+            )
+        if referer and not _is_allowed_origin_host(referer, req_host):
+            return JSONResponse(
+                {"detail": "Forbidden: cross-origin request rejected"},
+                status_code=403,
+            )
     return await call_next(request)
 
 
