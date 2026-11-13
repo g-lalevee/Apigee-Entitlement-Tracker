@@ -1886,6 +1886,7 @@ def _generate_report_response(
 
 @app.get("/api/export/{report_type}")
 async def api_export_report(
+    request: Request,
     report_type: str,
     org: str | None = Query(default=None, description="Optional filter by organization(s), comma-separated"),
     env: str | None = Query(default=None, description="Optional filter by environment"),
@@ -1893,6 +1894,7 @@ async def api_export_report(
     hideZero: bool = Query(default=False, description="Hide 0-PDU environments in export"),
 ) -> Response:
     """Generate and export CSV reports or a bundled ZIP archive for Google Sheets."""
+    _verify_request_authenticated(request)
     portfolio = get_current_portfolio()
     filtered_portfolio = _filter_export_portfolio(portfolio, org, env, runtime)
     ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
