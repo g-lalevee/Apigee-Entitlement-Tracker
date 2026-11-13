@@ -586,7 +586,9 @@ async def protect_csrf_and_origin(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Protect state-changing endpoints against cross-origin and DNS rebinding attacks."""
-    if request.method in {"POST", "PUT", "DELETE", "PATCH"} and not _is_mutative_request_origin_valid(request):
+    is_mutative_method = request.method in {"POST", "PUT", "DELETE", "PATCH"}
+    is_scan_stream = request.url.path.rstrip("/") == "/api/scan/stream"
+    if (is_mutative_method or is_scan_stream) and not _is_mutative_request_origin_valid(request):
         return JSONResponse(
             {"detail": "Forbidden: cross-origin request rejected"},
             status_code=403,
