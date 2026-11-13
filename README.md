@@ -64,7 +64,7 @@ flowchart TD
     Backend -->|3. Apigee X Instance Attachments| ApigeeAttach["Apigee API: GET /instances/{inst}/attachments"]
     Backend -->|4. Environment & Deployment Inventory| ApigeeDep["Apigee API: GET /v1/organizations/{org}/deployments"]
     Backend -->|5. Apigee Hybrid Revision Instances| ApigeeRevDep["Apigee API: GET /environments/{env}/apis/{proxy}/revisions/{rev}/deployments"]
-    Backend -->|6. Historical Traffic (Runtime & Envoy)| ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type (+ gateway_source eq 'envoy')"]
+    Backend -->|6. Historical Traffic - Runtime & Envoy | ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type (+ gateway_source eq 'envoy')"]
     Backend -->|7. Fallback & Time-Series Metrics| CloudMon["Cloud Monitoring API: Metric / TimeSeries"]
     
     ApigeeOrgs --> Engine[Entitlement Engine]
