@@ -19,6 +19,7 @@ import logging
 import os
 import pathlib
 import secrets
+import time
 import urllib.parse
 from typing import Any
 
@@ -1418,9 +1419,65 @@ def _apply_region_override_updates(
         cfg["regionOverrides"] = merged
 
 
+def _verify_request_authenticated(request: Request) -> None:
+    """Verify caller authentication via Google IAP, OAuth Bearer token, or valid session."""
+    iap_user = request.headers.get("x-goog-authenticated-user-email") or request.headers.get(
+        "X-Goog-Authenticated-User-Email"
+    )
+    if iap_user and iap_user.strip():
+        return
+
+    auth_header = request.headers.get("Authorization", "").strip()
+    if auth_header.startswith("Bearer "):
+        candidate = auth_header[7:].strip()
+        if _is_clean_token(candidate):
+            return
+
+    cookie_tok = request.cookies.get("apigee_access_token", "").strip()
+    if _is_clean_token(cookie_tok):
+        return
+
+    session_id = request.cookies.get("apigee_session_id", "").strip()
+    if session_id:
+        user_sess = get_user_session(session_id)
+        if not user_sess:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required: invalid or forged session",
+            )
+        expires_at = user_sess.get("expiresAt")
+        if expires_at and time.time() >= float(expires_at):
+            refresh_tok = user_sess.get("refreshToken")
+            refreshed = False
+            if refresh_tok:
+                try:
+                    refreshed_data = refresh_google_oauth_token(refresh_tok)
+                    if refreshed_data and refreshed_data.get("access_token"):
+                        user_sess["accessToken"] = refreshed_data["access_token"]
+                        exp_in = float(refreshed_data.get("expires_in", 3600))
+                        user_sess["expiresIn"] = exp_in
+                        user_sess["expiresAt"] = time.time() + exp_in
+                        set_user_session(session_id, user_sess)
+                        refreshed = True
+                except Exception as exc:
+                    logger.debug("Failed refreshing session token: %s", exc)
+            if not refreshed:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication session expired. Please re-authenticate.",
+                )
+        return
+
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required: missing authentication credentials",
+    )
+
+
 @app.post("/api/settings")
-async def api_update_settings(payload: SettingsUpdateRequest) -> JSONResponse:
+async def api_update_settings(request: Request, payload: SettingsUpdateRequest) -> JSONResponse:
     """Update cross-organization entitlement parameters, contract date, and region overrides."""
+    _verify_request_authenticated(request)
     cfg = load_config()
     _validate_and_apply_entitlements(payload, cfg)
 
