@@ -1352,6 +1352,23 @@ body {
   white-space: nowrap;
 }
 
+.legend-row.legend-row-multiline {
+  align-items: flex-start;
+}
+
+.legend-row.legend-row-multiline .legend-label {
+  padding-top: 0.1rem;
+}
+
+.legend-val.legend-val-stacked {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  text-align: right;
+  gap: 0.14rem;
+  line-height: 1.25;
+}
+
 .limit-progress-track {
   height: 8px;
   background: rgba(255, 255, 255, 0.1);
@@ -2464,6 +2481,12 @@ body.light-theme .jurisdiction-pill {
   color: #7dd3fc;
 }
 
+.call-chip.envoy {
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: #fcd34d;
+}
+
 .call-chip.ext {
   background: rgba(168, 85, 247, 0.15);
   border: 1px solid rgba(168, 85, 247, 0.35);
@@ -2504,6 +2527,10 @@ body.light-theme .jurisdiction-pill {
   border-left: 3px solid #38bdf8;
 }
 
+.call-breakdown-card.card-envoy {
+  border-left: 3px solid #f59e0b;
+}
+
 .call-breakdown-card.card-extensible {
   border-left: 3px solid #a855f7;
 }
@@ -2526,6 +2553,75 @@ body.light-theme .jurisdiction-pill {
   font-weight: 700;
 }
 
+.call-info-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.call-info-btn {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.call-info-btn:hover,
+.call-info-btn[aria-expanded="true"] {
+  background: rgba(56, 189, 248, 0.22);
+  border-color: rgba(56, 189, 248, 0.65);
+  color: #ffffff;
+}
+
+.call-info-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  background: rgba(11, 20, 30, 0.96);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 7px;
+  padding: 0.35rem 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #f8fafc;
+  white-space: nowrap;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+}
+
+body[data-theme="light"] .call-info-btn {
+  border-color: rgba(15, 23, 42, 0.25);
+  background: rgba(15, 23, 42, 0.06);
+  color: #475569;
+}
+
+body[data-theme="light"] .call-info-btn:hover,
+body[data-theme="light"] .call-info-btn[aria-expanded="true"] {
+  background: rgba(2, 132, 199, 0.16);
+  border-color: rgba(2, 132, 199, 0.55);
+  color: #0369a1;
+}
+
+body[data-theme="light"] .call-info-popover {
+  background: #ffffff;
+  border-color: rgba(2, 132, 199, 0.4);
+  color: #0f172a;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.15);
+}
+
 .call-weight-badge {
   font-size: 0.58rem;
   font-family: var(--font-mono);
@@ -2539,6 +2635,12 @@ body.light-theme .jurisdiction-pill {
   background: rgba(56, 189, 248, 0.18);
   color: #7dd3fc;
   border: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.badge-envoy {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.4);
 }
 
 .badge-ext {
@@ -2580,6 +2682,10 @@ body[data-theme="light"] .call-breakdown-card.card-standard {
   border-left-color: #0284c7;
 }
 
+body[data-theme="light"] .call-breakdown-card.card-envoy {
+  border-left-color: #d97706;
+}
+
 body[data-theme="light"] .call-breakdown-card.card-extensible {
   border-left-color: #9333ea;
 }
@@ -2606,6 +2712,12 @@ body[data-theme="light"] .badge-std {
   border-color: rgba(2, 132, 199, 0.3);
 }
 
+body[data-theme="light"] .badge-envoy {
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+  border-color: rgba(217, 119, 6, 0.3);
+}
+
 body[data-theme="light"] .badge-ext {
   background: rgba(147, 51, 234, 0.12);
   color: #7e22ce;
@@ -2622,6 +2734,12 @@ body[data-theme="light"] .call-chip.std {
   background: rgba(2, 132, 199, 0.1);
   border-color: rgba(2, 132, 199, 0.25);
   color: #0369a1;
+}
+
+body[data-theme="light"] .call-chip.envoy {
+  background: rgba(217, 119, 6, 0.1);
+  border-color: rgba(217, 119, 6, 0.25);
+  color: #b45309;
 }
 
 body[data-theme="light"] .call-chip.ext {

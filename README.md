@@ -18,7 +18,7 @@
 > [!IMPORTANT]
 > - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
 > - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically auditing API Proxy deployments. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default). **In this case, the recorded consumption metrics for environment units and PDU appear to be inaccurate.**
-> - **Apigee Adapter for Envoy Traffic**: API calls processed through the **Apigee Adapter for Envoy** are not separately identified or filtered by this tool. 
+> - **Apigee Adapter for Envoy Traffic**: API calls processed through the **Apigee Adapter for Envoy** are explicitly identified via the Apigee Analytics dimension `gateway_source eq 'envoy'`, separated from Apigee runtime traffic (Standard `1:5` / `0.2×` and Extensible `1:1` / `1.0×`), and weighted at a **`1:3` ratio (`0.333×`)** toward your entitlement call consumption.
 
 ---
 
@@ -28,7 +28,7 @@
 In Google Cloud, Apigee subscription contracts (such as 2024 subscription plans) govern capacity across **multiple Apigee organizations and GCP projects**:
 * **Proxy Deployment Units (PDUs)**
 * **Environment Units (Environments &times; Attached Regions)**
-* **Yearly API Call Commitments**
+* **Yearly API Call Commitments** (differentiating **Extensible** runtime calls at `1.0×` weight, **Standard** runtime calls at `1:5` / `0.2×` weight, and **Apigee Adapter for Envoy** calls at `1:3` / `0.333×` weight)
 
 Enterprises typically manage several Apigee organizations across business units, environments (`dev`, `test`, `stage`, `prod`), and regions. In this cross-org context, it is extremely important to know overall subscription consumption and detect impending overages for PDU, Environments or calls.
 
@@ -45,7 +45,7 @@ Enterprises typically manage several Apigee organizations across business units,
 
 
 2. **Structured Export Suite**:
-   * One-click **Export CSV** generating a comprehensive, 15-column audit spreadsheet formatted for Google Sheets and Excel reporting.
+   * One-click **Export CSV** generating a comprehensive, 16-column audit spreadsheet formatted for Google Sheets and Excel reporting (including separate columns for Standard, Envoy Adapter, Extensible, Raw Total, and Weighted Entitlement Calls).
    * Headless CLI mode for automated reporting and CI/CD audit jobs.
 
 ---
@@ -64,7 +64,7 @@ flowchart TD
     Backend -->|3. Apigee X Instance Attachments| ApigeeAttach["Apigee API: GET /instances/{inst}/attachments"]
     Backend -->|4. Environment & Deployment Inventory| ApigeeDep["Apigee API: GET /v1/organizations/{org}/deployments"]
     Backend -->|5. Apigee Hybrid Revision Instances| ApigeeRevDep["Apigee API: GET /environments/{env}/apis/{proxy}/revisions/{rev}/deployments"]
-    Backend -->|6. Historical Traffic | ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type"]
+    Backend -->|6. Historical Traffic (Runtime & Envoy)| ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type (+ gateway_source eq 'envoy')"]
     Backend -->|7. Fallback & Time-Series Metrics| CloudMon["Cloud Monitoring API: Metric / TimeSeries"]
     
     ApigeeOrgs --> Engine[Entitlement Engine]
@@ -84,7 +84,7 @@ flowchart TD
    * **Regional Footprint & Attachments (Apigee X)**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regional instances each Apigee X environment is attached to.
    * **Deployments Inspection**: Calls `GET /v1/organizations/{org}/deployments` (and `?sharedFlows=true`) to inspect every active proxy and shared flow revision, automatically classifying proxies as Standard or Extensible.
    * **Regional Footprint & PDU Multiplier (Apigee Hybrid)**: For each Apigee Hybrid environment with deployments, queries `GET /v1/organizations/{org}/environments/{env}/apis/{proxy}/revisions/{rev}/deployments` (or `/sharedflows/{sf}/revisions/{rev}/deployments`) and inspects the `instances[]` array to determine the attached runtime instances (`regionCount`) and PDU multiplier per deployment. *(Caution: if a Hybrid environment has no deployments, the attached instance count cannot be queried and defaults to `1`).*
-   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date**.
+   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` alongside `filter=(gateway_source eq 'envoy')` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date** and differentiating Apigee runtime calls (**Extensible** at `1.0×` weight, **Standard** at `1:5` / `0.2×` weight) from **Apigee Adapter for Envoy** calls (`1:3` / `0.333×` weight) using the entitlement formula `Ext + 0.2×Std + 0.333×Envoy`.
 
 2. **Cloud Monitoring API (`monitoring.googleapis.com/v3`)**:
    * Queries metric `apigee.googleapis.com/proxy/response_count` as an automatic fallback when the Analytics add-on is disabled on specific environments.
@@ -177,7 +177,7 @@ python3 app.py
    * Review compliance status across the 3 top overview cards.
    * Filter by Organization (multi-select), Environment, or Footprint (`Apigee X` / `Hybrid`).
    * Inspect Cloud Monitoring capacity trends and the detailed environment grid.
-5. **Export CSV**: Click **Export CSV** in the Entitlement Compliance section to download a 12-column audit spreadsheet.
+5. **Export CSV**: Click **Export CSV** in the Entitlement Compliance section to download a 16-column audit spreadsheet.
 
 #### Headless CLI Audit Mode (Optional)
 Run an automated audit and generate CSV reports without starting the web server:
@@ -263,7 +263,7 @@ gcloud run deploy "${SERVICE_NAME}" \
 
 ## CSV Export Format Reference
 
-Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` containing 15 columns formatted for Google Sheets and Excel:
+Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` containing 16 columns formatted for Google Sheets and Excel:
 
 | Column | Description | Example |
 | :--- | :--- | :--- |
@@ -277,11 +277,12 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 | `Deployed Units (Proxies + SF)` | Total deployed artifacts | `236 (204P + 32SF)` |
 | `Consumed PDUs` | Total Proxy Deployment Units consumed | `472` |
 | `% of PDU Limit` | Share of total PDU entitlement | `31.47%` |
-| `Standard Calls` | Raw calls for standard proxies (weighted at 0.2×) | `1000000` |
+| `Standard Calls` | Raw calls for standard proxies (weighted at 1:5 / 0.2×) | `1000000` |
+| `Envoy Adapter Calls` | Raw calls processed via Apigee Adapter for Envoy (weighted at 1:3 / 0.333×) | `300000` |
 | `Extensible Calls` | Raw calls for extensible proxies (weighted at 1.0×) | `14050000` |
-| `Raw Total Calls` | Unweighted total recorded calls (Standard + Extensible) | `15050000` |
-| `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (0.2× Std + 1.0× Ext) | `14250000` |
-| `% of call Limit` | Share of Yearly API Calls entitlement | `14.25%` |
+| `Raw Total Calls` | Unweighted total recorded calls (Standard + Envoy Adapter + Extensible) | `15350000` |
+| `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (1.0× Ext + 0.2× Std + 0.333× Envoy) | `14350000` |
+| `% of call Limit` | Share of Yearly API Calls entitlement | `14.35%` |
 
 ---
 

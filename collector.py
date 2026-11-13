@@ -382,9 +382,8 @@ def build_google_oidc_auth_url(
         "access_type": "offline",
         "prompt": "consent select_account",
         "include_granted_scopes": "true",
+        "state": state or secrets.token_urlsafe(32),
     }
-    if state:
-        params["state"] = state
     if prompt_account:
         params["login_hint"] = prompt_account
 
@@ -1505,6 +1504,7 @@ def _build_env_summary_record(
         "sharedFlowPdus": shared_flows_count * region_count,
         "totalPdus": total_artifacts_env * region_count,
         "standardApiCalls": 0,
+        "envoyApiCalls": 0,
         "extensibleApiCalls": 0,
         "rawApiCalls": 0,
         "yearlyApiCalls": 0,
@@ -1740,6 +1740,20 @@ def resolve_contract_period(contract_start_date: str | None = None) -> dict[str,
     }
 
 
+STANDARD_CALL_WEIGHT: Final[float] = 0.2
+ENVOY_CALL_WEIGHT: Final[float] = 1.0 / 3.0
+EXTENSIBLE_CALL_WEIGHT: Final[float] = 1.0
+
+
+def _compute_weighted_entitlement_calls(std_calls: int, envoy_calls: int, ext_calls: int) -> int:
+    """Compute weighted entitlement API calls (0.2x Standard + 1/3x Envoy + 1.0x Extensible)."""
+    return (
+        int(round(std_calls * STANDARD_CALL_WEIGHT))
+        + int(round(envoy_calls * ENVOY_CALL_WEIGHT))
+        + int(round(ext_calls * EXTENSIBLE_CALL_WEIGHT))
+    )
+
+
 def _extract_metric_daily_points(
     metric_block: dict[str, Any],
     daily_target: dict[str, int],
@@ -1765,25 +1779,107 @@ def _parse_analytics_env_block(
     env_block: dict[str, Any],
     daily_std: dict[str, int],
     daily_ext: dict[str, int],
+    daily_envoy: dict[str, int] | None = None,
 ) -> tuple[int, int]:
     """Parse dimensions or direct metrics from an Apigee analytics environment block."""
+    dims = env_block.get("dimensions", [])
+    if not dims:
+        std_c = sum(_extract_metric_daily_points(mb, daily_std) for mb in env_block.get("metrics", []))
+        return std_c, 0
+
     std_c = 0
     ext_c = 0
-    dims = env_block.get("dimensions", [])
-    if dims:
-        for dim_item in dims:
-            dim_name = str(dim_item.get("name", "")).strip().lower()
-            target_map = daily_ext if "extensible" in dim_name else daily_std
+    for dim_item in dims:
+        dim_name = str(dim_item.get("name", "")).strip().lower()
+        if daily_envoy is not None and "envoy" in dim_name:
             for mb in dim_item.get("metrics", []):
-                added = _extract_metric_daily_points(mb, target_map)
-                if "extensible" in dim_name:
-                    ext_c += added
-                else:
-                    std_c += added
-    else:
-        for mb in env_block.get("metrics", []):
-            std_c += _extract_metric_daily_points(mb, daily_std)
+                _extract_metric_daily_points(mb, daily_envoy)
+            continue
+        is_ext = "extensible" in dim_name
+        target_map = daily_ext if is_ext else daily_std
+        added = sum(_extract_metric_daily_points(mb, target_map) for mb in dim_item.get("metrics", []))
+        if is_ext:
+            ext_c += added
+        else:
+            std_c += added
     return std_c, ext_c
+
+
+def _parse_envoy_response_blocks(data: dict[str, Any] | None) -> tuple[dict[str, int], dict[str, int]]:
+    """Extract standard and extensible daily maps from an Apigee Analytics Envoy filter response."""
+    envoy_std: dict[str, int] = {}
+    envoy_ext: dict[str, int] = {}
+    if not data:
+        return envoy_std, envoy_ext
+    for env_block in data.get("environments", []):
+        _parse_analytics_env_block(env_block, envoy_std, envoy_ext)
+    return envoy_std, envoy_ext
+
+
+def _query_envoy_chunk_points(
+    sess: requests.Session,
+    dim_url: str,
+    flat_url: str,
+    tr_str: str,
+    used_flat: bool,
+) -> tuple[dict[str, int], dict[str, int], bool]:
+    """Query Apigee Analytics for Envoy Adapter calls (gateway_source eq 'envoy') in a time chunk."""
+    envoy_params = {
+        "select": "sum(message_count)",
+        "timeRange": tr_str,
+        "timeUnit": "day",
+        "filter": "(gateway_source eq 'envoy')",
+    }
+    if not used_flat:
+        data, err = _get_json_sync(sess, dim_url, params=envoy_params, timeout=15.0)
+        envoy_std, envoy_ext = _parse_envoy_response_blocks(None if err else data)
+        if envoy_std or envoy_ext:
+            return envoy_std, envoy_ext, True
+
+    flat_data, flat_err = _get_json_sync(sess, flat_url, params=envoy_params, timeout=15.0)
+    flat_std, flat_ext = _parse_envoy_response_blocks(None if flat_err else flat_data)
+    if flat_std or flat_ext:
+        return flat_std, flat_ext, used_flat
+    return {}, {}, False
+
+
+def _add_positive_daily_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    """Add positive daily call counts from source into target."""
+    for day_key, count in source.items():
+        if count > 0:
+            target[day_key] = target.get(day_key, 0) + count
+
+
+def _merge_chunk_calls(
+    chunk_std: dict[str, int],
+    chunk_ext: dict[str, int],
+    envoy_calls: tuple[dict[str, int], dict[str, int], bool],
+    daily_std: dict[str, int],
+    daily_envoy: dict[str, int],
+    daily_ext: dict[str, int],
+) -> tuple[int, int, int]:
+    """Merge single-chunk standard, extensible, and Envoy Adapter daily call counts."""
+    envoy_std, envoy_ext, subtract_envoy = envoy_calls
+    if subtract_envoy:
+        for k, v in envoy_std.items():
+            chunk_std[k] = max(0, chunk_std.get(k, 0) - v)
+        for k, v in envoy_ext.items():
+            chunk_ext[k] = max(0, chunk_ext.get(k, 0) - v)
+
+    _add_positive_daily_counts(daily_std, chunk_std)
+    _add_positive_daily_counts(daily_ext, chunk_ext)
+    _add_positive_daily_counts(daily_envoy, envoy_std)
+    _add_positive_daily_counts(daily_envoy, envoy_ext)
+    return sum(chunk_std.values()), sum(envoy_std.values()) + sum(envoy_ext.values()), sum(chunk_ext.values())
+
+
+def _combine_daily_call_maps(*maps: dict[str, int]) -> dict[str, int]:
+    """Sum multiple daily call dictionaries into a single daily call total dictionary."""
+    combined: dict[str, int] = {}
+    for mp in maps:
+        for k, v in mp.items():
+            combined[k] = combined.get(k, 0) + v
+    return combined
 
 
 def _query_env_analytics_chunks(
@@ -1792,29 +1888,39 @@ def _query_env_analytics_chunks(
     org_name: str,
     env_name: str,
     chunks: list[tuple[datetime.datetime, datetime.datetime]],
-) -> tuple[dict[str, int], int, int, bool]:
-    """Query Apigee Analytics endpoint with proxy_deployment_type dimension in 90-day time chunks."""
+) -> tuple[dict[str, int], int, int, int, bool]:
+    """Query Apigee Analytics endpoint for runtime (standard/extensible) and Envoy Adapter calls."""
     daily_std: dict[str, int] = {}
     daily_ext: dict[str, int] = {}
+    daily_envoy: dict[str, int] = {}
+    dim_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/proxy_deployment_type"
+    flat_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/"
+
     for c_start, c_end in chunks:
         tr_str = f"{c_start.strftime('%m/%d/%Y %H:%M')}~{c_end.strftime('%m/%d/%Y %H:%M')}"
         params = {"select": "sum(message_count)", "timeRange": tr_str, "timeUnit": "day"}
-        dim_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/proxy_deployment_type"
+        used_flat = False
         data, err = _get_json_sync(sess, dim_url, params=params, timeout=15.0)
         if err or not data or not data.get("environments"):
-            flat_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/"
+            used_flat = True
             data, err = _get_json_sync(sess, flat_url, params=params, timeout=15.0)
             if err or not data:
-                return {}, 0, 0, False
-        for env_block in data.get("environments", []):
-            _parse_analytics_env_block(env_block, daily_std, daily_ext)
+                return {}, 0, 0, 0, False
 
-    daily_map: dict[str, int] = {}
-    for k, v in daily_std.items():
-        daily_map[k] = daily_map.get(k, 0) + v
-    for k, v in daily_ext.items():
-        daily_map[k] = daily_map.get(k, 0) + v
-    return daily_map, sum(daily_std.values()), sum(daily_ext.values()), True
+        chunk_std: dict[str, int] = {}
+        chunk_ext: dict[str, int] = {}
+        for env_block in data.get("environments", []):
+            _parse_analytics_env_block(env_block, chunk_std, chunk_ext, daily_envoy)
+
+        envoy_calls = _query_envoy_chunk_points(
+            sess, dim_url, flat_url, tr_str, used_flat
+        )
+        _merge_chunk_calls(
+            chunk_std, chunk_ext, envoy_calls, daily_std, daily_envoy, daily_ext
+        )
+
+    daily_map = _combine_daily_call_maps(daily_std, daily_ext, daily_envoy)
+    return daily_map, sum(daily_std.values()), sum(daily_ext.values()), sum(daily_envoy.values()), True
 
 
 def _process_monitoring_point(pt: dict[str, Any], env_data: dict[str, Any]) -> None:
@@ -1881,6 +1987,7 @@ def _init_env_call_results(envs: list[dict[str, Any]]) -> dict[str, dict[str, An
         e["environment"]: {
             "daily": {},
             "standardApiCalls": 0,
+            "envoyApiCalls": 0,
             "extensibleApiCalls": 0,
             "source": "APIGEE_ANALYTICS",
             "analytics_ok": False,
@@ -1911,12 +2018,13 @@ def _fetch_single_org_contract_calls_sync(
         env_name = e["environment"]
         if int(e.get("totalArtifacts", 0)) <= 0 and int(e.get("totalPdus", 0)) <= 0:
             continue
-        daily_calls, std_c, ext_c, ok = _query_env_analytics_chunks(
+        daily_calls, std_c, ext_c, envoy_c, ok = _query_env_analytics_chunks(
             sess, apigee_base_url, org_name, env_name, chunks
         )
         if ok:
             env_results[env_name]["daily"] = daily_calls
             env_results[env_name]["standardApiCalls"] = std_c
+            env_results[env_name]["envoyApiCalls"] = envoy_c
             env_results[env_name]["extensibleApiCalls"] = ext_c
             env_results[env_name]["analytics_ok"] = True
         else:
@@ -1952,10 +2060,13 @@ def _generate_demo_calls(
                 c_val = max(0, int(round(daily_avg * wave)))
                 daily_map[day_dt.strftime("%Y-%m-%d")] = c_val
                 total_raw += c_val
-            std_c = int(round(total_raw * std_ratio))
-            ext_c = total_raw - std_c
-            weighted_c = int(round(std_c * 0.2 + ext_c * 1.0))
+            envoy_c = int(round(total_raw * 0.10))
+            rem_raw = total_raw - envoy_c
+            std_c = int(round(rem_raw * std_ratio))
+            ext_c = rem_raw - std_c
+            weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c)
             e["standardApiCalls"] = std_c
+            e["envoyApiCalls"] = envoy_c
             e["extensibleApiCalls"] = ext_c
             e["rawApiCalls"] = total_raw
             e["yearlyApiCalls"] = weighted_c
@@ -1978,8 +2089,9 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
         e_info = org_res.get(e["environment"], {})
         daily_map = e_info.get("daily", {})
         std_c = int(e_info.get("standardApiCalls", 0))
+        envoy_c = int(e_info.get("envoyApiCalls", 0))
         ext_c = int(e_info.get("extensibleApiCalls", 0))
-        raw_c = std_c + ext_c
+        raw_c = std_c + envoy_c + ext_c
         if raw_c == 0 and daily_map:
             raw_c = sum(daily_map.values())
             std_c = raw_c
@@ -1987,8 +2099,10 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
         if total_from_daily > raw_c:
             std_c += total_from_daily - raw_c
             raw_c = total_from_daily
-        weighted_c = int(round(std_c * 0.2 + ext_c * 1.0)) if (std_c > 0 or ext_c > 0) else raw_c
+        has_breakdown = std_c > 0 or envoy_c > 0 or ext_c > 0
+        weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c) if has_breakdown else raw_c
         e["standardApiCalls"] = std_c
+        e["envoyApiCalls"] = envoy_c
         e["extensibleApiCalls"] = ext_c
         e["rawApiCalls"] = raw_c
         e["yearlyApiCalls"] = weighted_c
@@ -2310,6 +2424,7 @@ def _extract_env_calls_series(
         "source": env.get("callsSource", "APIGEE_ANALYTICS"),
         "points": pts,
         "standardApiCalls": int(env.get("standardApiCalls", 0)),
+        "envoyApiCalls": int(env.get("envoyApiCalls", 0)),
         "extensibleApiCalls": int(env.get("extensibleApiCalls", 0)),
         "rawApiCalls": int(env.get("rawApiCalls", 0)),
         "yearlyApiCalls": int(env.get("yearlyApiCalls", 0)),
@@ -2625,15 +2740,16 @@ def _build_env_formula_and_shares(
     }
 
 
-def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int]:
-    """Extract standard, extensible, raw, and weighted yearly API calls."""
+def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    """Extract standard, envoy, extensible, raw, and weighted yearly API calls."""
     std_calls = int(env.get("standardApiCalls", 0))
+    envoy_calls = int(env.get("envoyApiCalls", 0))
     ext_calls = int(env.get("extensibleApiCalls", 0))
-    raw_calls = int(env.get("rawApiCalls", std_calls + ext_calls))
+    raw_calls = int(env.get("rawApiCalls", std_calls + envoy_calls + ext_calls))
     env_yearly_calls = int(env.get("yearlyApiCalls", 0))
-    if env_yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
-        env_yearly_calls = int(round(std_calls * 0.2 + ext_calls * 1.0))
-    return std_calls, ext_calls, raw_calls, env_yearly_calls
+    if env_yearly_calls == 0 and (std_calls > 0 or envoy_calls > 0 or ext_calls > 0):
+        env_yearly_calls = _compute_weighted_entitlement_calls(std_calls, envoy_calls, ext_calls)
+    return std_calls, envoy_calls, ext_calls, raw_calls, env_yearly_calls
 
 
 def _resolve_env_region_caution(
@@ -2669,7 +2785,7 @@ def _build_env_recalculated_record(
     tot_p = std_p + ext_p
     sf_p = int(env.get("sharedFlows", 0))
     env_total_pdus = (tot_p * r_count) + ((sf_p * r_count) if cfg.include_shared_flows else 0)
-    std_calls, ext_calls, raw_calls, env_yearly_calls = _resolve_env_call_metrics(env)
+    std_calls, envoy_calls, ext_calls, raw_calls, env_yearly_calls = _resolve_env_call_metrics(env)
     extra = _build_env_formula_and_shares(tot_p, sf_p, r_count, env_total_pdus, env_yearly_calls, cfg)
     region_caution = _resolve_env_region_caution(env, meta, tot_p + sf_p, is_overridden)
 
@@ -2697,6 +2813,7 @@ def _build_env_recalculated_record(
         "sharedFlowPdus": sf_p * r_count,
         "totalPdus": env_total_pdus,
         "standardApiCalls": std_calls,
+        "envoyApiCalls": envoy_calls,
         "extensibleApiCalls": ext_calls,
         "rawApiCalls": raw_calls,
         "yearlyApiCalls": env_yearly_calls,
@@ -2773,6 +2890,7 @@ def _aggregate_org_env_totals(org_envs_out: list[dict[str, Any]]) -> dict[str, i
         "sharedFlowPdus": 0,
         "totalPdus": 0,
         "standardApiCalls": 0,
+        "envoyApiCalls": 0,
         "extensibleApiCalls": 0,
         "rawApiCalls": 0,
         "yearlyApiCalls": 0,
@@ -2787,6 +2905,7 @@ def _aggregate_org_env_totals(org_envs_out: list[dict[str, Any]]) -> dict[str, i
         totals["sharedFlowPdus"] += e.get("sharedFlowPdus", 0)
         totals["totalPdus"] += e.get("totalPdus", 0)
         totals["standardApiCalls"] += e.get("standardApiCalls", 0)
+        totals["envoyApiCalls"] += e.get("envoyApiCalls", 0)
         totals["extensibleApiCalls"] += e.get("extensibleApiCalls", 0)
         totals["rawApiCalls"] += e.get("rawApiCalls", 0)
         totals["yearlyApiCalls"] += e.get("yearlyApiCalls", 0)
@@ -2825,6 +2944,7 @@ def _build_recalculated_org_record(
         "sharedFlowPdus": t["sharedFlowPdus"],
         "totalPdus": t["totalPdus"],
         "standardApiCalls": t["standardApiCalls"],
+        "envoyApiCalls": t["envoyApiCalls"],
         "extensibleApiCalls": t["extensibleApiCalls"],
         "rawApiCalls": t["rawApiCalls"],
         "yearlyApiCalls": t["yearlyApiCalls"],
@@ -2866,11 +2986,12 @@ def _compute_calls_quota_metrics(
     period_info: dict[str, Any],
     entitlement_yearly_calls: int,
 ) -> dict[str, Any]:
-    """Compute API call quotas, standard/extensible metrics, and run-rate projections."""
+    """Compute API call quotas, standard/envoy/extensible metrics, and run-rate projections."""
     total_calls = portfolio_totals["yearlyApiCalls"]
     std_calls = portfolio_totals.get("standardApiCalls", 0)
+    envoy_calls = portfolio_totals.get("envoyApiCalls", 0)
     ext_calls = portfolio_totals.get("extensibleApiCalls", 0)
-    raw_calls = portfolio_totals.get("rawApiCalls", std_calls + ext_calls)
+    raw_calls = portfolio_totals.get("rawApiCalls", std_calls + envoy_calls + ext_calls)
     calls_util_pct = round((total_calls / entitlement_yearly_calls) * 100, 1)
 
     days_elapsed = period_info["daysElapsed"]
@@ -2879,6 +3000,7 @@ def _compute_calls_quota_metrics(
 
     return {
         "totalStandardApiCalls": std_calls,
+        "totalEnvoyApiCalls": envoy_calls,
         "totalExtensibleApiCalls": ext_calls,
         "totalRawApiCalls": raw_calls,
         "totalYearlyApiCalls": total_calls,
@@ -2976,6 +3098,7 @@ def _build_portfolio_summary(
         "totalActiveEnvRegionAttachments": portfolio_totals["totalEnvironmentUnits"],
         "totalPdus": portfolio_totals["totalPdus"],
         "totalStandardApiCalls": portfolio_totals.get("standardApiCalls", 0),
+        "totalEnvoyApiCalls": portfolio_totals.get("envoyApiCalls", 0),
         "totalExtensibleApiCalls": portfolio_totals.get("extensibleApiCalls", 0),
         "totalRawApiCalls": portfolio_totals.get("rawApiCalls", 0),
         "totalYearlyApiCalls": portfolio_totals["yearlyApiCalls"],
@@ -3038,6 +3161,19 @@ def _build_recalculated_portfolio_payload(
     }
 
 
+def _sum_portfolio_organization_totals(organizations_out: list[dict[str, Any]]) -> dict[str, int]:
+    """Aggregate cross-organization totals across all recalculated organization records."""
+    return {
+        "totalPdus": sum(o["totalPdus"] for o in organizations_out),
+        "totalEnvironmentUnits": sum(o["environmentUnits"] for o in organizations_out),
+        "standardApiCalls": sum(o.get("standardApiCalls", 0) for o in organizations_out),
+        "envoyApiCalls": sum(o.get("envoyApiCalls", 0) for o in organizations_out),
+        "extensibleApiCalls": sum(o.get("extensibleApiCalls", 0) for o in organizations_out),
+        "rawApiCalls": sum(o.get("rawApiCalls", 0) for o in organizations_out),
+        "yearlyApiCalls": sum(o["yearlyApiCalls"] for o in organizations_out),
+    }
+
+
 def recalculate_portfolio(
     raw_data: dict[str, Any],
     entitlement_pdu: int = 500,
@@ -3048,7 +3184,9 @@ def recalculate_portfolio(
 ) -> dict[str, Any]:
     """Recalculate environment, organization, and cross-organization entitlement metrics."""
     ent_calls = int(extra_settings.get("entitlement_yearly_calls", 1_500_000_000))
-    contract_start = extra_settings.get("contract_start_date")
+    contract_start = extra_settings.get("contract_start_date") or (
+        raw_data.get("contractPeriod") or {}
+    ).get("contractStartDate")
 
     cfg = RecalculateConfig(
         entitlement_pdu=max(1, int(entitlement_pdu)),
@@ -3057,20 +3195,11 @@ def recalculate_portfolio(
         include_shared_flows=include_shared_flows,
         region_overrides=region_overrides or {},
     )
-    period_info = resolve_contract_period(
-        contract_start or (raw_data.get("contractPeriod") or {}).get("contractStartDate")
-    )
+    period_info = resolve_contract_period(contract_start)
     org_results = _recalculate_all_organizations(raw_data.get("organizations", []), cfg)
     organizations_out, all_envs_out, _ = org_results
 
-    portfolio_totals = {
-        "totalPdus": sum(o["totalPdus"] for o in organizations_out),
-        "totalEnvironmentUnits": sum(o["environmentUnits"] for o in organizations_out),
-        "standardApiCalls": sum(o.get("standardApiCalls", 0) for o in organizations_out),
-        "extensibleApiCalls": sum(o.get("extensibleApiCalls", 0) for o in organizations_out),
-        "rawApiCalls": sum(o.get("rawApiCalls", 0) for o in organizations_out),
-        "yearlyApiCalls": sum(o["yearlyApiCalls"] for o in organizations_out),
-    }
+    portfolio_totals = _sum_portfolio_organization_totals(organizations_out)
     quota_summary = _compute_quota_summary(
         portfolio_totals, period_info, cfg.entitlement_pdu, cfg.entitlement_envs, cfg.entitlement_yearly_calls
     )
@@ -3412,6 +3541,7 @@ def _build_demo_env(
         "sharedFlowPdus": sf_c * r_cnt,
         "totalPdus": tot_art * r_cnt,
         "standardApiCalls": 0,
+        "envoyApiCalls": 0,
         "extensibleApiCalls": 0,
         "rawApiCalls": 0,
         "yearlyApiCalls": 0,

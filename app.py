@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import pathlib
+import secrets
 import urllib.parse
 from typing import Any
 
@@ -286,6 +287,7 @@ def _merge_org_traffic_metrics(old_o: dict[str, Any], new_o: dict[str, Any]) -> 
         ):
             new_e["dailyCalls"] = old_e["dailyCalls"]
             new_e["standardApiCalls"] = old_e.get("standardApiCalls", 0)
+            new_e["envoyApiCalls"] = old_e.get("envoyApiCalls", 0)
             new_e["extensibleApiCalls"] = old_e.get("extensibleApiCalls", 0)
             new_e["rawApiCalls"] = old_e.get("rawApiCalls", 0)
             new_e["yearlyApiCalls"] = old_e.get("yearlyApiCalls", 0)
@@ -514,44 +516,66 @@ def _is_multi_tenant_domain(domain: str) -> bool:
     return any(clean == pub or clean.endswith("." + pub) for pub in _MULTI_TENANT_PUBLIC_DOMAINS)
 
 
+def _extract_hostname(url_or_host: str) -> str:
+    """Extract lowercase hostname from a URL or Host header string."""
+    if not url_or_host or not isinstance(url_or_host, str):
+        return ""
+    raw = url_or_host.strip()
+    if not raw or raw.lower() == "null":
+        return ""
+    with_scheme = raw if "://" in raw or raw.startswith("//") else f"//{raw}"
+    parsed = urllib.parse.urlsplit(with_scheme)
+    return (parsed.hostname or raw.split(":")[0]).lower()
+
+
+def _matches_allowed_host_pattern(origin_host: str, pattern: str) -> bool:
+    """Return True if origin_host matches a single ALLOWED_HOSTS pattern."""
+    if pattern == "*":
+        return False
+    if pattern.startswith("*."):
+        base = pattern[2:].lower().strip(".")
+        if not base or _is_multi_tenant_domain(base):
+            return False
+        return origin_host == base or origin_host.endswith("." + base)
+    return pattern.lower() == origin_host
+
+
 def _is_allowed_origin_host(origin: str, request_host: str) -> bool:
     """Verify whether the request Origin/Referer matches the host or trusted hosts."""
-    try:
-        if not origin or not isinstance(origin, str) or origin.strip().lower() == "null":
-            return False
-        parsed = urllib.parse.urlparse(origin)
-        origin_host = (parsed.hostname or parsed.netloc.split(":")[0]).lower()
-        if not origin_host:
-            return False
-
-        clean_request_host = ""
-        if request_host:
-            req_parsed = urllib.parse.urlsplit(
-                request_host if "://" in request_host or request_host.startswith("//") else f"//{request_host}"
-            )
-            clean_request_host = (req_parsed.hostname or request_host.split(":")[0]).lower()
-
-        if clean_request_host and origin_host == clean_request_host:
-            return True
-
-        local_hosts = {"localhost", "127.0.0.1", "::1", "testserver"}
-        if origin_host in local_hosts and clean_request_host in local_hosts:
-            return True
-
-        for pattern in ALLOWED_HOSTS:
-            if pattern == "*":
-                continue
-            if pattern.startswith("*."):
-                base = pattern[2:].lower().strip(".")
-                if not base or _is_multi_tenant_domain(base):
-                    continue
-                if origin_host == base or origin_host.endswith("." + base):
-                    return True
-            elif pattern.lower() == origin_host:
-                return True
-    except Exception:
+    origin_host = _extract_hostname(origin)
+    if not origin_host:
         return False
-    return False
+
+    clean_request_host = _extract_hostname(request_host)
+    if clean_request_host and origin_host == clean_request_host:
+        return True
+
+    local_hosts = {"localhost", "127.0.0.1", "::1", "testserver"}
+    if origin_host in local_hosts and clean_request_host in local_hosts:
+        return True
+
+    return any(_matches_allowed_host_pattern(origin_host, p) for p in ALLOWED_HOSTS)
+
+
+def _get_header_case_insensitive(request: Request, name: str) -> str:
+    """Return header value by name regardless of casing."""
+    return request.headers.get(name) or request.headers.get(name.lower()) or ""
+
+
+def _is_mutative_request_origin_valid(request: Request) -> bool:
+    """Validate Origin and Referer headers on state-changing HTTP requests."""
+    origin = _get_header_case_insensitive(request, "Origin")
+    referer = _get_header_case_insensitive(request, "Referer")
+    if not origin and not referer:
+        return False
+    req_host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    if origin and not _is_allowed_origin_host(origin, req_host):
+        return False
+    return not (referer and not _is_allowed_origin_host(referer, req_host))
 
 
 @app.middleware("http")
@@ -560,29 +584,11 @@ async def protect_csrf_and_origin(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Protect state-changing endpoints against cross-origin and DNS rebinding attacks."""
-    if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
-        origin = request.headers.get("Origin") or request.headers.get("origin")
-        referer = request.headers.get("Referer") or request.headers.get("referer")
-        if not origin and not referer:
-            return JSONResponse(
-                {"detail": "Forbidden: cross-origin request rejected"},
-                status_code=403,
-            )
-        req_host = (
-            request.headers.get("x-forwarded-host")
-            or request.headers.get("host")
-            or request.url.netloc
+    if request.method in {"POST", "PUT", "DELETE", "PATCH"} and not _is_mutative_request_origin_valid(request):
+        return JSONResponse(
+            {"detail": "Forbidden: cross-origin request rejected"},
+            status_code=403,
         )
-        if origin and not _is_allowed_origin_host(origin, req_host):
-            return JSONResponse(
-                {"detail": "Forbidden: cross-origin request rejected"},
-                status_code=403,
-            )
-        if referer and not _is_allowed_origin_host(referer, req_host):
-            return JSONResponse(
-                {"detail": "Forbidden: cross-origin request rejected"},
-                status_code=403,
-            )
     return await call_next(request)
 
 
@@ -773,6 +779,32 @@ async def _perform_local_gcloud_browser_login(
     )
 
 
+def _build_custom_oauth_redirect_response(
+    request: Request,
+    redirect_uri: str,
+    account: str | None,
+    custom_client_id: str,
+) -> JSONResponse:
+    """Create JSONResponse with OAuth URL and CSRF state cookie."""
+    state_token = generate_session_id()
+    auth_url = build_google_oidc_auth_url(
+        redirect_uri=redirect_uri, prompt_account=account, state=state_token
+    )
+    is_https = (request.headers.get("x-forwarded-proto") == "https") or (request.url.scheme == "https")
+    resp = JSONResponse(
+        {
+            "authUrl": auth_url,
+            "redirectUri": redirect_uri,
+            "clientId": custom_client_id,
+            "isOAuthConfigured": True,
+        }
+    )
+    resp.set_cookie(
+        key="apigee_oidc_state", value=state_token, max_age=600, httponly=True, secure=is_https, samesite="lax"
+    )
+    return resp
+
+
 @app.get("/api/auth/oidc/auth-url")
 async def api_oidc_auth_url(
     request: Request,
@@ -782,28 +814,10 @@ async def api_oidc_auth_url(
     base_url, redirect_uri = _resolve_redirect_endpoints(request)
     custom_client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     custom_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
-    has_custom_web_oauth = bool(
-        custom_client_id
-        and custom_client_id != DEFAULT_GOOGLE_CLIENT_ID
-        and custom_client_secret
-    )
+    if custom_client_id and custom_client_id != DEFAULT_GOOGLE_CLIENT_ID and custom_client_secret:
+        return _build_custom_oauth_redirect_response(request, redirect_uri, account, custom_client_id)
 
-    if has_custom_web_oauth:
-        auth_url = build_google_oidc_auth_url(
-            redirect_uri=redirect_uri,
-            prompt_account=account,
-        )
-        return JSONResponse(
-            {
-                "authUrl": auth_url,
-                "redirectUri": redirect_uri,
-                "clientId": custom_client_id,
-                "isOAuthConfigured": True,
-            }
-        )
-
-    iap_user = request.headers.get("x-goog-authenticated-user-email")
-    if iap_user or os.environ.get("K_SERVICE"):
+    if request.headers.get("x-goog-authenticated-user-email") or os.environ.get("K_SERVICE"):
         return JSONResponse(
             {
                 "authUrl": "/_gcp_iap/clear_login_cookie",
@@ -921,6 +935,7 @@ def _attach_oidc_cookies(
             secure=is_https,
             samesite="lax",
         )
+    response.delete_cookie(key="apigee_oidc_state")
 
 
 def _build_oidc_response(
@@ -951,12 +966,17 @@ def _build_oidc_response(
 async def api_oidc_callback(
     request: Request,
     code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> Response:
     """Handle Google OIDC OAuth 2.0 redirect callback, exchange authorization code, and persist tokens."""
     if error or not code:
         err_val = urllib.parse.quote(str(error or "no_code"), safe="")
         return RedirectResponse(url=f"/?oidc_error={err_val}")
+
+    expected_state = request.cookies.get("apigee_oidc_state")
+    if not state or not expected_state or not secrets.compare_digest(state, expected_state):
+        return RedirectResponse(url="/?oidc_error=invalid_state")
 
     _, redirect_uri = _resolve_redirect_endpoints(request)
     try:

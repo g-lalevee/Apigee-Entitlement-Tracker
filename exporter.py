@@ -64,6 +64,7 @@ ENVIRONMENTS_CSV_HEADER: tuple[str, ...] = (
     "Consumed PDUs",
     "% of PDU Limit",
     "Standard Calls",
+    "Envoy Adapter Calls",
     "Extensible Calls",
     "Raw Total Calls",
     "Entitlement Calls (Weighted)",
@@ -232,18 +233,23 @@ def generate_organizations_csv(portfolio: Mapping[str, Any]) -> str:
 def _resolve_env_calls_data(
     e: Mapping[str, Any],
     limit_calls: int,
-) -> tuple[int, int, int, int, str]:
-    """Extract standard, extensible, raw, weighted calls, and limit percentage."""
+) -> tuple[int, int, int, int, int, str]:
+    """Extract standard, envoy, extensible, raw, weighted calls, and limit percentage."""
     std_calls = int(e.get("standardApiCalls", 0))
+    envoy_calls = int(e.get("envoyApiCalls", 0))
     ext_calls = int(e.get("extensibleApiCalls", 0))
-    raw_calls = int(e.get("rawApiCalls", std_calls + ext_calls))
+    raw_calls = int(e.get("rawApiCalls", std_calls + envoy_calls + ext_calls))
     yearly_calls = int(e.get("yearlyApiCalls", 0))
-    if yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
-        yearly_calls = int(round(std_calls * 0.2 + ext_calls * 1.0))
+    if yearly_calls == 0 and (std_calls > 0 or envoy_calls > 0 or ext_calls > 0):
+        yearly_calls = (
+            int(round(std_calls * 0.2))
+            + int(round(envoy_calls / 3.0))
+            + int(round(ext_calls * 1.0))
+        )
     call_limit_pct = (
         f"{(yearly_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
     )
-    return std_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct
+    return std_calls, envoy_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct
 
 
 def _format_env_unit_label(e: Mapping[str, Any], include_sf: bool) -> str:
@@ -275,7 +281,7 @@ def _build_env_row(
     units_label = _format_env_unit_label(e, include_sf)
     total_pdus = int(e.get("totalPdus", 0))
     pdu_limit_pct = f"{(total_pdus / limit_pdu) * 100:.2f}%" if limit_pdu > 0 else "0.00%"
-    std_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct = (
+    std_calls, envoy_calls, ext_calls, raw_calls, yearly_calls, call_limit_pct = (
         _resolve_env_calls_data(e, limit_calls)
     )
 
@@ -291,6 +297,7 @@ def _build_env_row(
         total_pdus,
         pdu_limit_pct,
         std_calls,
+        envoy_calls,
         ext_calls,
         raw_calls,
         yearly_calls,

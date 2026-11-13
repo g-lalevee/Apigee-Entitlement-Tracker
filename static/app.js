@@ -989,44 +989,52 @@ function renderMonitoringChart() {
 
 /* Monthly API Calls Chart */
 
-function updateCallsBreakdownBanner(stdCalls, extCalls, weightedCalls, rawCalls) {
+function updateCallsBreakdownBanner(stdCalls, envoyCalls, extCalls, weightedCalls, rawCalls) {
   const std = Number(stdCalls || 0);
+  const envoy = Number(envoyCalls || 0);
   const ext = Number(extCalls || 0);
   const stdEntitlement = Math.round(std * 0.2);
+  const envoyEntitlement = Math.round(envoy / 3.0);
   const extEntitlement = Math.round(ext * 1.0);
-  const entitlementSum = stdEntitlement + extEntitlement;
-  const weighted = (std > 0 || ext > 0) ? entitlementSum : Number(weightedCalls ?? entitlementSum);
-  const raw = (std > 0 || ext > 0) ? (std + ext) : Number(rawCalls ?? (std + ext));
-
-  const stdEl = document.getElementById('banner-calls-std');
-  if (stdEl) {
-    stdEl.textContent = `${std.toLocaleString()} (${formatCompactCalls(std)})`;
-    stdEl.title = `${std.toLocaleString()} standard calls`;
-  }
-  const stdWeightedEl = document.getElementById('banner-calls-std-weighted');
-  if (stdWeightedEl) {
-    stdWeightedEl.innerHTML = `&rarr; <strong>${stdEntitlement.toLocaleString()}</strong> ent. calls (0.2&times;)`;
-  }
+  const entitlementSum = stdEntitlement + envoyEntitlement + extEntitlement;
+  const hasBreakdown = std > 0 || envoy > 0 || ext > 0;
+  const weighted = hasBreakdown ? entitlementSum : Number(weightedCalls ?? entitlementSum);
+  const raw = hasBreakdown ? (std + envoy + ext) : Number(rawCalls ?? (std + envoy + ext));
 
   const extEl = document.getElementById('banner-calls-ext');
   if (extEl) {
     extEl.textContent = `${ext.toLocaleString()} (${formatCompactCalls(ext)})`;
-    extEl.title = `${ext.toLocaleString()} extensible calls`;
   }
   const extWeightedEl = document.getElementById('banner-calls-ext-weighted');
   if (extWeightedEl) {
     extWeightedEl.innerHTML = `&rarr; <strong>${extEntitlement.toLocaleString()}</strong> ent. calls (1.0&times;)`;
   }
 
+  const stdEl = document.getElementById('banner-calls-std');
+  if (stdEl) {
+    stdEl.textContent = `${std.toLocaleString()} (${formatCompactCalls(std)})`;
+  }
+  const stdWeightedEl = document.getElementById('banner-calls-std-weighted');
+  if (stdWeightedEl) {
+    stdWeightedEl.innerHTML = `&rarr; <strong>${stdEntitlement.toLocaleString()}</strong> ent. calls (0.2&times;)`;
+  }
+
+  const envoyEl = document.getElementById('banner-calls-envoy');
+  if (envoyEl) {
+    envoyEl.textContent = `${envoy.toLocaleString()} (${formatCompactCalls(envoy)})`;
+  }
+  const envoyWeightedEl = document.getElementById('banner-calls-envoy-weighted');
+  if (envoyWeightedEl) {
+    envoyWeightedEl.innerHTML = `&rarr; <strong>${envoyEntitlement.toLocaleString()}</strong> ent. calls (0.333&times;)`;
+  }
+
   const totalWeightedEl = document.getElementById('banner-calls-total-weighted');
   if (totalWeightedEl) {
     totalWeightedEl.textContent = `${weighted.toLocaleString()} (${formatCompactCalls(weighted)})`;
-    totalWeightedEl.title = `Entitlement Calls = ${ext.toLocaleString()} Extensible + (${std.toLocaleString()} Standard × 0.2 = ${stdEntitlement.toLocaleString()}) = ${weighted.toLocaleString()}`;
   }
   const rawTotalEl = document.getElementById('banner-calls-raw-total');
   if (rawTotalEl) {
-    rawTotalEl.innerHTML = `- <strong>${formatCompactCalls(extEntitlement)}</strong> Ext + <strong>${formatCompactCalls(stdEntitlement)}</strong> Std Ent. &bull; Raw: ${formatCompactCalls(raw)}`;
-    rawTotalEl.title = `Entitlement Sum = Extensible (${ext.toLocaleString()}) + 0.2 × Standard (${std.toLocaleString()} = ${stdEntitlement.toLocaleString()}) = ${weighted.toLocaleString()} | Raw Total: ${raw.toLocaleString()}`;
+    rawTotalEl.innerHTML = `- <strong>${formatCompactCalls(extEntitlement)}</strong> Ext + <strong>${formatCompactCalls(stdEntitlement)}</strong> Std + <strong>${formatCompactCalls(envoyEntitlement)}</strong> Env Ent. &bull; Raw: ${formatCompactCalls(raw)}`;
   }
 }
 
@@ -1138,14 +1146,22 @@ function renderMonthlyCallsChart() {
   const pctYearly = yearlyLimit > 0 ? ((totalContractCalls / yearlyLimit) * 100).toFixed(1) : '0.0';
 
   const seriesStdCalls = matchingSeries.reduce((sum, s) => sum + (s.standardApiCalls || 0), 0);
+  const seriesEnvoyCalls = matchingSeries.reduce((sum, s) => sum + (s.envoyApiCalls || 0), 0);
   const seriesExtCalls = matchingSeries.reduce((sum, s) => sum + (s.extensibleApiCalls || 0), 0);
-  const seriesEntitlementCalls = Math.round(seriesStdCalls * 0.2 + seriesExtCalls * 1.0);
+  const seriesEntitlementCalls =
+    Math.round(seriesStdCalls * 0.2) +
+    Math.round(seriesEnvoyCalls / 3.0) +
+    Math.round(seriesExtCalls * 1.0);
   const seriesRawCalls = matchingSeries.reduce(
-    (sum, s) => sum + (s.rawApiCalls || (s.standardApiCalls || 0) + (s.extensibleApiCalls || 0)),
+    (sum, s) =>
+      sum +
+      (s.rawApiCalls ||
+        (s.standardApiCalls || 0) + (s.envoyApiCalls || 0) + (s.extensibleApiCalls || 0)),
     0
   );
   updateCallsBreakdownBanner(
     seriesStdCalls,
+    seriesEnvoyCalls,
     seriesExtCalls,
     seriesEntitlementCalls > 0 ? seriesEntitlementCalls : totalContractCalls,
     seriesRawCalls
@@ -1579,9 +1595,13 @@ function renderSimplifiedDashboard() {
 
   // 3. Yearly API Calls (Contract Period) metrics for filtered scope
   const consumedStdCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.standardApiCalls || 0), 0);
+  const consumedEnvoyCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.envoyApiCalls || 0), 0);
   const consumedExtCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.extensibleApiCalls || 0), 0);
   const consumedRawCalls = allMatchingEnvs.reduce(
-    (sum, e) => sum + (e.rawApiCalls ?? ((e.standardApiCalls || 0) + (e.extensibleApiCalls || 0))),
+    (sum, e) =>
+      sum +
+      (e.rawApiCalls ??
+        ((e.standardApiCalls || 0) + (e.envoyApiCalls || 0) + (e.extensibleApiCalls || 0))),
     0
   );
   const consumedCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.yearlyApiCalls || 0), 0);
@@ -1590,7 +1610,13 @@ function renderSimplifiedDashboard() {
   const diffCalls = Math.abs(limitCalls - consumedCalls);
   const pctCallsUsed = limitCalls > 0 ? ((consumedCalls / limitCalls) * 100).toFixed(1) : '0.0';
 
-  updateCallsBreakdownBanner(consumedStdCalls, consumedExtCalls, consumedCalls, consumedRawCalls);
+  updateCallsBreakdownBanner(
+    consumedStdCalls,
+    consumedEnvoyCalls,
+    consumedExtCalls,
+    consumedCalls,
+    consumedRawCalls
+  );
 
   const xPdus = allMatchingEnvs
     .filter((e) => e.runtimeType !== 'HYBRID')
@@ -1650,6 +1676,11 @@ function renderSimplifiedDashboard() {
     chipStd.textContent = `Std: ${formatCompactCalls(consumedStdCalls)}`;
     chipStd.title = `Standard Calls: ${consumedStdCalls.toLocaleString()} (0.2× weighting)`;
   }
+  const chipEnvoy = document.getElementById('chip-calls-envoy');
+  if (chipEnvoy) {
+    chipEnvoy.textContent = `Envoy: ${formatCompactCalls(consumedEnvoyCalls)}`;
+    chipEnvoy.title = `Envoy Adapter Calls: ${consumedEnvoyCalls.toLocaleString()} (1:3 / 0.333× weighting)`;
+  }
   const chipExt = document.getElementById('chip-calls-ext');
   if (chipExt) {
     chipExt.textContent = `Ext: ${formatCompactCalls(consumedExtCalls)}`;
@@ -1663,9 +1694,7 @@ function renderSimplifiedDashboard() {
 
   document.getElementById('val-calls-formula').innerHTML = `Period: <code>${escapeHtml(
     contractPeriodStart
-  )} &rarr; ${escapeHtml(contractPeriodEnd)}</code> (${daysElapsed}d elapsed) &bull; <strong>${pctCallsUsed}% used</strong> &bull; Run-rate: <strong>${formatCompactCalls(
-    projectedCalls
-  )}/yr</strong>`;
+  )} &rarr; ${escapeHtml(contractPeriodEnd)}</code> &bull; <strong>${pctCallsUsed}% used</strong>`;
   const pillCalls = document.getElementById('pill-status-calls');
   if (pillCalls) {
     pillCalls.className = `chart-status-pill ${isCallsAbove ? 'above' : 'below'}`;
@@ -1711,19 +1740,25 @@ function renderSimplifiedDashboard() {
   if (elEnvs) elEnvs.textContent = activeEnvsCount.toLocaleString();
 
   const elStdCalls = document.getElementById('legend-std-calls');
+  const elEnvoyCalls = document.getElementById('legend-envoy-calls');
   const elExtCalls = document.getElementById('legend-ext-calls');
   const legCallsBreakdown = document.getElementById('legend-calls-breakdown-summary');
+  if (elExtCalls) {
+    elExtCalls.textContent = `Ext.: ${formatCompactCalls(consumedExtCalls)} (1.0×)`;
+    elExtCalls.title = `${consumedExtCalls.toLocaleString()} extensible calls`;
+  }
   if (elStdCalls) {
-    elStdCalls.textContent = `${formatCompactCalls(consumedStdCalls)} Std (0.2×)`;
+    elStdCalls.textContent = `Std.: ${formatCompactCalls(consumedStdCalls)} (0.2×)`;
     elStdCalls.title = `${consumedStdCalls.toLocaleString()} standard calls`;
   }
-  if (elExtCalls) {
-    elExtCalls.textContent = `${formatCompactCalls(consumedExtCalls)} Ext (1.0×)`;
-    elExtCalls.title = `${consumedExtCalls.toLocaleString()} extensible calls`;
+  if (elEnvoyCalls) {
+    elEnvoyCalls.textContent = `Envoy: ${formatCompactCalls(consumedEnvoyCalls)} (0.333×)`;
+    elEnvoyCalls.title = `${consumedEnvoyCalls.toLocaleString()} Envoy Adapter calls (1:3 weighting)`;
   }
   if (legCallsBreakdown) {
     const stdEnt = Math.round(consumedStdCalls * 0.2);
-    legCallsBreakdown.title = `Standard: ${consumedStdCalls.toLocaleString()} calls (0.2× = ${stdEnt.toLocaleString()} ent. calls) • Extensible: ${consumedExtCalls.toLocaleString()} calls (1.0×) • Entitlement Sum: ${(stdEnt + consumedExtCalls).toLocaleString()}`;
+    const envoyEnt = Math.round(consumedEnvoyCalls / 3.0);
+    legCallsBreakdown.title = `Standard: ${consumedStdCalls.toLocaleString()} calls (0.2× = ${stdEnt.toLocaleString()} ent. calls) • Envoy Adapter: ${consumedEnvoyCalls.toLocaleString()} calls (1:3 = ${envoyEnt.toLocaleString()} ent. calls) • Extensible: ${consumedExtCalls.toLocaleString()} calls (1.0×) • Entitlement Sum: ${(stdEnt + envoyEnt + consumedExtCalls).toLocaleString()}`;
   }
 
   // Determine active Gauge Dimension metrics
@@ -1807,7 +1842,7 @@ function renderSimplifiedDashboard() {
   if (!visibleEnvs.length) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="13" style="text-align: center; padding: 1.5rem; color: var(--text-muted);">
+        <td colspan="14" style="text-align: center; padding: 1.5rem; color: var(--text-muted);">
           No environments match the current filter${hideZero ? ' (or all have 0 PDUs)' : ''}.
         </td>
       </tr>
@@ -1828,6 +1863,7 @@ function renderSimplifiedDashboard() {
           ? `${e.totalArtifacts} <span style="color:var(--text-muted);font-size:0.74rem;">(${e.totalProxies}P + ${e.sharedFlows}SF)</span>`
           : `${e.totalProxies}`;
         const stdCalls = Number(e.standardApiCalls || 0);
+        const envoyCalls = Number(e.envoyApiCalls || 0);
         const extCalls = Number(e.extensibleApiCalls || 0);
         const envCalls = Number(e.yearlyApiCalls || 0);
         const callLimitPct = limitCalls > 0 ? ((envCalls / limitCalls) * 100).toFixed(2) : '0.00';
@@ -1843,8 +1879,9 @@ function renderSimplifiedDashboard() {
             <td class="num-cell">${unitsLabel}</td>
             <td class="num-cell"><strong>${e.totalPdus.toLocaleString()}</strong></td>
             <td class="num-cell">${pduLimitPct}%</td>
-            <td class="num-cell" title="${stdCalls.toLocaleString()} standard calls">${stdCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(stdCalls)})</span></td>
             <td class="num-cell" title="${extCalls.toLocaleString()} extensible calls">${extCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(extCalls)})</span></td>
+            <td class="num-cell" title="${stdCalls.toLocaleString()} standard calls">${stdCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(stdCalls)})</span></td>
+            <td class="num-cell" title="${envoyCalls.toLocaleString()} Envoy Adapter calls (1:3 weighting)">${envoyCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envoyCalls)})</span></td>
             <td class="num-cell" title="${envCalls.toLocaleString()} entitlement calls (weighted)"><strong>${envCalls.toLocaleString()}</strong> <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envCalls)})</span></td>
             <td class="num-cell">${callLimitPct}%</td>
           </tr>
@@ -1856,6 +1893,7 @@ function renderSimplifiedDashboard() {
   const visibleUnits = visibleEnvs.reduce((s, e) => s + e.totalArtifacts, 0);
   const visibleEnvUnits = visibleEnvs.reduce((s, e) => s + (e.regionCount || 0), 0);
   const visibleStdCalls = visibleEnvs.reduce((s, e) => s + (e.standardApiCalls || 0), 0);
+  const visibleEnvoyCalls = visibleEnvs.reduce((s, e) => s + (e.envoyApiCalls || 0), 0);
   const visibleExtCalls = visibleEnvs.reduce((s, e) => s + (e.extensibleApiCalls || 0), 0);
   const visibleCalls = visibleEnvs.reduce((s, e) => s + (e.yearlyApiCalls || 0), 0);
 
@@ -1867,8 +1905,9 @@ function renderSimplifiedDashboard() {
       <td class="num-cell">${visibleUnits.toLocaleString()} units</td>
       <td class="num-cell">${consumedPdus.toLocaleString()} PDUs</td>
       <td class="num-cell">${pctPduUsed}%</td>
-      <td class="num-cell" title="${visibleStdCalls.toLocaleString()} standard calls">${formatCompactCalls(visibleStdCalls)}</td>
       <td class="num-cell" title="${visibleExtCalls.toLocaleString()} extensible calls">${formatCompactCalls(visibleExtCalls)}</td>
+      <td class="num-cell" title="${visibleStdCalls.toLocaleString()} standard calls">${formatCompactCalls(visibleStdCalls)}</td>
+      <td class="num-cell" title="${visibleEnvoyCalls.toLocaleString()} Envoy Adapter calls">${formatCompactCalls(visibleEnvoyCalls)}</td>
       <td class="num-cell" title="${visibleCalls.toLocaleString()} entitlement calls">${formatCompactCalls(visibleCalls)} / ${formatCompactCalls(limitCalls)}</td>
       <td class="num-cell">${pctCallsUsed}%</td>
     </tr>
@@ -2373,6 +2412,43 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.disabled = false;
         btn.textContent = 'Refresh Analytics Calls';
       }
+    }
+  });
+
+  // Clickable weight info icons in Calls Breakdown Banner
+  const closeAllCallInfoPopovers = () => {
+    document.querySelectorAll('.call-info-popover').forEach((pop) => {
+      pop.hidden = true;
+    });
+    document.querySelectorAll('.call-info-btn').forEach((b) => {
+      b.setAttribute('aria-expanded', 'false');
+    });
+  };
+
+  document.getElementById('calls-breakdown-banner')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.call-info-btn');
+    if (!btn) return;
+    e.stopPropagation();
+    const targetId = btn.getAttribute('data-info-target');
+    const pop = targetId ? document.getElementById(targetId) : null;
+    if (!pop) return;
+    const isOpening = pop.hidden;
+    closeAllCallInfoPopovers();
+    if (isOpening) {
+      pop.hidden = false;
+      btn.setAttribute('aria-expanded', 'true');
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.call-info-wrap')) {
+      closeAllCallInfoPopovers();
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAllCallInfoPopovers();
     }
   });
 
