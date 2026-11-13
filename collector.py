@@ -64,6 +64,7 @@ __all__ = [
     "get_demo_dataset",
     "get_gcp_user_auth_info",
     "get_user_session",
+    "is_token_in_active_session",
     "list_available_jurisdictions",
     "populate_contract_api_calls",
     "populate_contract_api_calls_sync",
@@ -271,6 +272,24 @@ def clear_user_session(session_id: str | None) -> None:
         return
     with _OIDC_LOCK:
         _USER_SESSIONS.pop(session_id, None)
+
+
+def is_token_in_active_session(token: str | None) -> bool:
+    """Return True if token matches an active, non-expired in-memory user session."""
+    if not token or not token.strip():
+        return False
+    clean_tok = token.strip()
+    with _OIDC_LOCK:
+        for sess in _USER_SESSIONS.values():
+            if sess.get("accessToken") == clean_tok:
+                exp = sess.get("expiresAt")
+                if exp is None or time.time() < float(exp):
+                    return True
+        if _ACTIVE_OIDC_SESSION and _ACTIVE_OIDC_SESSION.get("accessToken") == clean_tok:
+            exp = _ACTIVE_OIDC_SESSION.get("expiresAt")
+            if exp is None or time.time() < float(exp):
+                return True
+    return False
 
 
 def set_active_oidc_session(session: dict[str, Any]) -> None:

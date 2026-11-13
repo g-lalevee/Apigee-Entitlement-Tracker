@@ -52,6 +52,7 @@ from collector import (
     get_demo_dataset,
     get_gcp_user_auth_info,
     get_user_session,
+    is_token_in_active_session,
     populate_contract_api_calls,
     recalculate_portfolio,
     refresh_google_oauth_token,
@@ -1419,23 +1420,52 @@ def _apply_region_override_updates(
         cfg["regionOverrides"] = merged
 
 
+def _validate_iap_jwt(iap_jwt: str | None, expected_email: str | None = None) -> bool:
+    """Cryptographically validate Google Cloud IAP JWT assertion."""
+    if not iap_jwt or not iap_jwt.strip():
+        return False
+    clean_jwt = iap_jwt.strip()
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token
+
+        expected_aud = os.environ.get("IAP_AUDIENCE")
+        decoded = id_token.verify_token(
+            clean_jwt,
+            google_requests.Request(),
+            audience=expected_aud,
+            certs_url="https://www.gstatic.com/iap/verify/public_key-jwk",
+        )
+        if expected_email and expected_email.strip():
+            jwt_email = str(decoded.get("email", "")).strip().lower()
+            clean_expected = (
+                expected_email.split(":")[-1].strip().lower()
+                if ":" in expected_email
+                else expected_email.strip().lower()
+            )
+            if jwt_email != clean_expected:
+                return False
+        return True
+    except Exception as exc:
+        logger.debug("IAP JWT validation failed: %s", exc)
+        return False
+
+
 def _verify_request_authenticated(request: Request) -> None:
     """Verify caller authentication via Google IAP, OAuth Bearer token, or valid session."""
     iap_user = request.headers.get("x-goog-authenticated-user-email") or request.headers.get(
         "X-Goog-Authenticated-User-Email"
     )
-    if iap_user and iap_user.strip():
-        return
-
-    auth_header = request.headers.get("Authorization", "").strip()
-    if auth_header.startswith("Bearer "):
-        candidate = auth_header[7:].strip()
-        if _is_clean_token(candidate):
+    iap_jwt = request.headers.get("x-goog-iap-jwt-assertion") or request.headers.get(
+        "X-Goog-IAP-JWT-Assertion"
+    )
+    if iap_user or iap_jwt:
+        if _validate_iap_jwt(iap_jwt, iap_user):
             return
-
-    cookie_tok = request.cookies.get("apigee_access_token", "").strip()
-    if _is_clean_token(cookie_tok):
-        return
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required: invalid or unverified IAP credentials",
+        )
 
     session_id = request.cookies.get("apigee_session_id", "").strip()
     if session_id:
@@ -1467,6 +1497,28 @@ def _verify_request_authenticated(request: Request) -> None:
                     detail="Authentication session expired. Please re-authenticate.",
                 )
         return
+
+    auth_header = request.headers.get("Authorization", "").strip()
+    candidate_token = None
+    if auth_header.startswith("Bearer "):
+        candidate_token = auth_header[7:].strip()
+    if not candidate_token:
+        cookie_tok = request.cookies.get("apigee_access_token", "").strip()
+        if cookie_tok:
+            candidate_token = cookie_tok
+
+    if candidate_token:
+        if is_token_in_active_session(candidate_token):
+            return
+        try:
+            validate_google_oauth_token(candidate_token)
+            return
+        except Exception as exc:
+            logger.debug("Bearer token validation failed: %s", exc)
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required: invalid or expired authentication token",
+            )
 
     raise HTTPException(
         status_code=401,
