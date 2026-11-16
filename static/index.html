@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261112-7" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261116-1" />
 </head>
 <body>
 
@@ -356,8 +356,8 @@
                   <div class="calls-dimension-chips" id="calls-dimension-chips">
                     <span class="call-chip ext" id="chip-calls-ext" title="Extensible Calls (1.0&times; weighting)">Ext: 0</span>
                     <span class="call-chip std" id="chip-calls-std" title="Standard Calls (0.2&times; weighting)">Std: 0</span>
-                    <span class="call-chip envoy" id="chip-calls-envoy" title="Envoy Adapter Calls (1:3 / 0.333&times; weighting)">Envoy: 0</span>
-                    <span class="call-chip raw" id="chip-calls-raw" title="Raw sum of all API calls">Raw: 0</span>
+                    <span class="call-chip raw" id="chip-calls-raw" title="Raw Runtime API Calls (Ext + Std, excl. Envoy)">Raw: 0</span>
+                    <span class="call-chip envoy call-chip-spaced" id="chip-calls-envoy" title="Envoy Adapter Calls (Free / 0&times; weighting)">Envoy: 0</span>
                   </div>
                   <div class="metric-sub" id="val-calls-formula">
                     Period: <code>2026-01-01 &rarr; 2027-01-01</code> &bull; <strong>0.0% used</strong>
@@ -439,7 +439,7 @@
                     <div class="legend-val legend-val-stacked" id="legend-calls-breakdown-summary">
                       <span id="legend-ext-calls">Ext.: 0 (1.0&times;)</span>
                       <span id="legend-std-calls">Std.: 0 (0.2&times;)</span>
-                      <span id="legend-envoy-calls">Envoy: 0 (0.333&times;)</span>
+                      <span id="legend-envoy-calls" style="color:var(--text-muted);">Envoy: 0 (Free)</span>
                     </div>
                   </div>
                 </div>
@@ -580,7 +580,7 @@
               </div>
             </div>
 
-            <!-- Calls Breakdown Banner: Extensible (1.0x), Standard (1:5), Envoy Adapter (1:3), and Entitlement Sum -->
+            <!-- Calls Breakdown Banner: Extensible (1.0x), Standard (1:5), Entitlement Sum, then Envoy Adapter (Free) -->
             <div class="calls-breakdown-banner" id="calls-breakdown-banner">
               <div class="call-breakdown-card card-extensible">
                 <div class="call-breakdown-header">
@@ -622,26 +622,6 @@
                 <div class="call-breakdown-sub" id="banner-calls-std-weighted">&rarr; 0 ent. calls (0.2&times;)</div>
               </div>
 
-              <div class="call-breakdown-card card-envoy">
-                <div class="call-breakdown-header">
-                  <span class="call-breakdown-title">Envoy Adapter Calls</span>
-                  <div class="call-info-wrap">
-                    <button
-                      type="button"
-                      class="call-info-btn"
-                      aria-label="Envoy Adapter Calls weight info"
-                      aria-expanded="false"
-                      data-info-target="info-pop-envoy"
-                    >i</button>
-                    <div class="call-info-popover" id="info-pop-envoy" role="tooltip" hidden>
-                      Envoy Adapter Calls Weight: (1:3)&times;
-                    </div>
-                  </div>
-                </div>
-                <div class="call-breakdown-val" id="banner-calls-envoy">0</div>
-                <div class="call-breakdown-sub" id="banner-calls-envoy-weighted">&rarr; 0 ent. calls (0.333&times;)</div>
-              </div>
-
               <div class="call-breakdown-card card-total">
                 <div class="call-breakdown-header">
                   <span class="call-breakdown-title">Entitlement Calls (Sum)</span>
@@ -654,12 +634,34 @@
                       data-info-target="info-pop-total"
                     >i</button>
                     <div class="call-info-popover" id="info-pop-total" role="tooltip" hidden>
-                      Entitlement Calls (Sum): Ext + 0.2&times;Std + 0.333&times;Envoy
+                      Entitlement Calls (Sum): Ext + 0.2&times;Std (Envoy Free)
                     </div>
                   </div>
                 </div>
                 <div class="call-breakdown-val" id="banner-calls-total-weighted">0</div>
-                <div class="call-breakdown-sub" id="banner-calls-raw-total">- 0 Ext + 0 Std + 0 Env Ent. &bull; Raw: 0</div>
+                <div class="call-breakdown-sub" id="banner-calls-raw-total">- 0 Ext + 0 Std Ent. &bull; Raw: 0</div>
+              </div>
+
+              <div class="calls-breakdown-spacer" aria-hidden="true"></div>
+
+              <div class="call-breakdown-card card-envoy">
+                <div class="call-breakdown-header">
+                  <span class="call-breakdown-title">Envoy Adapter Calls</span>
+                  <div class="call-info-wrap">
+                    <button
+                      type="button"
+                      class="call-info-btn"
+                      aria-label="Envoy Adapter Calls weight info"
+                      aria-expanded="false"
+                      data-info-target="info-pop-envoy"
+                    >i</button>
+                    <div class="call-info-popover" id="info-pop-envoy" role="tooltip" hidden>
+                      Envoy Adapter Calls: Free (0&times; weight in Entitlement 2024)
+                    </div>
+                  </div>
+                </div>
+                <div class="call-breakdown-val" id="banner-calls-envoy">0</div>
+                <div class="call-breakdown-sub" id="banner-calls-envoy-weighted">&rarr; 0 ent. calls (Free / 0&times;)</div>
               </div>
             </div>
 
@@ -689,8 +691,8 @@
                     <th class="num-cell">% of PDU Limit</th>
                     <th class="num-cell">Extensible Calls (1.0&times;)</th>
                     <th class="num-cell">Standard Calls (0.2&times;)</th>
-                    <th class="num-cell">Envoy Calls (0.333&times;)</th>
                     <th class="num-cell">Entitlement Calls</th>
+                    <th class="num-cell">Envoy Calls (Free)</th>
                     <th class="num-cell">% of Call Limit</th>
                   </tr>
                 </thead>
@@ -763,7 +765,7 @@
   </div>
 
   <div id="toast" class="toast-notification" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261112-7"></script>
+  <script src="/static/app.js?v=20261116-1"></script>
 
 
 </body>

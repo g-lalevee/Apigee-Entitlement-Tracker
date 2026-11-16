@@ -18,7 +18,9 @@
 > [!IMPORTANT]
 > - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
 > - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically auditing API Proxy deployments. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default). **In this case, the recorded consumption metrics for environment units and PDU appear to be inaccurate.**
-> - **Apigee Adapter for Envoy Traffic**: API calls processed through the **Apigee Adapter for Envoy** are explicitly identified via the Apigee Analytics dimension `gateway_source eq 'envoy'`, separated from Apigee runtime traffic (Standard `1:5` / `0.2×` and Extensible `1:1` / `1.0×`), and weighted at a **`1:3` ratio (`0.333×`)** toward your entitlement call consumption.
+> - **Apigee Adapter for Envoy Traffic**: Envoy-related traffic involves two distinct call types: 
+>    - (1) **API traffic handled directly by Envoy** (`gateway_source eq 'envoy'`), which is separated from Apigee runtime traffic (Standard and Extensible) and is free under Entitlement v2024; and 
+>   - (2) **calls against the `remote-*` Apigee proxies** (e.g., for authentication, quota, or analytics sync), which are executed on the Apigee runtime and included in **Extensible traffic**.
 
 ---
 
@@ -28,7 +30,7 @@
 In Google Cloud, Apigee subscription contracts (such as 2024 subscription plans) govern capacity across **multiple Apigee organizations and GCP projects**:
 * **Proxy Deployment Units (PDUs)**
 * **Environment Units (Environments &times; Attached Regions)**
-* **Yearly API Call Commitments** (differentiating **Extensible** runtime calls at `1.0×` weight, **Standard** runtime calls at `1:5` / `0.2×` weight, and **Apigee Adapter for Envoy** calls at `1:3` / `0.333×` weight)
+* **Yearly API Call Commitments** (differentiating **Extensible** runtime calls at `1.0×` weight, **Standard** runtime calls at `1:5` / `0.2×` weight, and **Apigee Adapter for Envoy** calls tracked separately as **free**)
 
 Enterprises typically manage several Apigee organizations across business units, environments (`dev`, `test`, `stage`, `prod`), and regions. In this cross-org context, it is extremely important to know overall subscription consumption and detect impending overages for PDU, Environments or calls.
 
@@ -84,7 +86,7 @@ flowchart TD
    * **Regional Footprint & Attachments (Apigee X)**: Queries `GET /v1/organizations/{org}/instances` and `/instances/{name}/attachments` to dynamically determine how many regional instances each Apigee X environment is attached to.
    * **Deployments Inspection**: Calls `GET /v1/organizations/{org}/deployments` (and `?sharedFlows=true`) to inspect every active proxy and shared flow revision, automatically classifying proxies as Standard or Extensible.
    * **Regional Footprint & PDU Multiplier (Apigee Hybrid)**: For each Apigee Hybrid environment with deployments, queries `GET /v1/organizations/{org}/environments/{env}/apis/{proxy}/revisions/{rev}/deployments` (or `/sharedflows/{sf}/revisions/{rev}/deployments`) and inspects the `instances[]` array to determine the attached runtime instances (`regionCount`) and PDU multiplier per deployment. *(Caution: if a Hybrid environment has no deployments, the attached instance count cannot be queried and defaults to `1`).*
-   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` alongside `filter=(gateway_source eq 'envoy')` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date** and differentiating Apigee runtime calls (**Extensible** at `1.0×` weight, **Standard** at `1:5` / `0.2×` weight) from **Apigee Adapter for Envoy** calls (`1:3` / `0.333×` weight) using the entitlement formula `Ext + 0.2×Std + 0.333×Envoy`.
+   * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` alongside `filter=(gateway_source eq 'envoy')` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date** and differentiating Apigee runtime calls (**Extensible** at `1.0×` weight, **Standard** at `1:5` / `0.2×` weight) from **Apigee Adapter for Envoy** calls (tracked separately as **free / `0×` weight** under Entitlement v2024) using the entitlement formula `Ext + 0.2×Std`.
 
 2. **Cloud Monitoring API (`monitoring.googleapis.com/v3`)**:
    * Queries metric `apigee.googleapis.com/proxy/response_count` as an automatic fallback when the Analytics add-on is disabled on specific environments.
@@ -278,11 +280,11 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 | `Consumed PDUs` | Total Proxy Deployment Units consumed | `472` |
 | `% of PDU Limit` | Share of total PDU entitlement | `31.47%` |
 | `Standard Calls` | Raw calls for standard proxies (weighted at 1:5 / 0.2×) | `1000000` |
-| `Envoy Adapter Calls` | Raw calls processed via Apigee Adapter for Envoy (weighted at 1:3 / 0.333×) | `300000` |
+| `Envoy Adapter Calls` | Raw calls processed via Apigee Adapter for Envoy (free / 0× under Entitlement v2024) | `300000` |
 | `Extensible Calls` | Raw calls for extensible proxies (weighted at 1.0×) | `14050000` |
-| `Raw Total Calls` | Unweighted total recorded calls (Standard + Envoy Adapter + Extensible) | `15350000` |
-| `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (1.0× Ext + 0.2× Std + 0.333× Envoy) | `14350000` |
-| `% of call Limit` | Share of Yearly API Calls entitlement | `14.35%` |
+| `Raw Total Calls` | Unweighted total recorded runtime calls (Standard + Extensible, excluding Envoy) | `15050000` |
+| `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (1.0× Ext + 0.2× Std) | `14250000` |
+| `% of call Limit` | Share of Yearly API Calls entitlement | `14.25%` |
 
 ---
 

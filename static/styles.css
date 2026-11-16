@@ -2499,12 +2499,29 @@ body.light-theme .jurisdiction-pill {
   color: var(--text-secondary);
 }
 
+.call-chip.call-chip-spaced {
+  margin-left: 0.65rem;
+}
+
 /* Calls Breakdown Banner (Monthly API Calls Section) */
 .calls-breakdown-banner {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  grid-template-columns: 1fr 1fr 1fr 18px 1fr;
   gap: 0.45rem;
   margin-bottom: 0.6rem;
+}
+
+.calls-breakdown-spacer {
+  min-width: 1px;
+}
+
+@media (max-width: 900px) {
+  .calls-breakdown-banner {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+  .calls-breakdown-spacer {
+    display: none;
+  }
 }
 
 .call-breakdown-card {

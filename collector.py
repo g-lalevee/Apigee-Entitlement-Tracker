@@ -1760,15 +1760,15 @@ def resolve_contract_period(contract_start_date: str | None = None) -> dict[str,
 
 
 STANDARD_CALL_WEIGHT: Final[float] = 0.2
-ENVOY_CALL_WEIGHT: Final[float] = 1.0 / 3.0
+ENVOY_CALL_WEIGHT: Final[float] = 0.0
 EXTENSIBLE_CALL_WEIGHT: Final[float] = 1.0
 
 
 def _compute_weighted_entitlement_calls(std_calls: int, envoy_calls: int, ext_calls: int) -> int:
-    """Compute weighted entitlement API calls (0.2x Standard + 1/3x Envoy + 1.0x Extensible)."""
+    """Compute weighted entitlement API calls (0.2x Standard + 1.0x Extensible; Envoy is free)."""
+    _ = envoy_calls
     return (
         int(round(std_calls * STANDARD_CALL_WEIGHT))
-        + int(round(envoy_calls * ENVOY_CALL_WEIGHT))
         + int(round(ext_calls * EXTENSIBLE_CALL_WEIGHT))
     )
 
@@ -1901,13 +1901,25 @@ def _combine_daily_call_maps(*maps: dict[str, int]) -> dict[str, int]:
     return combined
 
 
+def _build_daily_entitlement_map(
+    daily_std: dict[str, int],
+    daily_ext: dict[str, int],
+) -> dict[str, int]:
+    """Compute per-day weighted entitlement calls (0.2x Standard + 1.0x Extensible)."""
+    all_days = set(daily_std) | set(daily_ext)
+    return {
+        day: _compute_weighted_entitlement_calls(daily_std.get(day, 0), 0, daily_ext.get(day, 0))
+        for day in all_days
+    }
+
+
 def _query_env_analytics_chunks(
     sess: requests.Session,
     base_url: str,
     org_name: str,
     env_name: str,
     chunks: list[tuple[datetime.datetime, datetime.datetime]],
-) -> tuple[dict[str, int], int, int, int, bool]:
+) -> tuple[dict[str, dict[str, int]], int, int, int, bool]:
     """Query Apigee Analytics endpoint for runtime (standard/extensible) and Envoy Adapter calls."""
     daily_std: dict[str, int] = {}
     daily_ext: dict[str, int] = {}
@@ -1938,8 +1950,14 @@ def _query_env_analytics_chunks(
             chunk_std, chunk_ext, envoy_calls, daily_std, daily_envoy, daily_ext
         )
 
-    daily_map = _combine_daily_call_maps(daily_std, daily_ext, daily_envoy)
-    return daily_map, sum(daily_std.values()), sum(daily_ext.values()), sum(daily_envoy.values()), True
+    daily_map = _combine_daily_call_maps(daily_std, daily_ext)
+    daily_entitlement = _build_daily_entitlement_map(daily_std, daily_ext)
+    daily_maps = {
+        "daily": daily_map,
+        "dailyEntitlement": daily_entitlement,
+        "dailyEnvoy": daily_envoy,
+    }
+    return daily_maps, sum(daily_std.values()), sum(daily_ext.values()), sum(daily_envoy.values()), True
 
 
 def _process_monitoring_point(pt: dict[str, Any], env_data: dict[str, Any]) -> None:
@@ -2005,6 +2023,8 @@ def _init_env_call_results(envs: list[dict[str, Any]]) -> dict[str, dict[str, An
     return {
         e["environment"]: {
             "daily": {},
+            "dailyEntitlement": {},
+            "dailyEnvoy": {},
             "standardApiCalls": 0,
             "envoyApiCalls": 0,
             "extensibleApiCalls": 0,
@@ -2037,11 +2057,13 @@ def _fetch_single_org_contract_calls_sync(
         env_name = e["environment"]
         if int(e.get("totalArtifacts", 0)) <= 0 and int(e.get("totalPdus", 0)) <= 0:
             continue
-        daily_calls, std_c, ext_c, envoy_c, ok = _query_env_analytics_chunks(
+        daily_maps, std_c, ext_c, envoy_c, ok = _query_env_analytics_chunks(
             sess, apigee_base_url, org_name, env_name, chunks
         )
         if ok:
-            env_results[env_name]["daily"] = daily_calls
+            env_results[env_name]["daily"] = daily_maps.get("daily", {})
+            env_results[env_name]["dailyEntitlement"] = daily_maps.get("dailyEntitlement", {})
+            env_results[env_name]["dailyEnvoy"] = daily_maps.get("dailyEnvoy", {})
             env_results[env_name]["standardApiCalls"] = std_c
             env_results[env_name]["envoyApiCalls"] = envoy_c
             env_results[env_name]["extensibleApiCalls"] = ext_c
@@ -2066,7 +2088,11 @@ def _generate_demo_calls(
             base_annual = int(e.get("demoAnnualCallsBase", e.get("totalPdus", 0) * 420_000))
             daily_avg = base_annual / 365.0
             daily_map: dict[str, int] = {}
-            total_raw = 0
+            daily_ent_map: dict[str, int] = {}
+            daily_envoy_map: dict[str, int] = {}
+            std_c = 0
+            ext_c = 0
+            envoy_c = 0
             std_proxies = int(e.get("standardProxies", 0))
             ext_proxies = int(e.get("extensibleProxies", 0))
             tot_p = std_proxies + ext_proxies
@@ -2075,14 +2101,20 @@ def _generate_demo_calls(
                 day_dt = q_start + datetime.timedelta(days=d_idx)
                 if day_dt > q_end:
                     break
+                day_str = day_dt.strftime("%Y-%m-%d")
                 wave = 0.85 + 0.30 * math.sin((d_idx + len(e["environment"])) * 0.4)
                 c_val = max(0, int(round(daily_avg * wave)))
-                daily_map[day_dt.strftime("%Y-%m-%d")] = c_val
-                total_raw += c_val
-            envoy_c = int(round(total_raw * 0.10))
-            rem_raw = total_raw - envoy_c
-            std_c = int(round(rem_raw * std_ratio))
-            ext_c = rem_raw - std_c
+                d_envoy = int(round(c_val * 0.10))
+                d_runtime = c_val - d_envoy
+                d_std = int(round(d_runtime * std_ratio))
+                d_ext = d_runtime - d_std
+                daily_map[day_str] = d_runtime
+                daily_ent_map[day_str] = _compute_weighted_entitlement_calls(d_std, 0, d_ext)
+                daily_envoy_map[day_str] = d_envoy
+                std_c += d_std
+                ext_c += d_ext
+                envoy_c += d_envoy
+            total_raw = std_c + ext_c
             weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c)
             e["standardApiCalls"] = std_c
             e["envoyApiCalls"] = envoy_c
@@ -2091,6 +2123,8 @@ def _generate_demo_calls(
             e["yearlyApiCalls"] = weighted_c
             e["callsSource"] = "APIGEE_ANALYTICS_DEMO"
             e["dailyCalls"] = daily_map
+            e["dailyEntitlementCalls"] = daily_ent_map
+            e["dailyEnvoyCalls"] = daily_envoy_map
 
     raw_data["contractPeriod"] = {
         "contractStartDate": period_info["contractStartDate"],
@@ -2110,7 +2144,7 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
         std_c = int(e_info.get("standardApiCalls", 0))
         envoy_c = int(e_info.get("envoyApiCalls", 0))
         ext_c = int(e_info.get("extensibleApiCalls", 0))
-        raw_c = std_c + envoy_c + ext_c
+        raw_c = std_c + ext_c
         if raw_c == 0 and daily_map:
             raw_c = sum(daily_map.values())
             std_c = raw_c
@@ -2118,7 +2152,7 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
         if total_from_daily > raw_c:
             std_c += total_from_daily - raw_c
             raw_c = total_from_daily
-        has_breakdown = std_c > 0 or envoy_c > 0 or ext_c > 0
+        has_breakdown = std_c > 0 or ext_c > 0
         weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c) if has_breakdown else raw_c
         e["standardApiCalls"] = std_c
         e["envoyApiCalls"] = envoy_c
@@ -2127,6 +2161,8 @@ def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) 
         e["yearlyApiCalls"] = weighted_c
         e["callsSource"] = e_info.get("source", "APIGEE_ANALYTICS")
         e["dailyCalls"] = daily_map
+        e["dailyEntitlementCalls"] = e_info.get("dailyEntitlement", {})
+        e["dailyEnvoyCalls"] = e_info.get("dailyEnvoy", {})
 
 
 def _notify_traffic_progress(
@@ -2430,11 +2466,20 @@ def _extract_env_calls_series(
 ) -> dict[str, Any] | None:
     """Format single environment daily calls as time-series entry."""
     daily_map: dict[str, int] = env.get("dailyCalls") or {}
-    if not daily_map and int(env.get("totalPdus", 0)) <= 0:
+    daily_ent_map: dict[str, int] = env.get("dailyEntitlementCalls") or {}
+    daily_envoy_map: dict[str, int] = env.get("dailyEnvoyCalls") or {}
+    all_days = sorted(set(daily_map) | set(daily_ent_map) | set(daily_envoy_map))
+    if not all_days and int(env.get("totalPdus", 0)) <= 0:
         return None
     pts = [
-        {"timestamp": f"{k}T00:00:00Z", "pdu": int(v), "dailyCalls": int(v)}
-        for k, v in sorted(daily_map.items())
+        {
+            "timestamp": f"{k}T00:00:00Z",
+            "pdu": int(daily_map.get(k, 0)),
+            "dailyCalls": int(daily_map.get(k, 0)),
+            "entitlementCalls": int(daily_ent_map[k]) if k in daily_ent_map else int(daily_map.get(k, 0)),
+            "envoyCalls": int(daily_envoy_map.get(k, 0)),
+        }
+        for k in all_days
     ]
     return {
         "organization": org_name,
@@ -2764,9 +2809,9 @@ def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int, 
     std_calls = int(env.get("standardApiCalls", 0))
     envoy_calls = int(env.get("envoyApiCalls", 0))
     ext_calls = int(env.get("extensibleApiCalls", 0))
-    raw_calls = int(env.get("rawApiCalls", std_calls + envoy_calls + ext_calls))
+    raw_calls = int(env.get("rawApiCalls", std_calls + ext_calls))
     env_yearly_calls = int(env.get("yearlyApiCalls", 0))
-    if env_yearly_calls == 0 and (std_calls > 0 or envoy_calls > 0 or ext_calls > 0):
+    if env_yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
         env_yearly_calls = _compute_weighted_entitlement_calls(std_calls, envoy_calls, ext_calls)
     return std_calls, envoy_calls, ext_calls, raw_calls, env_yearly_calls
 
@@ -3010,7 +3055,7 @@ def _compute_calls_quota_metrics(
     std_calls = portfolio_totals.get("standardApiCalls", 0)
     envoy_calls = portfolio_totals.get("envoyApiCalls", 0)
     ext_calls = portfolio_totals.get("extensibleApiCalls", 0)
-    raw_calls = portfolio_totals.get("rawApiCalls", std_calls + envoy_calls + ext_calls)
+    raw_calls = portfolio_totals.get("rawApiCalls", std_calls + ext_calls)
     calls_util_pct = round((total_calls / entitlement_yearly_calls) * 100, 1)
 
     days_elapsed = period_info["daysElapsed"]

@@ -238,14 +238,10 @@ def _resolve_env_calls_data(
     std_calls = int(e.get("standardApiCalls", 0))
     envoy_calls = int(e.get("envoyApiCalls", 0))
     ext_calls = int(e.get("extensibleApiCalls", 0))
-    raw_calls = int(e.get("rawApiCalls", std_calls + envoy_calls + ext_calls))
+    raw_calls = int(e.get("rawApiCalls", std_calls + ext_calls))
     yearly_calls = int(e.get("yearlyApiCalls", 0))
-    if yearly_calls == 0 and (std_calls > 0 or envoy_calls > 0 or ext_calls > 0):
-        yearly_calls = (
-            int(round(std_calls * 0.2))
-            + int(round(envoy_calls / 3.0))
-            + int(round(ext_calls * 1.0))
-        )
+    if yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
+        yearly_calls = int(round(std_calls * 0.2)) + int(round(ext_calls * 1.0))
     call_limit_pct = (
         f"{(yearly_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
     )

@@ -288,6 +288,8 @@ def _merge_org_traffic_metrics(old_o: dict[str, Any], new_o: dict[str, Any]) -> 
             and old_e.get("dailyCalls")
         ):
             new_e["dailyCalls"] = old_e["dailyCalls"]
+            new_e["dailyEntitlementCalls"] = old_e.get("dailyEntitlementCalls", {})
+            new_e["dailyEnvoyCalls"] = old_e.get("dailyEnvoyCalls", {})
             new_e["standardApiCalls"] = old_e.get("standardApiCalls", 0)
             new_e["envoyApiCalls"] = old_e.get("envoyApiCalls", 0)
             new_e["extensibleApiCalls"] = old_e.get("extensibleApiCalls", 0)
