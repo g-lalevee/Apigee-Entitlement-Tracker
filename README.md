@@ -310,16 +310,6 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 
 ---
 
-## Running Tests
-
-Execute the automated test suite using Python's built-in `unittest` runner:
-
-```bash
-python3 -m unittest discover tests
-```
-
----
-
 ## Contributing & License
 Contributions are welcome! Please open an issue or submit a pull request.
 Distributed under the **Apache 2.0 License**. See [LICENSE](LICENSE) for details.
