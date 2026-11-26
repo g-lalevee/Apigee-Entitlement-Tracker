@@ -7,12 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [1.1.0] - 2026-11-26
 
 ### Fixed
-- **Historical API Calls Accuracy (Pre-October / Multi-Month Retention):**
+- **Historical API Calls Accuracy (Multi-Month Retention):**
   - Removed Cloud Monitoring (`apigee.googleapis.com/proxy/response_count`, 6-week retention) fallback for API calls; all API call counts are now queried strictly from **Apigee Analytics** (14-month retention).
   - Isolated 90-day Analytics chunks with retries and non-overlapping `00:00`–`23:59` boundaries so empty early quarters, transient timeouts, or currently undeployed environments never wipe out or double-count earlier contract months.
   - Preserved organization PDU & Environment Unit inventories on partial Analytics errors (`PARTIAL` / `ERROR` status) instead of dropping organizations, and explicitly surfaced environments where the Apigee Analytics add-on is disabled (`NO ANALYTICS` / `ANALYTICS_DISABLED`).
-- **OAuth Token Refresh & Multi-Session Stability:**
+- **OAuth Token Refresh, Cloud Run IAP Compatibility & Multi-Session Stability:**
   - Fixed `/api/auth-status` refresh synchronization and Cloud Run cold-start refresh so OAuth sessions renew cleanly after 1 hour without lockout.
+  - Allowed Cloud Run deployments fronted by IAP (when `IAP_AUDIENCE` is unset) to fall through to valid OAuth 2.0 session authentication on `/api/scan/stream` and protected API endpoints while still rejecting unauthenticated requests with `HTTP 401`.
   - Added mid-scan `HTTP 401` session refresh and prevented failed live scans from silently opening the dashboard with synthetic demo or empty `0 PDU` data.
   - Eliminated duplicate 90-day Analytics scans when editing the Contract Starting Date and added sequence guards to prevent stale chart overwrites.
 - **Excluded Organization Metadata & Cloud Run Deployment:**
