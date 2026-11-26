@@ -1,3 +1,18 @@
+# Copyright 2026 The Apigee Entitlement Tracker Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CSV & Google Sheets Ready Exporter for Apigee Entitlement Tracker.
 
 Generates structured CSV reports designed for direct import into Google Sheets or Excel:
@@ -37,15 +52,21 @@ ORGANIZATIONS_CSV_HEADER: tuple[str, ...] = (
     "Billing Type",
     "Subscription Plan",
     "Environments Count",
+    "Environment Units",
     "Active Regions Count",
     "Regions List",
-    "Total Proxies Created",
+    "Unique Proxies Deployed",
     "Deployed API Proxies",
     "Deployed Shared Flows",
     "Standard Proxy PDUs",
     "Extensible Proxy PDUs",
     "Shared Flow PDUs",
     "Total Organization PDUs",
+    "Extensible Calls",
+    "Standard Calls",
+    "Entitlement Calls (Weighted)",
+    "Envoy Adapter Calls (Free)",
+    "% of Call Limit",
     "Cross-Org Entitlement Limit",
     "% of Global Entitlement",
     "% of Total Used PDUs",
@@ -63,11 +84,11 @@ ENVIRONMENTS_CSV_HEADER: tuple[str, ...] = (
     "Deployed Units (Proxies + SF)",
     "Consumed PDUs",
     "% of PDU Limit",
-    "Standard Calls",
-    "Envoy Adapter Calls",
     "Extensible Calls",
-    "Raw Total Calls",
+    "Standard Calls",
     "Entitlement Calls (Weighted)",
+    "Raw Total Calls",
+    "Envoy Adapter Calls (Free)",
     "% of call Limit",
 )
 
@@ -90,10 +111,13 @@ DEPLOYMENTS_CSV_HEADER: tuple[str, ...] = (
 HISTORY_CSV_HEADER: tuple[str, ...] = (
     "Snapshot Timestamp (UTC)",
     "Data Source",
+    "Jurisdiction",
     "Organizations Count",
     "Apigee X Orgs",
     "Apigee Hybrid Orgs",
     "Environments Count",
+    "Environment Units",
+    "Environment Entitlement Limit",
     "Deployed API Proxies",
     "Deployed Shared Flows",
     "Apigee X PDUs",
@@ -106,16 +130,22 @@ HISTORY_CSV_HEADER: tuple[str, ...] = (
     "Utilization %",
     "Remaining PDUs",
     "Overage PDUs",
+    "Yearly Entitlement Calls",
+    "Yearly Calls Limit",
     "Status",
 )
 
 
-_CSV_FORMULA_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@", "\t", "\r")
+_CSV_FORMULA_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@", "|", "\t", "\r")
+_CSV_STRIPPED_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@", "|")
 
 
 def _sanitize_csv_cell(value: Any) -> Any:
     """Neutralize spreadsheet formula triggers in string CSV cells."""
-    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+    if isinstance(value, str) and (
+        value.startswith(_CSV_FORMULA_PREFIXES)
+        or value.lstrip(" \t\r\n").startswith(_CSV_STRIPPED_PREFIXES)
+    ):
         return f"'{value}"
     return value
 
@@ -145,11 +175,42 @@ def _format_epoch_ms(ms_val: Any) -> str:
         return str(ms_val)
 
 
-def _build_org_summary_row(org: Mapping[str, Any], entitlement: int | float) -> list[Any]:
+def _format_org_footprint_label(runtime_type: str) -> str:
+    """Map runtimeType code to human-readable footprint label."""
+    if runtime_type == "HYBRID":
+        return "Apigee Hybrid"
+    if runtime_type == "UNKNOWN":
+        return "Unknown (Error)"
+    return "Apigee X (Cloud)"
+
+
+def _format_org_export_status(org: Mapping[str, Any]) -> str:
+    """Format organization status including partial/disabled Analytics call state."""
+    base_status = str(org.get("status", "OK"))
+    calls_status = str(org.get("callsStatus", "OK"))
+    if base_status == "OK" and calls_status in {"PARTIAL", "ERROR", "ANALYTICS_DISABLED"}:
+        return f"OK (Calls: {calls_status})"
+    return base_status
+
+
+def _build_org_summary_row(
+    org: Mapping[str, Any],
+    entitlement: int | float,
+    limit_calls: int = 1_500_000_000,
+) -> list[Any]:
     """Build a CSV row representation for a single Apigee organization summary."""
-    rt = org.get("runtimeType", "CLOUD")
-    footprint_label = "Apigee Hybrid" if rt == "HYBRID" else "Apigee X (Cloud)"
+    rt = str(org.get("runtimeType", "CLOUD"))
+    footprint_label = _format_org_footprint_label(rt)
     unique_regions: Sequence[str] = org.get("uniqueRegions", ())
+    std_calls = int(org.get("standardApiCalls", 0))
+    envoy_calls = int(org.get("envoyApiCalls", 0))
+    ext_calls = int(org.get("extensibleApiCalls", 0))
+    ent_calls = (
+        int(org["yearlyApiCalls"])
+        if org.get("yearlyApiCalls") is not None
+        else int(round(std_calls * 0.2)) + int(round(ext_calls * 1.0))
+    )
+    call_pct = f"{(ent_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
     return [
         org.get("organization", ""),
         org.get("projectId", ""),
@@ -158,6 +219,7 @@ def _build_org_summary_row(org: Mapping[str, Any], entitlement: int | float) -> 
         org.get("billingType", ""),
         org.get("subscriptionPlan", ""),
         org.get("environmentCount", 0),
+        org.get("environmentUnits", 0),
         org.get("uniqueRegionsCount", 0),
         ", ".join(unique_regions),
         org.get("totalProxiesCreated", 0),
@@ -167,20 +229,32 @@ def _build_org_summary_row(org: Mapping[str, Any], entitlement: int | float) -> 
         org.get("extensibleProxyPdus", 0),
         org.get("sharedFlowPdus", 0),
         org.get("totalPdus", 0),
+        ext_calls,
+        std_calls,
+        ent_calls,
+        envoy_calls,
+        call_pct,
         entitlement,
         f"{org.get('entitlementSharePct', 0)}%",
         f"{org.get('portfolioSharePct', 0)}%",
-        org.get("status", "OK"),
+        _format_org_export_status(org),
     ]
 
 
-def _build_portfolio_total_row(summary: Mapping[str, Any], entitlement: int | float) -> list[Any]:
+def _build_portfolio_total_row(
+    summary: Mapping[str, Any],
+    entitlement: int | float,
+    organizations: Sequence[Mapping[str, Any]] = (),
+) -> list[Any]:
     """Build the cross-organization global summary total row."""
     total_orgs = summary.get("totalOrganizations", 0)
     x_orgs = summary.get("apigeeXOrgs", 0)
     hybrid_orgs = summary.get("apigeeHybridOrgs", 0)
     overage = summary.get("overagePdus", 0)
     packs = summary.get("recommendedAddOnPacks50", 0)
+    env_units = summary.get("totalEnvironmentUnits", summary.get("totalActiveEnvRegionAttachments", 0))
+    unique_cross_org_regions = {r for o in organizations for r in o.get("uniqueRegions", ()) if r}
+    active_regions_count = len(unique_cross_org_regions) if organizations else env_units
 
     return [
         "TOTAL CROSS-ORGANIZATION",
@@ -190,7 +264,8 @@ def _build_portfolio_total_row(summary: Mapping[str, Any], entitlement: int | fl
         "CROSS-ORG",
         f"Overage: {overage} PDUs ({packs} x 50-PDU Packs)",
         summary.get("totalEnvironments", 0),
-        summary.get("totalActiveEnvRegionAttachments", 0),
+        env_units,
+        active_regions_count,
         f"Apigee X PDUs: {summary.get('apigeeXPdus', 0)} | Hybrid PDUs: {summary.get('apigeeHybridPdus', 0)}",
         "",
         summary.get("totalDeployedProxies", 0),
@@ -199,6 +274,11 @@ def _build_portfolio_total_row(summary: Mapping[str, Any], entitlement: int | fl
         summary.get("extensibleProxyPdus", 0),
         summary.get("sharedFlowPdus", 0),
         summary.get("totalPdus", 0),
+        summary.get("totalExtensibleApiCalls", 0),
+        summary.get("totalStandardApiCalls", 0),
+        summary.get("totalYearlyApiCalls", 0),
+        summary.get("totalEnvoyApiCalls", 0),
+        f"{summary.get('callsUtilizationPct', 0)}%",
         entitlement,
         f"{summary.get('utilizationPct', 0)}%",
         "100.0%",
@@ -220,13 +300,15 @@ def generate_organizations_csv(portfolio: Mapping[str, Any]) -> str:
 
     summary: Mapping[str, Any] = portfolio.get("summary", {})
     entitlement: int | float = summary.get("entitlementPdu", 500)
+    limit_calls = int(summary.get("entitlementYearlyCalls", 1_500_000_000) or 1_500_000_000)
+    organizations: Sequence[Mapping[str, Any]] = portfolio.get("organizations", ())
 
     writer.writerow(ORGANIZATIONS_CSV_HEADER)
-    for org in portfolio.get("organizations", ()):
-        writer.writerow(_sanitize_csv_row(_build_org_summary_row(org, entitlement)))
+    for org in organizations:
+        writer.writerow(_sanitize_csv_row(_build_org_summary_row(org, entitlement, limit_calls)))
 
     writer.writerow([])
-    writer.writerow(_sanitize_csv_row(_build_portfolio_total_row(summary, entitlement)))
+    writer.writerow(_sanitize_csv_row(_build_portfolio_total_row(summary, entitlement, organizations)))
     return buf.getvalue()
 
 
@@ -238,10 +320,12 @@ def _resolve_env_calls_data(
     std_calls = int(e.get("standardApiCalls", 0))
     envoy_calls = int(e.get("envoyApiCalls", 0))
     ext_calls = int(e.get("extensibleApiCalls", 0))
-    raw_calls = int(e.get("rawApiCalls", std_calls + ext_calls))
-    yearly_calls = int(e.get("yearlyApiCalls", 0))
-    if yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
+    if std_calls > 0 or ext_calls > 0:
+        raw_calls = std_calls + ext_calls
         yearly_calls = int(round(std_calls * 0.2)) + int(round(ext_calls * 1.0))
+    else:
+        raw_calls = int(e.get("rawApiCalls", 0))
+        yearly_calls = int(e.get("yearlyApiCalls", 0))
     call_limit_pct = (
         f"{(yearly_calls / limit_calls) * 100:.2f}%" if limit_calls > 0 else "0.00%"
     )
@@ -292,11 +376,11 @@ def _build_env_row(
         units_label,
         total_pdus,
         pdu_limit_pct,
-        std_calls,
-        envoy_calls,
         ext_calls,
-        raw_calls,
+        std_calls,
         yearly_calls,
+        raw_calls,
+        envoy_calls,
         call_limit_pct,
     ]
 
@@ -411,10 +495,13 @@ def _build_history_row(item: Mapping[str, Any]) -> list[Any]:
     return [
         item.get("timestamp", ""),
         item.get("source", ""),
+        item.get("jurisdiction", "global"),
         item.get("totalOrganizations", 0),
         item.get("apigeeXOrgs", 0),
         item.get("apigeeHybridOrgs", 0),
         item.get("totalEnvironments", 0),
+        item.get("totalEnvironmentUnits", 0),
+        item.get("entitlementEnvs", 6),
         item.get("totalDeployedProxies", 0),
         item.get("totalDeployedSharedFlows", 0),
         item.get("apigeeXPdus", 0),
@@ -427,6 +514,8 @@ def _build_history_row(item: Mapping[str, Any]) -> list[Any]:
         f"{item.get('utilizationPct', 0)}%",
         item.get("remainingPdus", 0),
         item.get("overagePdus", 0),
+        item.get("totalYearlyApiCalls", 0),
+        item.get("entitlementYearlyCalls", 1_500_000_000),
         item.get("quotaStatus", "HEALTHY"),
     ]
 

@@ -1,3 +1,18 @@
+# Copyright 2026 The Apigee Entitlement Tracker Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Apigee Entitlement Tracker — Multi-Organization Collector Engine.
 
 Authenticates using Google Cloud credentials (`google-auth` Application Default Credentials,
@@ -12,21 +27,23 @@ across Apigee X (`CLOUD`) and Apigee Hybrid (`HYBRID`):
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import datetime
+import hashlib
 import json
 import logging
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Final
 import urllib.parse
 
 import google.auth
@@ -57,6 +74,7 @@ __all__ = [
     "exchange_google_oidc_code",
     "fetch_monitoring_pdu_timeseries",
     "fetch_monitoring_pdu_timeseries_sync",
+    "filter_subscription_organizations",
     "generate_session_id",
     "get_active_jurisdiction",
     "get_active_oidc_session",
@@ -64,6 +82,7 @@ __all__ = [
     "get_demo_dataset",
     "get_gcp_user_auth_info",
     "get_user_session",
+    "is_non_subscription_org",
     "is_token_in_active_session",
     "list_available_jurisdictions",
     "populate_contract_api_calls",
@@ -71,6 +90,7 @@ __all__ = [
     "recalculate_portfolio",
     "refresh_google_oauth_token",
     "resolve_contract_period",
+    "resolve_jurisdiction_info",
     "set_active_jurisdiction",
     "set_active_oidc_session",
     "set_user_session",
@@ -199,8 +219,23 @@ def get_active_jurisdiction() -> dict[str, str]:
     return APIGEE_JURISDICTIONS.get(_ACTIVE_JURISDICTION, APIGEE_JURISDICTIONS["global"])
 
 
-def get_apigee_base_url() -> str:
-    """Return the base URL of the active Apigee control plane jurisdiction."""
+def resolve_jurisdiction_info(code_or_url: str | None = None) -> dict[str, str] | None:
+    """Resolve jurisdiction metadata without mutating global state."""
+    if not code_or_url:
+        return get_active_jurisdiction()
+    clean = str(code_or_url).strip().lower()
+    for code, info in APIGEE_JURISDICTIONS.items():
+        if clean in (code, info["endpoint"].lower(), info["baseUrl"].lower(), info["name"].lower()):
+            return info
+    return None
+
+
+def get_apigee_base_url(jurisdiction: str | None = None) -> str:
+    """Return the base URL of the specified or active Apigee control plane jurisdiction."""
+    if jurisdiction:
+        resolved = resolve_jurisdiction_info(jurisdiction)
+        if resolved is not None:
+            return resolved["baseUrl"]
     return get_active_jurisdiction()["baseUrl"]
 
 
@@ -214,13 +249,12 @@ def set_active_jurisdiction(code_or_url: str | None) -> dict[str, str] | None:
     global _ACTIVE_JURISDICTION
     if not code_or_url:
         return get_active_jurisdiction()
-    clean = str(code_or_url).strip().lower()
-    for code, info in APIGEE_JURISDICTIONS.items():
-        if clean in (code, info["endpoint"].lower(), info["baseUrl"].lower(), info["name"].lower()):
-            _ACTIVE_JURISDICTION = code
-            if hasattr(_thread_local, "session"):
-                delattr(_thread_local, "session")
-            return info
+    info = resolve_jurisdiction_info(code_or_url)
+    if info is not None:
+        _ACTIVE_JURISDICTION = info["code"]
+        if hasattr(_thread_local, "session"):
+            delattr(_thread_local, "session")
+        return info
     return None
 
 
@@ -242,6 +276,9 @@ _thread_local = threading.local()
 _ACTIVE_OIDC_SESSION: dict[str, Any] = {}
 _USER_SESSIONS: dict[str, dict[str, Any]] = {}
 _OIDC_LOCK = threading.Lock()
+_MAX_USER_SESSIONS: Final[int] = 1024
+_DEFAULT_SESSION_TTL_SECONDS: Final[float] = 86400.0
+_SESSION_EVICTION_GRACE_SECONDS: Final[float] = 86400.0
 
 
 def generate_session_id() -> str:
@@ -249,12 +286,35 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _is_session_entry_evictable(sess: Mapping[str, Any], now_ts: float) -> bool:
+    """Return True when an expired session without refresh token exceeds the eviction grace window."""
+    exp = sess.get("expiresAt")
+    if exp is None:
+        return False
+    return now_ts >= (float(exp) + _SESSION_EVICTION_GRACE_SECONDS) and not sess.get("refreshToken")
+
+
+def _prune_user_sessions_unlocked(now_ts: float) -> None:
+    """Evict stale expired user sessions and enforce bounded session dictionary capacity."""
+    expired_ids = [sid for sid, s in _USER_SESSIONS.items() if _is_session_entry_evictable(s, now_ts)]
+    for sid in expired_ids:
+        _USER_SESSIONS.pop(sid, None)
+    while len(_USER_SESSIONS) >= _MAX_USER_SESSIONS:
+        oldest_key = next(iter(_USER_SESSIONS))
+        _USER_SESSIONS.pop(oldest_key, None)
+
+
 def set_user_session(session_id: str, session: dict[str, Any]) -> None:
-    """Store user session data in memory keyed by session identifier."""
+    """Store user session data in memory keyed by session identifier with bounded TTL eviction."""
     if not session_id:
         return
+    now_ts = time.time()
+    stored = dict(session)
+    if stored.get("expiresAt") is None:
+        stored["expiresAt"] = now_ts + _DEFAULT_SESSION_TTL_SECONDS
     with _OIDC_LOCK:
-        _USER_SESSIONS[session_id] = dict(session)
+        _prune_user_sessions_unlocked(now_ts)
+        _USER_SESSIONS[session_id] = stored
 
 
 def get_user_session(session_id: str | None) -> dict[str, Any]:
@@ -263,6 +323,9 @@ def get_user_session(session_id: str | None) -> dict[str, Any]:
         return {}
     with _OIDC_LOCK:
         sess = _USER_SESSIONS.get(session_id)
+        if sess and _is_session_entry_evictable(sess, time.time()):
+            _USER_SESSIONS.pop(session_id, None)
+            return {}
         return dict(sess) if sess else {}
 
 
@@ -274,22 +337,80 @@ def clear_user_session(session_id: str | None) -> None:
         _USER_SESSIONS.pop(session_id, None)
 
 
-def is_token_in_active_session(token: str | None) -> bool:
-    """Return True if token matches an active, non-expired in-memory user session."""
-    if not token or not token.strip():
+def _session_matches_live_token(sess: Mapping[str, Any], clean_tok: str, now_ts: float) -> bool:
+    """Return True if session holds clean_tok and is not expired."""
+    if sess.get("accessToken") != clean_tok:
         return False
+    exp = sess.get("expiresAt")
+    return exp is None or now_ts < float(exp)
+
+
+def get_session_for_active_token(token: str | None) -> dict[str, Any] | None:
+    """Return a copy of the active, non-expired session matching token, if present."""
+    if not token or not token.strip():
+        return None
     clean_tok = token.strip()
+    now_ts = time.time()
+    is_cloud_run = bool(os.environ.get("K_SERVICE"))
     with _OIDC_LOCK:
         for sess in _USER_SESSIONS.values():
-            if sess.get("accessToken") == clean_tok:
-                exp = sess.get("expiresAt")
-                if exp is None or time.time() < float(exp):
-                    return True
-        if _ACTIVE_OIDC_SESSION and _ACTIVE_OIDC_SESSION.get("accessToken") == clean_tok:
-            exp = _ACTIVE_OIDC_SESSION.get("expiresAt")
-            if exp is None or time.time() < float(exp):
-                return True
-    return False
+            if _session_matches_live_token(sess, clean_tok, now_ts):
+                return dict(sess)
+        if not is_cloud_run and _ACTIVE_OIDC_SESSION and _session_matches_live_token(_ACTIVE_OIDC_SESSION, clean_tok, now_ts):
+            return dict(_ACTIVE_OIDC_SESSION)
+    return None
+
+
+def is_token_in_active_session(token: str | None) -> bool:
+    """Return True if token matches an active, non-expired in-memory user session."""
+    return get_session_for_active_token(token) is not None
+
+
+def _matches_refreshable_session(sess: Mapping[str, Any], clean_tok: str, clean_acct: str) -> str | None:
+    """Return refreshToken if sess matches clean_tok or clean_acct and holds a refreshToken."""
+    rtok = str(sess.get("refreshToken") or "").strip()
+    if not rtok:
+        return None
+    if (clean_tok and sess.get("accessToken") == clean_tok) or (clean_acct and sess.get("email") == clean_acct):
+        return rtok
+    return None
+
+
+def _find_refreshable_session_entry(
+    expired_token: str | None,
+    account: str | None,
+) -> tuple[str | None, str | None]:
+    """Locate (session_id, refresh_token) for an expired token or account in _USER_SESSIONS."""
+    clean_tok = (expired_token or "").strip()
+    clean_acct = (account or "").strip()
+    with _OIDC_LOCK:
+        for sid, sess in _USER_SESSIONS.items():
+            rtok = _matches_refreshable_session(sess, clean_tok, clean_acct)
+            if rtok:
+                return sid, rtok
+    return None, None
+
+
+def try_refresh_token_in_sessions(
+    expired_token: str | None,
+    account: str | None = None,
+) -> str | None:
+    """Refresh an expired session token in _USER_SESSIONS if a refreshToken is available."""
+    sid, refresh_tok = _find_refreshable_session_entry(expired_token, account)
+    if not sid or not refresh_tok:
+        return None
+    refreshed = refresh_google_oauth_token(refresh_tok)
+    new_tok = str((refreshed or {}).get("access_token") or "").strip()
+    if not new_tok:
+        return None
+    exp_sec = float((refreshed or {}).get("expires_in") or 3600)
+    with _OIDC_LOCK:
+        sess = _USER_SESSIONS.get(sid)
+        if sess is not None:
+            sess["accessToken"] = new_tok
+            sess["expiresIn"] = exp_sec
+            sess["expiresAt"] = time.time() + max(60.0, exp_sec)
+    return new_tok
 
 
 def set_active_oidc_session(session: dict[str, Any]) -> None:
@@ -297,8 +418,7 @@ def set_active_oidc_session(session: dict[str, Any]) -> None:
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = dict(session)
-    if hasattr(_thread_local, "session"):
-        delattr(_thread_local, "session")
+    _invalidate_auth_cache()
 
 
 def get_active_oidc_session() -> dict[str, Any]:
@@ -313,26 +433,51 @@ def clear_active_oidc_session() -> None:
     global _ACTIVE_OIDC_SESSION
     with _OIDC_LOCK:
         _ACTIVE_OIDC_SESSION = {}
-    if hasattr(_thread_local, "session"):
-        delattr(_thread_local, "session")
+    _invalidate_auth_cache()
+
+
+def resolve_verified_subject_identity(
+    info: Mapping[str, Any],
+    token: str | None = None,
+    fallback_account: str | None = None,
+) -> str:
+    """Resolve a tenant-unique user identity from verified token claims without trusting caller input on Cloud Run."""
+    raw_email = str(info.get("email") or "").strip()
+    if raw_email:
+        return raw_email
+    raw_sub = str(info.get("sub") or "").strip()
+    if raw_sub:
+        return f"sub:{raw_sub}"
+    if not os.environ.get("K_SERVICE") and fallback_account and fallback_account.strip():
+        return fallback_account.strip()
+    if token and token.strip():
+        digest = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()[:12]
+        return f"user-{digest}"
+    return f"anon-{secrets.token_hex(6)}"
+
+
+_resolve_verified_subject_identity = resolve_verified_subject_identity
 
 
 def _validate_tokeninfo(clean_token: str) -> dict[str, Any] | None:
     """Attempt token validation via Google OAuth2 tokeninfo endpoint."""
     try:
         resp = requests.get(
-            f"{GOOGLE_TOKENINFO_URL}?access_token={clean_token}",
+            GOOGLE_TOKENINFO_URL,
+            params={"access_token": clean_token},
             timeout=8.0,
         )
         if resp.status_code == 200:
             data = resp.json()
-            email = data.get("email") or data.get("sub", "")
             scope = data.get("scope", "")
             if CLOUD_PLATFORM_SCOPE not in scope:
                 raise ValueError(f"Token lacks required scope: {CLOUD_PLATFORM_SCOPE}")
+            sub_val = str(data.get("sub") or "").strip()
+            email_val = str(data.get("email") or "").strip() or (f"sub:{sub_val}" if sub_val else "")
             return {
                 "valid": True,
-                "email": email,
+                "email": email_val,
+                "sub": sub_val,
                 "scope": scope,
                 "expiresIn": data.get("expires_in"),
                 "authMethod": "GOOGLE_OIDC_TOKENINFO",
@@ -409,8 +554,21 @@ def build_google_oidc_auth_url(
     return f"{GOOGLE_OIDC_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
+def _merge_tokeninfo_profile(profile: dict[str, Any], info: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Fill missing email/sub/name fields in userinfo profile from tokeninfo claims."""
+    if not info:
+        return profile
+    for key in ("email", "sub"):
+        if info.get(key) and not profile.get(key):
+            profile[key] = str(info[key])
+    if profile.get("email") and not profile.get("name"):
+        profile["name"] = profile["email"]
+    return profile
+
+
 def _fetch_userinfo_for_token(access_token: str) -> dict[str, Any]:
-    """Retrieve profile metadata for a verified OAuth2 access token."""
+    """Retrieve profile metadata for a verified OAuth2 access token with tokeninfo fallback."""
+    profile: dict[str, Any] = {}
     try:
         ui_resp = requests.get(
             GOOGLE_OIDC_USERINFO_URL,
@@ -418,15 +576,36 @@ def _fetch_userinfo_for_token(access_token: str) -> dict[str, Any]:
             timeout=8.0,
         )
         if ui_resp.status_code == 200:
-            return ui_resp.json()
+            profile = dict(ui_resp.json())
+            if profile.get("email"):
+                return profile
     except requests.RequestException as exc:
         logger.debug("Failed retrieving userinfo for access token: %s", exc)
 
-    info = _validate_tokeninfo(access_token)
-    if info and info.get("email"):
-        clean_email = str(info["email"])
-        return {"email": clean_email, "name": clean_email}
-    return {}
+    return _merge_tokeninfo_profile(profile, _validate_tokeninfo(access_token))
+
+
+def _post_oidc_token_exchange(
+    code: str,
+    redirect_uri: str,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+) -> dict[str, Any]:
+    """Send OAuth 2.0 authorization_code token exchange request to Google."""
+    cid = client_id or os.environ.get("GOOGLE_CLIENT_ID", DEFAULT_GOOGLE_CLIENT_ID)
+    sec = client_secret or os.environ.get("GOOGLE_CLIENT_SECRET")
+    payload = {
+        "code": code,
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+    if sec:
+        payload["client_secret"] = sec
+    resp = requests.post(GOOGLE_OIDC_TOKEN_URL, data=payload, timeout=12.0)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Google OIDC token exchange failed (HTTP {resp.status_code}): {resp.text}")
+    return resp.json()
 
 
 def exchange_google_oidc_code(
@@ -436,43 +615,56 @@ def exchange_google_oidc_code(
     client_secret: str | None = None,
 ) -> dict[str, Any]:
     """Exchange a Google OIDC authorization code for access and ID tokens."""
-    cid = client_id or os.environ.get("GOOGLE_CLIENT_ID", DEFAULT_GOOGLE_CLIENT_ID)
-    sec = client_secret or os.environ.get("GOOGLE_CLIENT_SECRET")
-
-    payload = {
-        "code": code,
-        "client_id": cid,
-        "redirect_uri": redirect_uri,
-        "grant_type": "authorization_code",
-    }
-    if sec:
-        payload["client_secret"] = sec
-
-    resp = requests.post(GOOGLE_OIDC_TOKEN_URL, data=payload, timeout=12.0)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Google OIDC token exchange failed (HTTP {resp.status_code}): {resp.text}")
-
-    token_data = resp.json()
+    token_data = _post_oidc_token_exchange(code, redirect_uri, client_id, client_secret)
     access_token = token_data.get("access_token")
-    id_token = token_data.get("id_token")
     user_info = _fetch_userinfo_for_token(access_token) if access_token else {}
-
-    email = user_info.get("email") or "google-user"
+    email = _resolve_verified_subject_identity(user_info, token=access_token)
     expires_in = token_data.get("expires_in")
-    expires_at = (time.time() + float(expires_in)) if expires_in else None
+    is_cloud_run = bool(os.environ.get("K_SERVICE"))
+    fallback_refresh = None if is_cloud_run else get_active_oidc_session().get("refreshToken")
     session = {
         "email": email,
-        "name": user_info.get("name", email),
+        "name": user_info.get("name") or email,
         "picture": user_info.get("picture"),
         "accessToken": access_token,
-        "refreshToken": token_data.get("refresh_token") or get_active_oidc_session().get("refreshToken"),
-        "idToken": id_token,
+        "refreshToken": token_data.get("refresh_token") or fallback_refresh,
+        "idToken": token_data.get("id_token"),
         "expiresIn": expires_in,
-        "expiresAt": expires_at,
+        "expiresAt": (time.time() + float(expires_in)) if expires_in else None,
         "authMethod": "GOOGLE_OIDC_WEB_FLOW",
     }
-    set_active_oidc_session(session)
+    if not is_cloud_run:
+        set_active_oidc_session(session)
     return session
+
+
+def _sync_refreshed_user_sessions(refresh_tok: str, new_access_token: str, expires_in: Any) -> None:
+    """Update any matching in-memory user sessions when a refresh token produces a new access token."""
+    exp_sec = float(expires_in or 3600)
+    new_exp_at = time.time() + exp_sec
+    with _OIDC_LOCK:
+        for sess in _USER_SESSIONS.values():
+            if sess.get("refreshToken") == refresh_tok:
+                sess["accessToken"] = new_access_token
+                sess["expiresIn"] = int(exp_sec)
+                sess["expiresAt"] = new_exp_at
+
+
+def _sync_refreshed_cli_session(refresh_tok: str, new_access_token: str, expires_in: Any) -> None:
+    """Update local CLI active session only when refresh_tok belongs to it and not on Cloud Run."""
+    if os.environ.get("K_SERVICE"):
+        return
+    curr_sess = get_active_oidc_session()
+    if curr_sess and curr_sess.get("refreshToken") == refresh_tok:
+        curr_sess.update(
+            {
+                "accessToken": new_access_token,
+                "expiresIn": expires_in,
+                "expiresAt": time.time() + float(expires_in),
+                "authMethod": "GOOGLE_OIDC_REFRESH",
+            }
+        )
+        set_active_oidc_session(curr_sess)
 
 
 def refresh_google_oauth_token(
@@ -483,12 +675,13 @@ def refresh_google_oauth_token(
     """Refresh an expired Google OAuth access token using an OAuth2 refresh token."""
     if not refresh_token or not str(refresh_token).strip():
         return None
+    clean_refresh = str(refresh_token).strip()
     cid = client_id or os.environ.get("GOOGLE_CLIENT_ID", DEFAULT_GOOGLE_CLIENT_ID)
     sec = client_secret or os.environ.get("GOOGLE_CLIENT_SECRET")
     payload = {
         "client_id": cid,
         "grant_type": "refresh_token",
-        "refresh_token": str(refresh_token).strip(),
+        "refresh_token": clean_refresh,
     }
     if sec:
         payload["client_secret"] = sec
@@ -499,17 +692,8 @@ def refresh_google_oauth_token(
             new_access_token = data.get("access_token")
             expires_in = data.get("expires_in", 3600)
             if new_access_token:
-                curr_sess = get_active_oidc_session()
-                if curr_sess:
-                    curr_sess.update(
-                        {
-                            "accessToken": new_access_token,
-                            "expiresIn": expires_in,
-                            "expiresAt": time.time() + float(expires_in),
-                            "authMethod": "GOOGLE_OIDC_REFRESH",
-                        }
-                    )
-                    set_active_oidc_session(curr_sess)
+                _sync_refreshed_user_sessions(clean_refresh, new_access_token, expires_in)
+                _sync_refreshed_cli_session(clean_refresh, new_access_token, expires_in)
             return data
     except requests.RequestException as exc:
         logger.debug("Failed refreshing OAuth2 token: %s", exc)
@@ -573,11 +757,13 @@ def _build_explicit_session(
     """Validate and construct an explicit OIDC session dictionary."""
     try:
         tok_info = validate_google_oauth_token(token)
-        email = tok_info.get("email") or explicit_account or "google-user"
-        exp_in = float(tok_info.get("expiresIn", 3600))
+        email = _resolve_verified_subject_identity(
+            tok_info, token=token, fallback_account=explicit_account
+        )
+        exp_in = float(tok_info.get("expiresIn") or 3600)
         return {
             "email": email,
-            "name": email,
+            "name": tok_info.get("name") or email,
             "accessToken": token,
             "refreshToken": refresh_token or fallback_refresh,
             "expiresIn": exp_in,
@@ -612,10 +798,33 @@ def _restore_explicit_token(
     return sess
 
 
-def _attempt_token_refresh(refresh_tok: str | None) -> tuple[bool, bool, int | None]:
-    """Attempt refreshing token and return standard liveness tuple."""
-    if refresh_tok and refresh_google_oauth_token(refresh_tok):
-        return True, False, 3600
+def _ensure_refreshed_session_identity(oidc_sess: dict[str, Any], new_tok: str) -> None:
+    """Populate email/identity on oidc_sess after refresh when missing (e.g. Cloud Run scale-out)."""
+    if oidc_sess.get("email") or oidc_sess.get("account"):
+        return
+    try:
+        tok_info = validate_google_oauth_token(new_tok)
+        oidc_sess["email"] = resolve_verified_subject_identity(tok_info, new_tok)
+    except ValueError:
+        oidc_sess["email"] = resolve_verified_subject_identity({}, new_tok)
+
+
+def _attempt_token_refresh(
+    refresh_tok: str | None,
+    oidc_sess: dict[str, Any] | None = None,
+) -> tuple[bool, bool, int | None]:
+    """Attempt refreshing token, update session dict in-place, and return liveness tuple."""
+    if refresh_tok:
+        refreshed = refresh_google_oauth_token(refresh_tok)
+        if refreshed and refreshed.get("access_token"):
+            new_tok = str(refreshed["access_token"])
+            exp_sec = int(float(refreshed.get("expires_in") or 3600))
+            if oidc_sess is not None:
+                oidc_sess["accessToken"] = new_tok
+                oidc_sess["expiresIn"] = exp_sec
+                oidc_sess["expiresAt"] = time.time() + exp_sec
+                _ensure_refreshed_session_identity(oidc_sess, new_tok)
+            return True, False, exp_sec
     return False, True, 0
 
 
@@ -623,10 +832,11 @@ def _evaluate_token_liveness(
     token: str | None,
     refresh_tok: str | None,
     expires_at_val: Any,
+    oidc_sess: dict[str, Any] | None = None,
 ) -> tuple[bool, bool, int | None]:
     """Determine whether an OAuth2 token is valid, expired, and its remaining seconds."""
     if not token:
-        return _attempt_token_refresh(refresh_tok) if refresh_tok else (False, False, None)
+        return _attempt_token_refresh(refresh_tok, oidc_sess) if refresh_tok else (False, False, None)
 
     if not expires_at_val:
         return True, False, 3600
@@ -635,10 +845,12 @@ def _evaluate_token_liveness(
     expires_at = float(expires_at_val)
 
     if now_ts >= expires_at:
-        return _attempt_token_refresh(refresh_tok)
+        return _attempt_token_refresh(refresh_tok, oidc_sess)
 
-    if now_ts >= (expires_at - 300) and refresh_tok and refresh_google_oauth_token(refresh_tok):
-        return True, False, 3600
+    if now_ts >= (expires_at - 300) and refresh_tok:
+        ok, _, rem = _attempt_token_refresh(refresh_tok, oidc_sess)
+        if ok:
+            return True, False, rem
 
     return True, False, max(0, int(expires_at - now_ts))
 
@@ -694,33 +906,45 @@ def _probe_gcloud_active_account(gcloud_bin: str) -> tuple[str | None, list[dict
     return active_account or cfg_account, all_accounts, project_id
 
 
-def _try_load_local_gcloud_token(gcloud_bin: str, active_account: str | None) -> dict[str, Any] | None:
-    """Attempt reading local user ADC token directly from gcloud binary."""
+def _run_gcloud_token_probe(
+    cmd: list[str],
+    active_account: str | None,
+    auth_method: str,
+) -> dict[str, Any] | None:
+    """Execute a gcloud token command and build a validated local session dict if successful."""
     try:
-        res_tok = subprocess.run(
-            [gcloud_bin, "auth", "application-default", "print-access-token"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        res_tok = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
         if res_tok.returncode == 0 and res_tok.stdout.strip():
             tok = res_tok.stdout.strip()
             tok_info = validate_google_oauth_token(tok)
-            tok_email = tok_info.get("email") or active_account
+            tok_email = tok_info.get("email") or active_account or resolve_verified_subject_identity(tok_info, tok)
             if tok_email:
-                sess_data = {
+                return {
                     "email": tok_email,
                     "name": tok_email,
                     "accessToken": tok,
                     "expiresIn": tok_info.get("expiresIn"),
                     "expiresAt": time.time() + float(tok_info.get("expiresIn", 3600)),
-                    "authMethod": "LOCAL_GCLOUD_ADC",
+                    "authMethod": auth_method,
                 }
-                return sess_data
     except (subprocess.SubprocessError, OSError, ValueError) as exc:
-        logger.debug("Local gcloud ADC token read failed: %s", exc)
+        logger.debug("Local gcloud token read failed (%s): %s", auth_method, exc)
     return None
+
+
+def _try_load_local_gcloud_token(gcloud_bin: str, active_account: str | None) -> dict[str, Any] | None:
+    """Attempt reading local user ADC token or gcloud CLI session token from gcloud binary."""
+    adc_sess = _run_gcloud_token_probe(
+        [gcloud_bin, "auth", "application-default", "print-access-token"],
+        active_account,
+        "LOCAL_GCLOUD_ADC",
+    )
+    if adc_sess is not None:
+        return adc_sess
+    cli_cmd = [gcloud_bin, "auth", "print-access-token"]
+    if active_account:
+        cli_cmd.extend(["--account", active_account])
+    return _run_gcloud_token_probe(cli_cmd, active_account, "LOCAL_GCLOUD_CLI")
 
 
 def _build_oidc_user_auth_payload(
@@ -748,7 +972,7 @@ def _build_oidc_user_auth_payload(
         "activeAccount": email,
         "accounts": [{"account": email, "status": "ACTIVE" if token_valid else "EXPIRED"}],
         "projectId": None,
-        "apigeeBaseUrl": get_apigee_base_url(),
+        "apigeeBaseUrl": cur_jur["endpoint"],
         "controlPlaneJurisdiction": cur_jur["code"],
         "controlPlaneEndpoint": cur_jur["endpoint"],
         "jurisdiction": cur_jur,
@@ -784,7 +1008,7 @@ def _build_local_gcloud_auth_payload(
         "activeAccount": email,
         "accounts": all_accounts or [{"account": email, "status": "ACTIVE"}],
         "projectId": project_id,
-        "apigeeBaseUrl": get_apigee_base_url(),
+        "apigeeBaseUrl": cur_jur["endpoint"],
         "controlPlaneJurisdiction": cur_jur["code"],
         "controlPlaneEndpoint": cur_jur["endpoint"],
         "jurisdiction": cur_jur,
@@ -808,6 +1032,8 @@ def _probe_adc_fallback(
         creds, default_proj = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
         proj = project_id or default_proj
         if _is_user_credentials(creds):
+            if not getattr(creds, "valid", False):
+                creds.refresh(google.auth.transport.requests.Request())
             acct = "Application Default Credentials"
             return acct, all_accounts + [{"account": acct, "status": "ACTIVE"}], proj, None, True
         return active_account, all_accounts, proj, getattr(creds, "service_account_email", None), False
@@ -837,6 +1063,8 @@ def _build_fallback_auth_payload(
 ) -> dict[str, Any]:
     """Construct fallback auth payload when no direct user session is active."""
     is_authenticated = bool(ctx.active_account and (ctx.has_token or ctx.token_valid))
+    is_cloud_run = bool(os.environ.get("K_SERVICE"))
+    redact_meta = is_cloud_run and not is_authenticated
     return {
         "authenticated": is_authenticated,
         "hasUserToken": ctx.has_token,
@@ -846,8 +1074,8 @@ def _build_fallback_auth_payload(
         "isServiceAccountFallback": bool(ctx.runtime_sa and not ctx.has_token),
         "activeAccount": ctx.active_account,
         "accounts": ctx.all_accounts,
-        "projectId": ctx.project_id,
-        "apigeeBaseUrl": get_apigee_base_url(),
+        "projectId": None if redact_meta else ctx.project_id,
+        "apigeeBaseUrl": cur_jur["endpoint"],
         "controlPlaneJurisdiction": cur_jur["code"],
         "controlPlaneEndpoint": cur_jur["endpoint"],
         "jurisdiction": cur_jur,
@@ -855,9 +1083,18 @@ def _build_fallback_auth_payload(
         "authSource": ctx.active_account or "No active GCP User Account",
         "authMethod": "LOCAL_ADC" if ctx.gcloud_bin else "NONE",
         "gcloudPath": ctx.gcloud_bin,
-        "isCloudRun": bool(os.environ.get("K_SERVICE")),
-        "runtimeServiceAccount": ctx.runtime_sa,
+        "isCloudRun": is_cloud_run,
+        "runtimeServiceAccount": None if redact_meta else ctx.runtime_sa,
     }
+
+
+def _resolve_base_user_session(user_session: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve initial session dictionary from caller session, Cloud Run mode, or CLI state."""
+    if user_session is not None:
+        return dict(user_session)
+    if os.environ.get("K_SERVICE"):
+        return {}
+    return get_active_oidc_session()
 
 
 def get_gcp_user_auth_info(
@@ -865,21 +1102,26 @@ def get_gcp_user_auth_info(
     explicit_refresh_token: str | None = None,
     explicit_account: str | None = None,
     user_session: dict[str, Any] | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, Any]:
     """Inspect the active Google Cloud user or credentials and token expiration status."""
-    base_sess = dict(user_session) if user_session is not None else get_active_oidc_session()
+    base_sess = _resolve_base_user_session(user_session)
     oidc_sess = _restore_explicit_token(
         explicit_token,
         explicit_refresh_token,
         explicit_account,
         base_sess,
     )
-    cur_jur = get_active_jurisdiction()
+    cur_jur = resolve_jurisdiction_info(jurisdiction) or get_active_jurisdiction()
     all_jurisdictions = list(APIGEE_JURISDICTIONS.values())
 
     token = oidc_sess.get("accessToken")
     refresh_tok = oidc_sess.get("refreshToken") or explicit_refresh_token
-    token_valid, token_expired, expires_in = _evaluate_token_liveness(token, refresh_tok, oidc_sess.get("expiresAt"))
+    token_valid, token_expired, expires_in = _evaluate_token_liveness(
+        token, refresh_tok, oidc_sess.get("expiresAt"), oidc_sess
+    )
+    if user_session is not None and token_valid:
+        user_session.update(oidc_sess)
 
     if (oidc_sess.get("email") or oidc_sess.get("account")) and (token_valid or token_expired):
         return _build_oidc_user_auth_payload(
@@ -921,7 +1163,7 @@ def _resolve_non_oidc_auth(
         project_id=project_id,
         runtime_sa=runtime_sa,
         has_token=has_token,
-        token_valid=token_valid,
+        token_valid=token_valid or has_token,
         token_expired=token_expired,
         expires_in=expires_in,
         gcloud_bin=gcloud_bin,
@@ -979,15 +1221,23 @@ def _validate_gcp_account(account: str | None) -> str | None:
 
 def _handle_direct_oidc_token(oidc_token: str, account: str | None) -> dict[str, Any]:
     """Store direct OIDC token into active session and return updated auth info."""
-    token_info = validate_google_oauth_token(oidc_token.strip())
-    email = token_info.get("email") or account or "google-user"
-    set_active_oidc_session({
+    clean_tok = oidc_token.strip()
+    token_info = validate_google_oauth_token(clean_tok)
+    email = _resolve_verified_subject_identity(
+        token_info, token=clean_tok, fallback_account=account
+    )
+    exp_in = float(token_info.get("expiresIn") or 3600)
+    sess_payload = {
         "email": email,
-        "accessToken": oidc_token.strip(),
-        "name": email,
+        "accessToken": clean_tok,
+        "name": token_info.get("name") or email,
+        "expiresIn": exp_in,
+        "expiresAt": time.time() + exp_in,
         "authMethod": "GOOGLE_OIDC_TOKEN",
-    })
-    return get_gcp_user_auth_info()
+    }
+    if not os.environ.get("K_SERVICE"):
+        set_active_oidc_session(sess_payload)
+    return get_gcp_user_auth_info(user_session=sess_payload)
 
 
 def _handle_browser_login(
@@ -1024,9 +1274,7 @@ def switch_or_login_gcp_user(
 ) -> dict[str, Any]:
     """Switch or authenticate GCP user account using Google OIDC / REST APIs or local gcloud."""
     clean_account = _validate_gcp_account(account)
-
-    if hasattr(_thread_local, "session"):
-        delattr(_thread_local, "session")
+    _invalidate_auth_cache()
 
     if oidc_token and oidc_token.strip():
         return _handle_direct_oidc_token(oidc_token, clean_account)
@@ -1041,52 +1289,89 @@ def switch_or_login_gcp_user(
     return get_gcp_user_auth_info()
 
 
-def _try_gcloud_token_session(gcloud_bin: str, target_account: str | None) -> tuple[requests.Session, str, str] | None:
-    """Build a requests.Session by printing an access token from local gcloud CLI."""
-    subcmds = [
-        [gcloud_bin, "auth", "application-default", "print-access-token"],
-        [gcloud_bin, "auth", "print-access-token"] + (["--account", target_account] if target_account else []),
-    ]
-    for subcmd in subcmds:
-        try:
-            res = subprocess.run(subcmd, capture_output=True, text=True, timeout=8, check=False)
-            if res.returncode == 0 and res.stdout.strip():
-                sess = requests.Session()
-                sess.headers.update({"Authorization": f"Bearer {res.stdout.strip()}", "Accept": "application/json"})
-                return sess, get_apigee_base_url(), f"GCP User: {target_account or 'Local User'} (Local ADC)"
-        except (subprocess.SubprocessError, OSError) as exc:
-            logger.debug("Command %s execution error: %s", subcmd, exc)
+_SESSION_CACHE_LOCK = threading.Lock()
+_SHARED_GCLOUD_TOKEN: dict[str, Any] = {}
+_SESSION_EPOCH: int = 0
+_GCLOUD_TOKEN_TTL_SECONDS: Final[float] = 2700.0
+
+
+def _invalidate_auth_cache() -> None:
+    """Invalidate shared gcloud token cache and bump session epoch for all worker threads."""
+    global _SESSION_EPOCH
+    with _SESSION_CACHE_LOCK:
+        _SHARED_GCLOUD_TOKEN.clear()
+        _SESSION_EPOCH += 1
+    if hasattr(_thread_local, "session"):
+        delattr(_thread_local, "session")
+
+
+def _build_bearer_session(
+    token: str,
+    target_account: str | None,
+    base_url: str,
+) -> tuple[requests.Session, str, str]:
+    """Create a requests.Session configured with a Bearer token and jurisdiction base URL."""
+    sess = requests.Session()
+    sess.headers.update({"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    return sess, base_url, f"GCP User: {target_account or 'Local User'} (Local ADC)"
+
+
+def _try_gcloud_token_session(
+    gcloud_bin: str,
+    target_account: str | None,
+    base_url: str,
+) -> tuple[requests.Session, str, str] | None:
+    """Build a requests.Session using a thread-safe cached access token from local gcloud CLI."""
+    acct_key = target_account or "__default__"
+    with _SESSION_CACHE_LOCK:
+        cached = _SHARED_GCLOUD_TOKEN.get(acct_key)
+        if cached and (time.time() - cached["fetchedAt"]) < _GCLOUD_TOKEN_TTL_SECONDS:
+            return _build_bearer_session(cached["token"], target_account, base_url)
+
+        subcmds = [
+            [gcloud_bin, "auth", "application-default", "print-access-token"],
+            [gcloud_bin, "auth", "print-access-token"] + (["--account", target_account] if target_account else []),
+        ]
+        for subcmd in subcmds:
+            try:
+                res = subprocess.run(subcmd, capture_output=True, text=True, timeout=8, check=False)
+                if res.returncode == 0 and res.stdout.strip():
+                    tok = res.stdout.strip()
+                    _SHARED_GCLOUD_TOKEN[acct_key] = {"token": tok, "fetchedAt": time.time()}
+                    return _build_bearer_session(tok, target_account, base_url)
+            except (subprocess.SubprocessError, OSError) as exc:
+                logger.debug("Command %s execution error: %s", subcmd, exc)
     return None
 
 
-def _create_token_session(token: str, user_label: str) -> tuple[requests.Session, str, str]:
+def _create_token_session(token: str, user_label: str, base_url: str) -> tuple[requests.Session, str, str]:
     """Create requests.Session configured with explicit Bearer token."""
     sess = requests.Session()
     sess.headers.update({"Authorization": f"Bearer {token.strip()}", "Accept": "application/json"})
-    return sess, get_apigee_base_url(), f"GCP User Token: {user_label} (OAuth2 API)"
+    return sess, base_url, f"GCP User Token: {user_label} (OAuth2 API)"
 
 
-def _try_user_adc_session(target_account: str | None) -> tuple[requests.Session, str, str] | None:
+def _try_user_adc_session(target_account: str | None, base_url: str) -> tuple[requests.Session, str, str] | None:
     """Attempt creating AuthorizedSession using user Application Default Credentials."""
     try:
         creds, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
         if _is_user_credentials(creds):
             sess = google.auth.transport.requests.AuthorizedSession(creds)
             sess.headers.update({"Accept": "application/json"})
-            return sess, get_apigee_base_url(), f"Application Default Credentials: {target_account or 'ADC'} (User)"
+            return sess, base_url, f"Application Default Credentials: {target_account or 'ADC'} (User)"
     except (google.auth.exceptions.GoogleAuthError, OSError) as exc:
         logger.debug("User ADC session build error: %s", exc)
     return None
 
 
-def _try_service_account_session(target_account: str | None) -> tuple[requests.Session, str, str]:
+def _try_service_account_session(target_account: str | None, base_url: str) -> tuple[requests.Session, str, str]:
     """Attempt creating AuthorizedSession using service account credentials."""
     try:
         creds, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
         sess = google.auth.transport.requests.AuthorizedSession(creds)
         sess.headers.update({"Accept": "application/json"})
         sa_email = getattr(creds, "service_account_email", None) or "Service Account"
-        return sess, get_apigee_base_url(), f"Service Account: {sa_email} (Logged User: {target_account or 'User'})"
+        return sess, base_url, f"Service Account: {sa_email} (Logged User: {target_account or 'User'})"
     except Exception as exc:
         raise RuntimeError(
             f"No valid Google credentials available to query Apigee APIs: {exc}. "
@@ -1094,45 +1379,64 @@ def _try_service_account_session(target_account: str | None) -> tuple[requests.S
         ) from exc
 
 
+def _resolve_explicit_or_oidc_token(
+    explicit_token: str | None,
+    account: str | None,
+    is_cloud_run: bool,
+) -> tuple[str | None, str]:
+    """Resolve an explicit bearer token or local CLI OIDC session token."""
+    oidc_sess = {} if is_cloud_run else get_active_oidc_session()
+    cleaned = explicit_token.strip() if explicit_token else None
+    token_to_use = cleaned or oidc_sess.get("accessToken")
+    user_label = account or oidc_sess.get("email") or "User"
+    return token_to_use, str(user_label)
+
+
 def _create_authenticated_session(
     account: str | None = None,
     explicit_token: str | None = None,
+    jurisdiction: str | None = None,
 ) -> tuple[requests.Session, str, str]:
     """Build an authenticated requests.Session for Apigee API queries."""
-    auth_info = get_gcp_user_auth_info()
-    target_account = account or auth_info.get("activeAccount")
-
-    oidc_sess = get_active_oidc_session()
-    token_to_use = (explicit_token.strip() if explicit_token else None) or oidc_sess.get("accessToken")
+    base_url = get_apigee_base_url(jurisdiction)
+    is_cloud_run = bool(os.environ.get("K_SERVICE"))
+    token_to_use, user_label = _resolve_explicit_or_oidc_token(explicit_token, account, is_cloud_run)
     if token_to_use:
-        user_label = oidc_sess.get("email") or target_account or "User"
-        return _create_token_session(token_to_use, user_label)
+        return _create_token_session(token_to_use, user_label, base_url)
 
-    gcloud_bin = _find_gcloud_bin()
-    if gcloud_bin:
-        gcloud_sess = _try_gcloud_token_session(gcloud_bin, target_account)
+    auth_info = get_gcp_user_auth_info(jurisdiction=jurisdiction)
+    target_account = account or auth_info.get("activeAccount")
+    if not is_cloud_run:
+        gcloud_bin = _find_gcloud_bin()
+        gcloud_sess = _try_gcloud_token_session(gcloud_bin, target_account, base_url) if gcloud_bin else None
         if gcloud_sess:
             return gcloud_sess
 
-    adc_sess = _try_user_adc_session(target_account)
+    adc_sess = _try_user_adc_session(target_account, base_url)
     if adc_sess:
         return adc_sess
-
-    return _try_service_account_session(target_account)
+    return _try_service_account_session(target_account, base_url)
 
 
 def _get_thread_session(
     account: str | None = None,
     explicit_token: str | None = None,
+    jurisdiction: str | None = None,
 ) -> tuple[requests.Session, str, str]:
     """Get or create a thread-local authenticated requests.Session for worker threads."""
-    tok_fingerprint = (explicit_token.strip()[-12:] if explicit_token else "") or get_active_oidc_session().get("accessToken", "")[-12:]
-    cur_jur = get_active_jurisdiction()["code"]
-    cache_key = f"{account or 'default'}:{tok_fingerprint}:{cur_jur}"
+    fallback_tok = "" if os.environ.get("K_SERVICE") else str(get_active_oidc_session().get("accessToken") or "")
+    raw_tok = explicit_token.strip() if explicit_token else fallback_tok.strip()
+    tok_fingerprint = hashlib.sha256(raw_tok.encode("utf-8")).hexdigest() if raw_tok else ""
+    jur_info = resolve_jurisdiction_info(jurisdiction) or get_active_jurisdiction()
+    cur_jur = jur_info["code"]
+    with _SESSION_CACHE_LOCK:
+        epoch = _SESSION_EPOCH
+    cache_key = f"{account or 'default'}:{tok_fingerprint}:{cur_jur}:{epoch}"
     if not hasattr(_thread_local, "session") or getattr(_thread_local, "cache_key", None) != cache_key:
         sess, base_url, auth_desc = _create_authenticated_session(
             account=account,
             explicit_token=explicit_token,
+            jurisdiction=cur_jur,
         )
         _thread_local.session = sess
         _thread_local.base_url = base_url
@@ -1154,45 +1458,101 @@ def _get_json_sync(
             if not resp.text or not resp.text.strip():
                 return {}, None
             return resp.json(), None
-        return None, f"HTTP {resp.status_code}: {resp.text[:250]}"
+        return None, f"HTTP {resp.status_code}: {resp.text[:600]}"
     except requests.RequestException as exc:
         return None, str(exc)
+
+
+_RETRY_BACKOFF_SECONDS: Final[float] = 0.5
+_MAX_APIGEE_PAGES: Final[int] = 100
+
+
+def _get_json_with_retry_sync(
+    sess: requests.Session,
+    url: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = 25.0,
+    retries: int = 1,
+    on_unauthorized: Callable[[], requests.Session] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Perform a synchronous GET request with bounded retry and optional 401 session refresh."""
+    active_sess = sess
+    data, err = _get_json_sync(active_sess, url, params=params, timeout=timeout)
+    for attempt in range(retries):
+        if not err or err.startswith("HTTP 403"):
+            return data, err
+        if err.startswith("HTTP 401") and on_unauthorized is not None:
+            active_sess = on_unauthorized()
+        delay = 2.0 * (attempt + 1) if err.startswith("HTTP 429") else _RETRY_BACKOFF_SECONDS * (attempt + 1)
+        time.sleep(delay)
+        data, err = _get_json_sync(active_sess, url, params=params, timeout=timeout)
+    return data, err
+
+
+def _fetch_paginated_apigee_list(
+    sess: requests.Session,
+    url: str,
+    list_key: str,
+    base_params: dict[str, Any] | None = None,
+    timeout: float = 20.0,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch all paginated items for an Apigee list endpoint following nextPageToken."""
+    items: list[dict[str, Any]] = []
+    page_params: dict[str, Any] = dict(base_params) if base_params else {}
+    for _ in range(_MAX_APIGEE_PAGES):
+        data, err = _get_json_with_retry_sync(
+            sess, url, params=page_params or None, timeout=timeout, retries=1
+        )
+        if err or data is None:
+            return items, err or "Empty response"
+        batch = data.get(list_key, [])
+        if isinstance(batch, list):
+            items.extend(batch)
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            break
+        page_params["pageToken"] = next_token
+    return items, None
+
+
+def _parse_discovered_org_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Normalize a single organization item returned by GET /v1/organizations."""
+    org_name = item.get("organization")
+    if not org_name:
+        return None
+    proj_ids = item.get("projectIds") or ([item.get("projectId")] if item.get("projectId") else [org_name])
+    return {
+        "organization": org_name,
+        "projectId": proj_ids[0] if proj_ids else org_name,
+        "projectIds": proj_ids,
+    }
 
 
 def discover_authorized_organizations_sync(
     account: str | None = None,
     explicit_token: str | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, Any]:
     """Retrieve all Apigee organizations authorized for the user via GET /v1/organizations."""
     sess, base_url, auth_desc = _create_authenticated_session(
         account=account,
         explicit_token=explicit_token,
+        jurisdiction=jurisdiction,
     )
     orgs_url = f"{base_url}/organizations"
-    data, err = _get_json_sync(sess, orgs_url, timeout=20.0)
-    if err or data is None:
+    raw_orgs, err = _fetch_paginated_apigee_list(sess, orgs_url, "organizations", timeout=20.0)
+    if err:
         raise RuntimeError(f"Failed to list authorized Apigee organizations from {orgs_url}: {err}")
 
-    raw_orgs = data.get("organizations", [])
-    organizations: list[dict[str, Any]] = []
-    for item in raw_orgs:
-        org_name = item.get("organization")
-        proj_ids = item.get("projectIds") or ([item.get("projectId")] if item.get("projectId") else [org_name])
-        if org_name:
-            organizations.append(
-                {
-                    "organization": org_name,
-                    "projectId": proj_ids[0] if proj_ids else org_name,
-                    "projectIds": proj_ids,
-                }
-            )
-
+    organizations = [parsed for item in raw_orgs if (parsed := _parse_discovered_org_item(item)) is not None]
     organizations.sort(key=lambda x: x["organization"].lower())
-    auth_info = get_gcp_user_auth_info()
+    resolved_acct = account
+    if not resolved_acct and not os.environ.get("K_SERVICE"):
+        resolved_acct = get_gcp_user_auth_info(jurisdiction=jurisdiction).get("activeAccount")
 
     return {
         "discoveredAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "account": account or auth_info.get("activeAccount"),
+        "account": resolved_acct,
         "authSource": auth_desc,
         "apiEndpoint": orgs_url,
         "totalAuthorizedOrgs": len(organizations),
@@ -1203,12 +1563,14 @@ def discover_authorized_organizations_sync(
 async def discover_authorized_organizations(
     account: str | None = None,
     explicit_token: str | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, Any]:
     """Async wrapper for dynamic organization discovery."""
     return await asyncio.to_thread(
         discover_authorized_organizations_sync,
         account,
         explicit_token,
+        jurisdiction,
     )
 
 
@@ -1218,14 +1580,33 @@ def _resolve_org_runtime_type(
     instances: list[dict[str, Any]],
     props_list: list[dict[str, Any]],
 ) -> str:
-    """Classify runtime type as CLOUD (Apigee X) or HYBRID."""
+    """Classify runtime type as CLOUD (Apigee X) or HYBRID without false-positive org name heuristics."""
+    _ = org_name
     props_map = {p.get("name"): p.get("value") for p in props_list if isinstance(p, dict)}
     hybrid_feature_enabled = str(props_map.get("features.hybrid.enabled", "")).lower() == "true"
-    if raw_runtime_type == "HYBRID" or (
-        len(instances) == 0 and (hybrid_feature_enabled or "hybrid" in org_name.lower())
-    ):
+    if raw_runtime_type == "HYBRID" or (len(instances) == 0 and hybrid_feature_enabled):
         return "HYBRID"
     return raw_runtime_type
+
+
+def _fetch_instance_attached_envs(
+    sess: requests.Session,
+    org_base: str,
+    inst_name: str,
+    inst_state: str,
+) -> list[str]:
+    """Fetch all paginated attached environment names for one Apigee X instance."""
+    if inst_state.upper() in {"CREATING", "DELETING"}:
+        return []
+    att_items, att_err = _fetch_paginated_apigee_list(
+        sess, f"{org_base}/instances/{inst_name}/attachments", "attachments", timeout=20.0
+    )
+    if att_err:
+        if inst_state.upper() != "ACTIVE":
+            logger.debug("Skipping attachments on non-ACTIVE instance %s (%s): %s", inst_name, inst_state, att_err)
+            return []
+        raise RuntimeError(f"Failed to list attachments for instance {inst_name}: {att_err}")
+    return [str(att["environment"]) for att in att_items if att.get("environment")]
 
 
 def _map_cloud_env_regions(
@@ -1241,22 +1622,19 @@ def _map_cloud_env_regions(
     for inst in instances:
         inst_name = inst.get("name", "")
         inst_loc = inst.get("location", inst_name)
-        att_data, _ = _get_json_sync(sess, f"{org_base}/instances/{inst_name}/attachments")
-        attached_envs: list[str] = []
-        for att in (att_data or {}).get("attachments", []):
-            env_ref = att.get("environment")
-            if env_ref:
-                attached_envs.append(env_ref)
-                env_to_regions.setdefault(env_ref, [])
-                region_label = f"{inst_loc} ({inst_name})" if inst_name != inst_loc else inst_loc
-                if region_label not in env_to_regions[env_ref]:
-                    env_to_regions[env_ref].append(region_label)
+        inst_state = str(inst.get("state", "ACTIVE"))
+        attached_envs = _fetch_instance_attached_envs(sess, org_base, inst_name, inst_state)
+        region_label = f"{inst_loc} ({inst_name})" if inst_name != inst_loc else inst_loc
+        for env_ref in attached_envs:
+            env_to_regions.setdefault(env_ref, [])
+            if region_label not in env_to_regions[env_ref]:
+                env_to_regions[env_ref].append(region_label)
 
         instances_summary.append(
             {
                 "name": inst_name,
                 "location": inst_loc,
-                "state": inst.get("state", "ACTIVE"),
+                "state": inst_state,
                 "runtimeVersion": inst.get("runtimeVersion", ""),
                 "attachedEnvironments": attached_envs,
             }
@@ -1265,16 +1643,18 @@ def _map_cloud_env_regions(
 
 
 def _extract_deployment_instances(dep_detail: dict[str, Any] | None) -> list[str]:
-    """Extract deduplicated runtime instance identifiers from revision deployment status."""
+    """Extract deduplicated active runtime instance identifiers from revision deployment status."""
     if not dep_detail or not isinstance(dep_detail, dict):
         return []
     discovered: list[str] = []
     for inst_item in dep_detail.get("instances", []):
-        inst_id = (
-            str(inst_item.get("instance", "")).strip()
-            if isinstance(inst_item, dict)
-            else str(inst_item).strip()
-        )
+        if isinstance(inst_item, dict):
+            state = str(inst_item.get("state") or "").strip().upper()
+            if state in {"REMOVED", "DELETING"}:
+                continue
+            inst_id = str(inst_item.get("instance", "")).strip()
+        else:
+            inst_id = str(inst_item).strip()
         if inst_id and inst_id not in discovered:
             discovered.append(inst_id)
     return discovered
@@ -1287,13 +1667,13 @@ def _inspect_hybrid_deployment_candidate(
     path_seg: str,
     dep_item: dict[str, Any],
 ) -> list[str]:
-    """Query a single revision deployment resource and extract active Hybrid instance IDs."""
+    """Query a single revision deployment resource with retry and extract active Hybrid instance IDs."""
     art_name = str(dep_item.get("apiProxy") or dep_item.get("name") or "").strip()
     if not art_name:
         return []
     rev = str(dep_item.get("revision") or "1").strip()
     url = f"{org_base}/environments/{env_name}/{path_seg}/{art_name}/revisions/{rev}/deployments"
-    dep_detail, err = _get_json_sync(sess, url)
+    dep_detail, err = _get_json_with_retry_sync(sess, url, timeout=15.0, retries=1)
     if err or not dep_detail:
         return []
     if (
@@ -1314,16 +1694,18 @@ def _fetch_hybrid_env_deployment_instances(
 ) -> list[str]:
     """Query revision deployment details for a Hybrid environment to discover active instances."""
     candidates: list[tuple[str, dict[str, Any]]] = [
-        *[("apis", p) for p in env_proxies[:2]],
-        *[("sharedflows", sf) for sf in env_sfs[:2]],
+        *[("apis", p) for p in env_proxies[:8]],
+        *[("sharedflows", sf) for sf in env_sfs[:4]],
     ]
-    for path_seg, dep_item in candidates[:2]:
+    all_instances: list[str] = []
+    for path_seg, dep_item in candidates[:10]:
         instances_found = _inspect_hybrid_deployment_candidate(
             sess, org_base, env_name, path_seg, dep_item
         )
-        if instances_found:
-            return instances_found
-    return []
+        for inst_id in instances_found:
+            if inst_id not in all_instances:
+                all_instances.append(inst_id)
+    return all_instances
 
 
 @dataclass(frozen=True)
@@ -1434,10 +1816,10 @@ def _build_proxy_deployments(
     deployments: list[dict[str, Any]] = []
     std_proxies, ext_proxies = 0, 0
 
+    default_p_type = "EXTENSIBLE" if ctx.runtime_type == "HYBRID" else "STANDARD"
     for p in env_proxies:
-        p_type = p.get("proxyDeploymentType", "EXTENSIBLE" if ctx.runtime_type == "HYBRID" else "STANDARD")
-        if p_type not in ("STANDARD", "EXTENSIBLE"):
-            p_type = "STANDARD"
+        raw_p_type = str(p.get("proxyDeploymentType") or "").strip().upper()
+        p_type = raw_p_type if raw_p_type in ("STANDARD", "EXTENSIBLE") else default_p_type
         if p_type == "STANDARD":
             std_proxies += 1
         else:
@@ -1528,6 +1910,7 @@ def _build_env_summary_record(
         "rawApiCalls": 0,
         "yearlyApiCalls": 0,
         "callsSource": "PENDING",
+        "callsStatus": "OK",
         "dailyCalls": {},
     }
 
@@ -1588,12 +1971,16 @@ def _resolve_instances_and_runtime(
     org_name: str,
     org_meta: dict[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Retrieve instances and resolve runtime type for an organization."""
+    """Retrieve paginated instances and resolve runtime type for an organization."""
     raw_runtime_type = org_meta.get("runtimeType", "CLOUD")
     instances: list[dict[str, Any]] = []
     if raw_runtime_type == "CLOUD":
-        inst_data, _ = _get_json_sync(sess, f"{org_base}/instances")
-        instances = (inst_data or {}).get("instances", [])
+        inst_items, inst_err = _fetch_paginated_apigee_list(
+            sess, f"{org_base}/instances", "instances", timeout=20.0
+        )
+        if inst_err:
+            raise RuntimeError(f"Failed to list instances: {inst_err}")
+        instances = inst_items
 
     props_list = org_meta.get("properties", {}).get("property", [])
     runtime_type = _resolve_org_runtime_type(raw_runtime_type, org_name, instances, props_list)
@@ -1639,11 +2026,127 @@ def _resolve_regions_for_runtime(
     return env_to_regions, instances_summary
 
 
-def _resolve_org_plans(org_meta: dict[str, Any]) -> tuple[str, str]:
+_NON_SUBSCRIPTION_BILLING_TYPES: Final[frozenset[str]] = frozenset(
+    {"PAYG", "PAY_AS_YOU_GO", "PAY-AS-YOU-GO", "EVALUATION", "TRIAL"}
+)
+
+
+def _clean_plan_field(val: Any, unspecified_token: str) -> str:
+    """Normalize an Apigee billing or plan string, clearing proto unspecified sentinels."""
+    text = str(val or "").strip()
+    return "" if text.upper() == unspecified_token else text
+
+
+def _resolve_org_plans(org_meta: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve billing type and subscription plan with standard defaults."""
-    billing_type = org_meta.get("billingType") or org_meta.get("subscriptionType") or "SUBSCRIPTION"
-    subscription_plan = org_meta.get("subscriptionPlan") or org_meta.get("subscriptionType") or billing_type
+    raw_bt = _clean_plan_field(org_meta.get("billingType"), "BILLING_TYPE_UNSPECIFIED")
+    raw_st = _clean_plan_field(org_meta.get("subscriptionType"), "SUBSCRIPTION_TYPE_UNSPECIFIED")
+    raw_sp = _clean_plan_field(org_meta.get("subscriptionPlan"), "SUBSCRIPTION_PLAN_UNSPECIFIED")
+    billing_type = raw_bt or raw_st or "SUBSCRIPTION"
+    subscription_plan = raw_sp or raw_st or billing_type
     return billing_type, subscription_plan
+
+
+def is_non_subscription_org(org_or_meta: Mapping[str, Any]) -> bool:
+    """Return True if organization is Trial/Evaluation or Pay-As-You-Go (excluded from Subscription quotas).
+
+    Subscription organizations (including both SUBSCRIPTION_2021 and SUBSCRIPTION_2024) return False.
+    """
+    if org_or_meta.get("status") == "EXCLUDED_BILLING":
+        return True
+    return any(
+        str(org_or_meta.get(field) or "").strip().upper() in _NON_SUBSCRIPTION_BILLING_TYPES
+        for field in ("billingType", "subscriptionType", "subscriptionPlan")
+    )
+
+
+def _normalize_excluded_detail_entry(item: Mapping[str, Any]) -> dict[str, str] | None:
+    """Normalize a single excluded Trial/PAYG organization metadata dictionary."""
+    raw_name = item.get("organization")
+    if not raw_name:
+        return None
+    name = str(raw_name).strip()
+    raw_bt = _clean_plan_field(item.get("billingType"), "BILLING_TYPE_UNSPECIFIED")
+    raw_st = _clean_plan_field(item.get("subscriptionType"), "SUBSCRIPTION_TYPE_UNSPECIFIED")
+    raw_sp = _clean_plan_field(item.get("subscriptionPlan"), "SUBSCRIPTION_PLAN_UNSPECIFIED")
+    bt = raw_bt or raw_st or (raw_sp if raw_sp.upper() in _NON_SUBSCRIPTION_BILLING_TYPES else "") or "PAYG / TRIAL"
+    return {
+        "organization": name,
+        "projectId": str(item.get("projectId") or name),
+        "billingType": bt,
+        "subscriptionPlan": raw_sp or bt,
+        "runtimeType": str(item.get("runtimeType") or "CLOUD"),
+    }
+
+
+def _upsert_excluded_detail_map(by_name: dict[str, dict[str, Any]], item: Any) -> None:
+    """Insert or update normalized excluded billing record in by_name when item is a valid mapping."""
+    if isinstance(item, Mapping):
+        parsed = _normalize_excluded_detail_entry(item)
+        if parsed:
+            existing = by_name.get(parsed["organization"])
+            if existing and parsed["billingType"] == "PAYG / TRIAL" and existing.get("billingType") != "PAYG / TRIAL":
+                return
+            by_name[parsed["organization"]] = parsed
+
+
+def extract_excluded_billing_details(
+    orgs: Sequence[Mapping[str, Any]],
+    existing_details: Sequence[Mapping[str, Any]] | None = None,
+    excluded_names: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Build sorted metadata records for excluded Trial/Evaluation and Pay-As-You-Go organizations."""
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in existing_details or ():
+        _upsert_excluded_detail_map(by_name, item)
+    for org in orgs:
+        if isinstance(org, Mapping) and is_non_subscription_org(org):
+            _upsert_excluded_detail_map(by_name, org)
+    for name in excluded_names:
+        clean = str(name).strip()
+        if clean and clean not in by_name:
+            _upsert_excluded_detail_map(by_name, {"organization": clean})
+    return [by_name[k] for k in sorted(by_name, key=str.lower)]
+
+
+_extract_excluded_billing_details = extract_excluded_billing_details
+
+
+def filter_subscription_organizations(
+    orgs: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Separate Subscription organizations (including 2021 & 2024) from excluded Trial/PAYG organizations."""
+    kept: list[dict[str, Any]] = []
+    excluded_names: list[str] = []
+    for org in orgs:
+        if isinstance(org, Mapping) and is_non_subscription_org(org):
+            org_name = str(org.get("organization") or "").strip()
+            if org_name:
+                excluded_names.append(org_name)
+        else:
+            kept.append(org)
+    return kept, sorted(set(excluded_names), key=str.lower)
+
+
+def _build_excluded_billing_org_result(
+    org_name: str,
+    project_id: str,
+    org_meta: Mapping[str, Any],
+    billing_type: str,
+    subscription_plan: str,
+) -> dict[str, Any]:
+    """Return sentinel record for Trial/Evaluation or Pay-As-You-Go organizations."""
+    return {
+        "organization": org_name,
+        "projectId": project_id,
+        "status": "EXCLUDED_BILLING",
+        "error": None,
+        "runtimeType": str(org_meta.get("runtimeType", "CLOUD")),
+        "billingType": billing_type,
+        "subscriptionPlan": subscription_plan,
+        "environments": [],
+        "deployments": [],
+    }
 
 
 def _fetch_deployments_grouped(
@@ -1653,11 +2156,15 @@ def _fetch_deployments_grouped(
     env_to_regions: dict[str, list[str]],
     runtime_type: str,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
-    """Fetch deployments and shared flows from Apigee API grouped by environment."""
-    proxy_dep_data, _ = _get_json_sync(sess, f"{org_base}/deployments")
-    sf_dep_data, _ = _get_json_sync(sess, f"{org_base}/deployments", params={"sharedFlows": "true"})
-    all_proxy_deps = (proxy_dep_data or {}).get("deployments", [])
-    all_sf_deps = (sf_dep_data or {}).get("deployments", [])
+    """Fetch paginated deployments and shared flows from Apigee API grouped by environment."""
+    all_proxy_deps, proxy_err = _fetch_paginated_apigee_list(sess, f"{org_base}/deployments", "deployments", timeout=20.0)
+    if proxy_err:
+        raise RuntimeError(f"Failed to list proxy deployments: {proxy_err}")
+    all_sf_deps, sf_err = _fetch_paginated_apigee_list(
+        sess, f"{org_base}/deployments", "deployments", base_params={"sharedFlows": "true"}, timeout=20.0
+    )
+    if sf_err:
+        raise RuntimeError(f"Failed to list shared flow deployments: {sf_err}")
 
     proxies_by_env = _group_deployments_by_env(all_proxy_deps, env_names, env_to_regions, runtime_type)
     sfs_by_env = _group_deployments_by_env(all_sf_deps, env_names, env_to_regions, runtime_type)
@@ -1669,43 +2176,22 @@ def _count_unique_artifacts(deployments: list[dict[str, Any]], kind: str) -> int
     return len({d["name"] for d in deployments if d.get("artifactKind") == kind})
 
 
-def _fetch_single_organization_sync(
-    org_name: str,
-    project_ids: list[str],
-    account: str | None = None,
-    explicit_token: str | None = None,
-    hybrid_region_overrides: dict[str, int] | None = None,
+def _assemble_ok_org_result(
+    ctx: OrgEnvRecordContext,
+    org_meta: Mapping[str, Any],
+    plans: tuple[str, str],
+    instances_summary: list[dict[str, Any]],
+    records: tuple[list[dict[str, Any]], list[dict[str, Any]]],
 ) -> dict[str, Any]:
-    """Fetch complete PDU data for a single Apigee Organization (X or Hybrid)."""
-    project_id = project_ids[0] if project_ids else org_name
-    sess, base_url, _ = _get_thread_session(account=account, explicit_token=explicit_token)
-    org_base = f"{base_url}/organizations/{org_name}"
-
-    org_meta, org_err = _get_json_sync(sess, org_base)
-    if org_err or not org_meta:
-        return _build_error_org_result(org_name, project_id, org_err or "Failed to fetch organization metadata")
-
-    billing_type, subscription_plan = _resolve_org_plans(org_meta)
-    env_names: list[str] = [str(e) for e in org_meta.get("environments", [])]
-    runtime_type, instances = _resolve_instances_and_runtime(sess, org_base, org_name, org_meta)
-    proxies_by_env, sfs_by_env = _fetch_deployments_grouped(sess, org_base, env_names, {}, runtime_type)
-    env_cautions: dict[str, str] = {}
-    discovery_ctx = OrgDiscoveryContext(
-        sess, org_base, org_name, instances, proxies_by_env, sfs_by_env, env_cautions
-    )
-    env_to_regions, instances_summary = _resolve_regions_for_runtime(
-        runtime_type, env_names, hybrid_region_overrides or {}, discovery_ctx
-    )
-    ctx = OrgEnvRecordContext(org_name=org_name, project_id=project_id, runtime_type=runtime_type)
-    environments_list, deployments_list = _build_env_and_deployment_records(
-        env_names, env_to_regions, proxies_by_env, sfs_by_env, ctx, env_cautions=env_cautions
-    )
+    """Assemble final OK organization payload from collected inventory records."""
+    billing_type, subscription_plan = plans
+    environments_list, deployments_list = records
     return {
-        "organization": org_name,
-        "projectId": project_id,
+        "organization": ctx.org_name,
+        "projectId": ctx.project_id,
         "status": "OK",
         "error": None,
-        "runtimeType": runtime_type,
+        "runtimeType": ctx.runtime_type,
         "billingType": billing_type,
         "subscriptionPlan": subscription_plan,
         "state": org_meta.get("state", "ACTIVE"),
@@ -1715,6 +2201,63 @@ def _fetch_single_organization_sync(
         "environments": environments_list,
         "deployments": deployments_list,
     }
+
+
+def _resolve_org_project_id(org_meta: Mapping[str, Any], fallback_project_id: str) -> str:
+    """Resolve authoritative GCP project ID from organization metadata or discovery fallback."""
+    direct = str(org_meta.get("projectId") or "").strip()
+    if direct:
+        return direct
+    meta_list = org_meta.get("projectIds")
+    if isinstance(meta_list, list) and meta_list and str(meta_list[0]).strip():
+        return str(meta_list[0]).strip()
+    return fallback_project_id
+
+
+def _fetch_single_organization_sync(
+    org_name: str,
+    project_ids: list[str],
+    account: str | None = None,
+    explicit_token: str | None = None,
+    hybrid_region_overrides: dict[str, int] | None = None,
+    jurisdiction: str | None = None,
+) -> dict[str, Any]:
+    """Fetch complete PDU data for a single Apigee Organization (X or Hybrid)."""
+    fallback_proj = project_ids[0] if project_ids else org_name
+    sess, base_url, _ = _get_thread_session(
+        account=account, explicit_token=explicit_token, jurisdiction=jurisdiction
+    )
+    org_base = f"{base_url}/organizations/{org_name}"
+
+    org_meta, org_err = _get_json_with_retry_sync(sess, org_base, timeout=20.0, retries=2)
+    if org_err or not org_meta:
+        return _build_error_org_result(org_name, fallback_proj, org_err or "Failed to fetch organization metadata")
+
+    project_id = _resolve_org_project_id(org_meta, fallback_proj)
+    billing_type, subscription_plan = _resolve_org_plans(org_meta)
+    if is_non_subscription_org(org_meta):
+        return _build_excluded_billing_org_result(org_name, project_id, org_meta, billing_type, subscription_plan)
+
+    env_names: list[str] = [str(e) for e in org_meta.get("environments", [])]
+    try:
+        runtime_type, instances = _resolve_instances_and_runtime(sess, org_base, org_name, org_meta)
+        proxies_by_env, sfs_by_env = _fetch_deployments_grouped(sess, org_base, env_names, {}, runtime_type)
+        env_cautions: dict[str, str] = {}
+        discovery_ctx = OrgDiscoveryContext(
+            sess, org_base, org_name, instances, proxies_by_env, sfs_by_env, env_cautions
+        )
+        env_to_regions, instances_summary = _resolve_regions_for_runtime(
+            runtime_type, env_names, hybrid_region_overrides or {}, discovery_ctx
+        )
+    except RuntimeError as exc:
+        return _build_error_org_result(org_name, project_id, str(exc))
+    ctx = OrgEnvRecordContext(org_name=org_name, project_id=project_id, runtime_type=runtime_type)
+    records = _build_env_and_deployment_records(
+        env_names, env_to_regions, proxies_by_env, sfs_by_env, ctx, env_cautions=env_cautions
+    )
+    return _assemble_ok_org_result(
+        ctx, org_meta, (billing_type, subscription_plan), instances_summary, records
+    )
 
 
 def _add_years(dt: datetime.datetime, years: int) -> datetime.datetime:
@@ -1739,14 +2282,20 @@ def resolve_contract_period(contract_start_date: str | None = None) -> dict[str,
             parsed_start = default_start
 
     period_start = parsed_start
-    max_lookback_dt = now - datetime.timedelta(days=420)
-    while (period_start + datetime.timedelta(days=365)) <= now and period_start < max_lookback_dt:
+    while _add_years(period_start, 1) <= now:
         period_start = _add_years(period_start, 1)
 
     period_end = _add_years(period_start, 1)
-    query_start = max(period_start, max_lookback_dt)
-    query_end = now if now > query_start else query_start + datetime.timedelta(days=1)
-    days_elapsed = max(1, (now - period_start).days + 1) if now >= period_start else 1
+    max_lookback_dt = now - datetime.timedelta(days=420)
+    if now < period_start:
+        query_start = now
+        query_end = now
+        days_elapsed = 0
+    else:
+        effective_end = min(now, period_end)
+        query_start = max(period_start, max_lookback_dt)
+        query_end = max(query_start, effective_end)
+        days_elapsed = max(1, (effective_end - period_start).days + 1)
 
     return {
         "contractStartDate": parsed_start.strftime("%Y-%m-%d"),
@@ -1794,55 +2343,105 @@ def _extract_metric_daily_points(
     return added
 
 
+def _classify_dimension_is_extensible(dim_name: str, default_extensible: bool) -> bool:
+    """Classify an Apigee analytics proxy_deployment_type dimension name as Extensible vs Standard."""
+    if "extensible" in dim_name:
+        return True
+    if "standard" in dim_name:
+        return False
+    return default_extensible
+
+
+def _parse_single_analytics_dimension(
+    dim_item: Mapping[str, Any],
+    daily_std: dict[str, int],
+    daily_ext: dict[str, int],
+    daily_envoy: dict[str, int] | None,
+    default_extensible: bool,
+) -> tuple[int, int]:
+    """Extract call points from a single Apigee Analytics dimension bucket."""
+    dim_name = str(dim_item.get("name", "")).strip().lower()
+    metrics = dim_item.get("metrics", [])
+    if daily_envoy is not None and "envoy" in dim_name:
+        for mb in metrics:
+            _extract_metric_daily_points(mb, daily_envoy)
+        return 0, 0
+    is_ext = _classify_dimension_is_extensible(dim_name, default_extensible)
+    target_map = daily_ext if is_ext else daily_std
+    added = sum(_extract_metric_daily_points(mb, target_map) for mb in metrics)
+    return (0, added) if is_ext else (added, 0)
+
+
 def _parse_analytics_env_block(
     env_block: dict[str, Any],
     daily_std: dict[str, int],
     daily_ext: dict[str, int],
     daily_envoy: dict[str, int] | None = None,
+    default_extensible: bool = False,
 ) -> tuple[int, int]:
     """Parse dimensions or direct metrics from an Apigee analytics environment block."""
     dims = env_block.get("dimensions", [])
     if not dims:
-        std_c = sum(_extract_metric_daily_points(mb, daily_std) for mb in env_block.get("metrics", []))
-        return std_c, 0
+        fallback_map = daily_ext if default_extensible else daily_std
+        cnt = sum(_extract_metric_daily_points(mb, fallback_map) for mb in env_block.get("metrics", []))
+        return (0, cnt) if default_extensible else (cnt, 0)
 
     std_c = 0
     ext_c = 0
     for dim_item in dims:
-        dim_name = str(dim_item.get("name", "")).strip().lower()
-        if daily_envoy is not None and "envoy" in dim_name:
-            for mb in dim_item.get("metrics", []):
-                _extract_metric_daily_points(mb, daily_envoy)
-            continue
-        is_ext = "extensible" in dim_name
-        target_map = daily_ext if is_ext else daily_std
-        added = sum(_extract_metric_daily_points(mb, target_map) for mb in dim_item.get("metrics", []))
-        if is_ext:
-            ext_c += added
-        else:
-            std_c += added
+        d_std, d_ext = _parse_single_analytics_dimension(
+            dim_item, daily_std, daily_ext, daily_envoy, default_extensible
+        )
+        std_c += d_std
+        ext_c += d_ext
     return std_c, ext_c
 
 
-def _parse_envoy_response_blocks(data: dict[str, Any] | None) -> tuple[dict[str, int], dict[str, int]]:
-    """Extract standard and extensible daily maps from an Apigee Analytics Envoy filter response."""
+def _parse_envoy_response_blocks(
+    data: dict[str, Any] | None,
+    default_extensible: bool = False,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Extract standard, extensible, and inline-envoy daily maps from an Apigee Analytics Envoy filter response."""
     envoy_std: dict[str, int] = {}
     envoy_ext: dict[str, int] = {}
+    envoy_inline: dict[str, int] = {}
     if not data:
-        return envoy_std, envoy_ext
+        return envoy_std, envoy_ext, envoy_inline
     for env_block in data.get("environments", []):
-        _parse_analytics_env_block(env_block, envoy_std, envoy_ext)
-    return envoy_std, envoy_ext
+        _parse_analytics_env_block(
+            env_block, envoy_std, envoy_ext, envoy_inline, default_extensible=default_extensible
+        )
+    return envoy_std, envoy_ext, envoy_inline
 
 
-def _query_envoy_chunk_points(
+def _is_transient_envoy_query_error(err: str | None) -> bool:
+    """Return True if an Envoy filter query failed with a transient/auth error rather than an unsupported 400/404."""
+    if not err or _is_analytics_disabled_error(err):
+        return False
+    if err.startswith(("HTTP 400", "HTTP 404")):
+        return False
+    return True
+
+
+def _format_envoy_parsed_tuple(
+    data: dict[str, Any] | None,
+    default_extensible: bool,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], bool]:
+    """Convert raw Envoy stats JSON into a 4-tuple (std, ext, inline, subtract_flag)."""
+    e_std, e_ext, e_inl = _parse_envoy_response_blocks(data, default_extensible=default_extensible)
+    return e_std, e_ext, e_inl, bool(e_std or e_ext)
+
+
+def _query_envoy_chunk_with_status(
     sess: requests.Session,
-    dim_url: str,
-    flat_url: str,
+    urls: tuple[str, str],
     tr_str: str,
     used_flat: bool,
-) -> tuple[dict[str, int], dict[str, int], bool]:
-    """Query Apigee Analytics for Envoy Adapter calls (gateway_source eq 'envoy') in a time chunk."""
+    default_extensible: bool = False,
+    on_unauthorized: Callable[[], requests.Session] | None = None,
+) -> tuple[tuple[dict[str, int], dict[str, int], dict[str, int], bool], str | None]:
+    """Query Envoy Adapter calls and report any transient HTTP/network error."""
+    dim_url, flat_url = urls
     envoy_params = {
         "select": "sum(message_count)",
         "timeRange": tr_str,
@@ -1850,16 +2449,35 @@ def _query_envoy_chunk_points(
         "filter": "(gateway_source eq 'envoy')",
     }
     if not used_flat:
-        data, err = _get_json_sync(sess, dim_url, params=envoy_params, timeout=15.0)
-        envoy_std, envoy_ext = _parse_envoy_response_blocks(None if err else data)
-        if envoy_std or envoy_ext:
-            return envoy_std, envoy_ext, True
+        data, err = _get_json_with_retry_sync(
+            sess, dim_url, params=envoy_params, timeout=25.0, retries=1, on_unauthorized=on_unauthorized
+        )
+        if not err:
+            return _format_envoy_parsed_tuple(data, default_extensible), None
+        if _is_transient_envoy_query_error(err):
+            return ({}, {}, {}, False), err
 
-    flat_data, flat_err = _get_json_sync(sess, flat_url, params=envoy_params, timeout=15.0)
-    flat_std, flat_ext = _parse_envoy_response_blocks(None if flat_err else flat_data)
-    if flat_std or flat_ext:
-        return flat_std, flat_ext, used_flat
-    return {}, {}, False
+    flat_data, flat_err = _get_json_with_retry_sync(
+        sess, flat_url, params=envoy_params, timeout=25.0, retries=1, on_unauthorized=on_unauthorized
+    )
+    if flat_err:
+        return ({}, {}, {}, False), (flat_err if _is_transient_envoy_query_error(flat_err) else None)
+    return _format_envoy_parsed_tuple(flat_data, default_extensible), None
+
+
+def _query_envoy_chunk_points(
+    sess: requests.Session,
+    urls: tuple[str, str],
+    tr_str: str,
+    used_flat: bool,
+    default_extensible: bool = False,
+    on_unauthorized: Callable[[], requests.Session] | None = None,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], bool]:
+    """Query Apigee Analytics for Envoy Adapter calls (gateway_source eq 'envoy') in a time chunk."""
+    calls_tuple, _ = _query_envoy_chunk_with_status(
+        sess, urls, tr_str, used_flat, default_extensible=default_extensible, on_unauthorized=on_unauthorized
+    )
+    return calls_tuple
 
 
 def _add_positive_daily_counts(target: dict[str, int], source: dict[str, int]) -> None:
@@ -1869,16 +2487,25 @@ def _add_positive_daily_counts(target: dict[str, int], source: dict[str, int]) -
             target[day_key] = target.get(day_key, 0) + count
 
 
+def _unpack_envoy_calls_tuple(
+    envoy_calls: tuple[Any, ...],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], bool]:
+    """Normalize 3-tuple or 4-tuple Envoy call records into (std, ext, inline, subtract)."""
+    if len(envoy_calls) == 4:
+        return envoy_calls[0], envoy_calls[1], envoy_calls[2], bool(envoy_calls[3])
+    return envoy_calls[0], envoy_calls[1], {}, bool(envoy_calls[2])
+
+
 def _merge_chunk_calls(
     chunk_std: dict[str, int],
     chunk_ext: dict[str, int],
-    envoy_calls: tuple[dict[str, int], dict[str, int], bool],
+    envoy_calls: tuple[Any, ...],
     daily_std: dict[str, int],
     daily_envoy: dict[str, int],
     daily_ext: dict[str, int],
 ) -> tuple[int, int, int]:
     """Merge single-chunk standard, extensible, and Envoy Adapter daily call counts."""
-    envoy_std, envoy_ext, subtract_envoy = envoy_calls
+    envoy_std, envoy_ext, envoy_inline, subtract_envoy = _unpack_envoy_calls_tuple(envoy_calls)
     if subtract_envoy:
         for k, v in envoy_std.items():
             chunk_std[k] = max(0, chunk_std.get(k, 0) - v)
@@ -1889,7 +2516,9 @@ def _merge_chunk_calls(
     _add_positive_daily_counts(daily_ext, chunk_ext)
     _add_positive_daily_counts(daily_envoy, envoy_std)
     _add_positive_daily_counts(daily_envoy, envoy_ext)
-    return sum(chunk_std.values()), sum(envoy_std.values()) + sum(envoy_ext.values()), sum(chunk_ext.values())
+    _add_positive_daily_counts(daily_envoy, envoy_inline)
+    total_envoy_chunk = sum(envoy_std.values()) + sum(envoy_ext.values()) + sum(envoy_inline.values())
+    return sum(chunk_std.values()), total_envoy_chunk, sum(chunk_ext.values())
 
 
 def _combine_daily_call_maps(*maps: dict[str, int]) -> dict[str, int]:
@@ -1913,94 +2542,278 @@ def _build_daily_entitlement_map(
     }
 
 
-def _query_env_analytics_chunks(
+_ANALYTICS_DISABLED_PATTERNS: Final[tuple[str, ...]] = (
+    "analytics add-on is disabled",
+    "analytics addon is disabled",
+    "analytics is disabled",
+    "analytics is not enabled",
+    "analytics not enabled",
+    "not enabled for analytics",
+    "analytics service is not enabled",
+    "analytics add-on is not enabled",
+    "analytics addon is not enabled",
+)
+
+
+def _is_analytics_disabled_error(err: str | None) -> bool:
+    """Return True when Apigee reports the Analytics add-on is disabled for an environment."""
+    if not err:
+        return False
+    low = err.lower()
+    return any(pat in low for pat in _ANALYTICS_DISABLED_PATTERNS)
+
+
+def _extract_clean_http_error(err_msg: str) -> str:
+    """Extract concise 'HTTP <code> - <message>' from raw HTTP/JSON error strings."""
+    code_match = re.match(r"^(HTTP\s+\d+)\s*:\s*(.*)$", err_msg, re.DOTALL)
+    if not code_match:
+        return err_msg
+    code_part, body = code_match.group(1), code_match.group(2).strip()
+    msg_match = re.search(r'"message"\s*:\s*"([^"]+)"', body)
+    if msg_match:
+        return f"{code_part} - {msg_match.group(1)}"
+    return f"{code_part} - {body[:160]}" if body else code_part
+
+
+def _summarize_env_chunk_errors(org_name: str, env_name: str, raw_errors: list[tuple[str, str]]) -> list[str]:
+    """Summarize failures for one org into concise '<org>: <code & message>' entries."""
+    _ = env_name
+    if not raw_errors:
+        return []
+    unique_msgs = list(dict.fromkeys(_extract_clean_http_error(err_msg) for _, err_msg in raw_errors))
+    return [f"{org_name}: {msg}" for msg in unique_msgs]
+
+
+@dataclass(frozen=True)
+class AnalyticsChunkSpec:
+    """Parameters describing one environment's Apigee Analytics query context."""
+    org_name: str
+    env_name: str
+    account: str | None = None
+    explicit_token: str | None = None
+    jurisdiction: str | None = None
+    default_extensible: bool = False
+
+
+@dataclass(frozen=True)
+class AnalyticsChunkOutcome:
+    """Parsed result of querying a single Apigee Analytics time chunk."""
+    chunk_std: dict[str, int]
+    chunk_ext: dict[str, int]
+    envoy_calls: tuple[dict[str, int], dict[str, int], dict[str, int], bool]
+    error: tuple[str, str] | None = None
+    analytics_disabled: bool = False
+
+
+def _reconcile_envoy_inline_counts(
+    envoy_calls: tuple[dict[str, int], dict[str, int], dict[str, int], bool],
+    chunk_envoy_inline: dict[str, int],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], bool]:
+    """Merge inline 'envoy' dimension counts without double-counting filtered Envoy results."""
+    if not chunk_envoy_inline:
+        return envoy_calls
+    envoy_std, envoy_ext, envoy_inline, sub = envoy_calls
+    merged_inline = dict(envoy_inline)
+    for day_key, val in chunk_envoy_inline.items():
+        if val > 0:
+            merged_inline[day_key] = max(merged_inline.get(day_key, 0), val)
+    return envoy_std, envoy_ext, merged_inline, sub
+
+
+def _fetch_analytics_chunk_raw(
     sess: requests.Session,
-    base_url: str,
-    org_name: str,
-    env_name: str,
+    dim_url: str,
+    flat_url: str,
+    params: dict[str, str],
+    chunk_label: str,
+    on_unauthorized: Callable[[], requests.Session],
+) -> tuple[dict[str, Any] | None, bool, tuple[str, str] | None, bool]:
+    """Execute dimension stats query with fallback to flat stats, returning (data, used_flat, error, disabled)."""
+    data, err = _get_json_with_retry_sync(
+        sess, dim_url, params=params, timeout=25.0, retries=1, on_unauthorized=on_unauthorized
+    )
+    if _is_analytics_disabled_error(err):
+        return None, False, None, True
+    if err and err.startswith("HTTP 403"):
+        return None, False, (chunk_label, err), False
+    if not err:
+        return data, False, None, False
+
+    flat_data, flat_err = _get_json_with_retry_sync(
+        sess, flat_url, params=params, timeout=25.0, retries=1, on_unauthorized=on_unauthorized
+    )
+    if _is_analytics_disabled_error(flat_err):
+        return None, True, None, True
+    if flat_err or flat_data is None:
+        return None, True, (chunk_label, flat_err or "Empty response"), False
+    return flat_data, True, None, False
+
+
+def _query_single_analytics_chunk(
+    c_start: datetime.datetime,
+    c_end: datetime.datetime,
+    spec: AnalyticsChunkSpec,
+) -> AnalyticsChunkOutcome:
+    """Query one Apigee Analytics time chunk with retry, 401 refresh, and disabled-addon detection."""
+    active_tok = spec.explicit_token
+    sess, base_url, _ = _get_thread_session(
+        account=spec.account, explicit_token=active_tok, jurisdiction=spec.jurisdiction
+    )
+
+    def _refresh_sess() -> requests.Session:
+        """Refresh thread-local session upon HTTP 401, refreshing OAuth token if possible."""
+        nonlocal sess, active_tok
+        refreshed_tok = try_refresh_token_in_sessions(active_tok, spec.account)
+        if refreshed_tok:
+            active_tok = refreshed_tok
+        _invalidate_auth_cache()
+        sess, _, _ = _get_thread_session(
+            account=spec.account, explicit_token=active_tok, jurisdiction=spec.jurisdiction
+        )
+        return sess
+
+    dim_url = f"{base_url}/organizations/{spec.org_name}/environments/{spec.env_name}/stats/proxy_deployment_type"
+    flat_url = f"{base_url}/organizations/{spec.org_name}/environments/{spec.env_name}/stats"
+    tr_str = f"{c_start.strftime('%m/%d/%Y %H:%M')}~{c_end.strftime('%m/%d/%Y %H:%M')}"
+    params = {"select": "sum(message_count)", "timeRange": tr_str, "timeUnit": "day"}
+    chunk_label = f"{c_start.strftime('%Y-%m-%d')}..{c_end.strftime('%Y-%m-%d')}"
+
+    data, used_flat, err_pair, is_disabled = _fetch_analytics_chunk_raw(
+        sess, dim_url, flat_url, params, chunk_label, _refresh_sess
+    )
+    if is_disabled or err_pair or not data:
+        return AnalyticsChunkOutcome({}, {}, ({}, {}, {}, False), err_pair, is_disabled)
+
+    chunk_std, chunk_ext, chunk_envoy_inline = _extract_chunk_env_blocks(data, spec.default_extensible)
+    envoy_calls, envoy_err_pair = _fetch_optional_envoy_for_chunk(
+        sess, (dim_url, flat_url, tr_str, chunk_label), used_flat, spec.default_extensible, bool(chunk_std or chunk_ext), _refresh_sess
+    )
+    envoy_calls = _reconcile_envoy_inline_counts(envoy_calls, chunk_envoy_inline)
+    return AnalyticsChunkOutcome(chunk_std, chunk_ext, envoy_calls, envoy_err_pair, False)
+
+
+def _fetch_optional_envoy_for_chunk(
+    sess: requests.Session,
+    req_meta: tuple[str, str, str, str],
+    used_flat: bool,
+    default_extensible: bool,
+    has_runtime_calls: bool,
+    on_unauthorized: Callable[[], requests.Session],
+) -> tuple[tuple[dict[str, int], dict[str, int], dict[str, int], bool], tuple[str, str] | None]:
+    """Query Envoy Adapter calls only when chunk has runtime calls, formatting any transient error."""
+    if not has_runtime_calls:
+        return ({}, {}, {}, False), None
+    dim_url, flat_url, tr_str, chunk_label = req_meta
+    envoy_calls, envoy_err = _query_envoy_chunk_with_status(
+        sess, (dim_url, flat_url), tr_str, used_flat, default_extensible=default_extensible, on_unauthorized=on_unauthorized
+    )
+    err_pair = (chunk_label, f"Envoy filter query failed ({envoy_err})") if envoy_err else None
+    return envoy_calls, err_pair
+
+
+def _extract_chunk_env_blocks(
+    data: Mapping[str, Any],
+    default_extensible: bool,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Parse all environment blocks in an Analytics chunk response."""
+    chunk_std: dict[str, int] = {}
+    chunk_ext: dict[str, int] = {}
+    chunk_envoy_inline: dict[str, int] = {}
+    for env_block in data.get("environments", []):
+        _parse_analytics_env_block(
+            env_block, chunk_std, chunk_ext, chunk_envoy_inline, default_extensible=default_extensible
+        )
+    return chunk_std, chunk_ext, chunk_envoy_inline
+
+
+def _resolve_env_calls_status(
+    total_chunks: int,
+    error_count: int,
+    disabled_count: int,
+    has_calls: bool = False,
+) -> tuple[str, str]:
+    """Determine (callsSource, callsStatus) from chunk execution outcomes."""
+    if disabled_count > 0 and error_count == 0:
+        if disabled_count >= total_chunks:
+            return "ANALYTICS_DISABLED", "ANALYTICS_DISABLED"
+        return "APIGEE_ANALYTICS", "PARTIAL"
+    if error_count == 0:
+        return "APIGEE_ANALYTICS", "OK"
+    if error_count < total_chunks or has_calls:
+        return "APIGEE_ANALYTICS", "PARTIAL"
+    return "APIGEE_ANALYTICS", "ERROR"
+
+
+def _empty_analytics_result() -> dict[str, Any]:
+    """Return an empty Apigee Analytics result structure when no time chunks apply."""
+    return {
+        "daily": {},
+        "dailyStandard": {},
+        "dailyExtensible": {},
+        "dailyEntitlement": {},
+        "dailyEnvoy": {},
+        "standardApiCalls": 0,
+        "extensibleApiCalls": 0,
+        "envoyApiCalls": 0,
+        "source": "APIGEE_ANALYTICS",
+        "status": "OK",
+        "analytics_ok": True,
+        "errors": [],
+    }
+
+
+def _accumulate_chunk_outcome(
+    outcome: AnalyticsChunkOutcome,
+    daily_std: dict[str, int],
+    daily_envoy: dict[str, int],
+    daily_ext: dict[str, int],
+    raw_errors: list[tuple[str, str]],
+) -> int:
+    """Merge a single chunk's calls and errors, returning 1 when Analytics was disabled else 0."""
+    if outcome.chunk_std or outcome.chunk_ext or outcome.envoy_calls[2]:
+        _merge_chunk_calls(outcome.chunk_std, outcome.chunk_ext, outcome.envoy_calls, daily_std, daily_envoy, daily_ext)
+    if outcome.analytics_disabled:
+        return 1
+    if outcome.error:
+        raw_errors.append(outcome.error)
+    return 0
+
+
+def _query_env_analytics_chunks(
+    spec: AnalyticsChunkSpec,
     chunks: list[tuple[datetime.datetime, datetime.datetime]],
-) -> tuple[dict[str, dict[str, int]], int, int, int, bool]:
-    """Query Apigee Analytics endpoint for runtime (standard/extensible) and Envoy Adapter calls."""
+) -> dict[str, Any]:
+    """Query Apigee Analytics 90-day chunks in parallel for runtime and Envoy Adapter calls."""
+    if not chunks:
+        return _empty_analytics_result()
+
     daily_std: dict[str, int] = {}
     daily_ext: dict[str, int] = {}
     daily_envoy: dict[str, int] = {}
-    dim_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/proxy_deployment_type"
-    flat_url = f"{base_url}/organizations/{org_name}/environments/{env_name}/stats/"
+    raw_errors: list[tuple[str, str]] = []
+    disabled_count = 0
 
-    for c_start, c_end in chunks:
-        tr_str = f"{c_start.strftime('%m/%d/%Y %H:%M')}~{c_end.strftime('%m/%d/%Y %H:%M')}"
-        params = {"select": "sum(message_count)", "timeRange": tr_str, "timeUnit": "day"}
-        used_flat = False
-        data, err = _get_json_sync(sess, dim_url, params=params, timeout=15.0)
-        if err or not data or not data.get("environments"):
-            used_flat = True
-            data, err = _get_json_sync(sess, flat_url, params=params, timeout=15.0)
-            if err or not data:
-                return {}, 0, 0, 0, False
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+        futures = [executor.submit(_query_single_analytics_chunk, c_start, c_end, spec) for c_start, c_end in chunks]
+        for fut in as_completed(futures):
+            disabled_count += _accumulate_chunk_outcome(fut.result(), daily_std, daily_envoy, daily_ext, raw_errors)
 
-        chunk_std: dict[str, int] = {}
-        chunk_ext: dict[str, int] = {}
-        for env_block in data.get("environments", []):
-            _parse_analytics_env_block(env_block, chunk_std, chunk_ext, daily_envoy)
-
-        envoy_calls = _query_envoy_chunk_points(
-            sess, dim_url, flat_url, tr_str, used_flat
-        )
-        _merge_chunk_calls(
-            chunk_std, chunk_ext, envoy_calls, daily_std, daily_envoy, daily_ext
-        )
-
-    daily_map = _combine_daily_call_maps(daily_std, daily_ext)
-    daily_entitlement = _build_daily_entitlement_map(daily_std, daily_ext)
-    daily_maps = {
-        "daily": daily_map,
-        "dailyEntitlement": daily_entitlement,
+    has_calls = bool(daily_std or daily_ext or daily_envoy)
+    source, status = _resolve_env_calls_status(len(chunks), len(raw_errors), disabled_count, has_calls=has_calls)
+    return {
+        "daily": _combine_daily_call_maps(daily_std, daily_ext),
+        "dailyStandard": daily_std,
+        "dailyExtensible": daily_ext,
+        "dailyEntitlement": _build_daily_entitlement_map(daily_std, daily_ext),
         "dailyEnvoy": daily_envoy,
+        "standardApiCalls": sum(daily_std.values()),
+        "extensibleApiCalls": sum(daily_ext.values()),
+        "envoyApiCalls": sum(daily_envoy.values()),
+        "source": source,
+        "status": status,
+        "analytics_ok": status in {"OK", "PARTIAL"},
+        "errors": _summarize_env_chunk_errors(spec.org_name, spec.env_name, raw_errors),
     }
-    return daily_maps, sum(daily_std.values()), sum(daily_ext.values()), sum(daily_envoy.values()), True
-
-
-def _process_monitoring_point(pt: dict[str, Any], env_data: dict[str, Any]) -> None:
-    """Update environment daily calls if a higher value is found in Cloud Monitoring."""
-    t_str = pt.get("interval", {}).get("endTime") or pt.get("interval", {}).get("startTime")
-    val = int(pt.get("value", {}).get("int64Value", 0))
-    if t_str and val > 0:
-        day_key = t_str[:10]
-        prev = env_data["daily"].get(day_key, 0)
-        if val > prev:
-            env_data["daily"][day_key] = val
-            if not env_data["analytics_ok"]:
-                env_data["source"] = "CLOUD_MONITORING"
-
-
-def _query_monitoring_response_counts(
-    sess: requests.Session,
-    proj_id: str,
-    org_name: str,
-    q_start: datetime.datetime,
-    q_end: datetime.datetime,
-    env_results: dict[str, dict[str, Any]],
-) -> None:
-    """Query Cloud Monitoring metric for supplementary proxy response counts."""
-    mon_url = f"{MONITORING_BASE_URL}/projects/{proj_id}/timeSeries"
-    mon_params = {
-        "filter": f'metric.type="apigee.googleapis.com/proxy/response_count" AND resource.labels.org="{org_name}"',
-        "interval.startTime": q_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "interval.endTime": q_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "aggregation.alignmentPeriod": "86400s",
-        "aggregation.perSeriesAligner": "ALIGN_SUM",
-        "aggregation.crossSeriesReducer": "REDUCE_SUM",
-        "aggregation.groupByFields": ["resource.label.org", "resource.label.env"],
-    }
-    mon_data, mon_err = _get_json_sync(sess, mon_url, params=mon_params, timeout=18.0)
-    if mon_err or not mon_data:
-        return
-    for ts in mon_data.get("timeSeries", []):
-        env_name = ts.get("resource", {}).get("labels", {}).get("env")
-        if not env_name or env_name not in env_results:
-            continue
-        for pt in ts.get("points", []):
-            _process_monitoring_point(pt, env_results[env_name])
 
 
 def _generate_time_chunks(
@@ -2008,31 +2821,30 @@ def _generate_time_chunks(
     query_end: datetime.datetime,
     step_days: int = 90,
 ) -> list[tuple[datetime.datetime, datetime.datetime]]:
-    """Split a date range into chronological time windows."""
+    """Split a date range into non-overlapping chronological windows (max 90 days per Apigee limit)."""
+    if query_start >= query_end:
+        return []
+    rounded_end = query_end
+    if rounded_end.second > 0 or rounded_end.microsecond > 0:
+        rounded_end = rounded_end.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
     chunks: list[tuple[datetime.datetime, datetime.datetime]] = []
     cur = query_start
-    while cur < query_end:
-        nxt = min(query_end, cur + datetime.timedelta(days=step_days))
-        chunks.append((cur, nxt))
+    while cur < rounded_end:
+        nxt = min(rounded_end, cur + datetime.timedelta(days=step_days))
+        chunk_end = (nxt - datetime.timedelta(minutes=1)) if nxt < rounded_end else nxt
+        if chunk_end > cur:
+            chunks.append((cur, chunk_end))
         cur = nxt
     return chunks
 
 
-def _init_env_call_results(envs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Initialize result structures for environment call queries."""
-    return {
-        e["environment"]: {
-            "daily": {},
-            "dailyEntitlement": {},
-            "dailyEnvoy": {},
-            "standardApiCalls": 0,
-            "envoyApiCalls": 0,
-            "extensibleApiCalls": 0,
-            "source": "APIGEE_ANALYTICS",
-            "analytics_ok": False,
-        }
-        for e in envs
-    }
+def _should_default_calls_extensible(env_obj: Mapping[str, Any], runtime_type: str) -> bool:
+    """Determine whether unclassified/flat analytics traffic should default to Extensible (1.0x)."""
+    if runtime_type == "HYBRID":
+        return True
+    std_p = int(env_obj.get("standardProxies", 0))
+    ext_p = int(env_obj.get("extensibleProxies", 0))
+    return ext_p > 0 or std_p == 0
 
 
 def _fetch_single_org_contract_calls_sync(
@@ -2041,38 +2853,78 @@ def _fetch_single_org_contract_calls_sync(
     query_end: datetime.datetime,
     account: str | None = None,
     explicit_token: str | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch daily and total API call counts per environment for an organization."""
+    """Fetch daily and total API call counts across all environments of an organization."""
     org_name = org_obj["organization"]
-    proj_id = org_obj.get("projectId", org_name)
+    runtime_type = str(org_obj.get("runtimeType", "CLOUD"))
     envs = org_obj.get("environments", [])
     if not envs:
         return {}
 
-    sess, apigee_base_url, _ = _get_thread_session(account=account, explicit_token=explicit_token)
-    chunks = _generate_time_chunks(query_start, query_end, step_days=90)
-    env_results = _init_env_call_results(envs)
+    chunks = _generate_time_chunks(query_start, query_end)
+    env_results: dict[str, dict[str, Any]] = {}
 
     for e in envs:
         env_name = e["environment"]
-        if int(e.get("totalArtifacts", 0)) <= 0 and int(e.get("totalPdus", 0)) <= 0:
-            continue
-        daily_maps, std_c, ext_c, envoy_c, ok = _query_env_analytics_chunks(
-            sess, apigee_base_url, org_name, env_name, chunks
+        spec = AnalyticsChunkSpec(
+            org_name=org_name,
+            env_name=env_name,
+            account=account,
+            explicit_token=explicit_token,
+            jurisdiction=jurisdiction,
+            default_extensible=_should_default_calls_extensible(e, runtime_type),
         )
-        if ok:
-            env_results[env_name]["daily"] = daily_maps.get("daily", {})
-            env_results[env_name]["dailyEntitlement"] = daily_maps.get("dailyEntitlement", {})
-            env_results[env_name]["dailyEnvoy"] = daily_maps.get("dailyEnvoy", {})
-            env_results[env_name]["standardApiCalls"] = std_c
-            env_results[env_name]["envoyApiCalls"] = envoy_c
-            env_results[env_name]["extensibleApiCalls"] = ext_c
-            env_results[env_name]["analytics_ok"] = True
-        else:
-            env_results[env_name]["source"] = "CLOUD_MONITORING"
+        env_results[env_name] = _query_env_analytics_chunks(spec, chunks)
 
-    _query_monitoring_response_counts(sess, proj_id, org_name, query_start, query_end, env_results)
     return env_results
+
+
+def _simulate_single_demo_env_calls(
+    e: dict[str, Any],
+    q_start: datetime.datetime,
+    q_end: datetime.datetime,
+    num_days: int,
+) -> None:
+    """Populate deterministic daily Standard, Extensible, and Envoy call counts for one demo environment."""
+    daily_avg = int(e.get("demoAnnualCallsBase", e.get("totalPdus", 0) * 420_000)) / 365.0
+    daily_map: dict[str, int] = {}
+    daily_std_map: dict[str, int] = {}
+    daily_ext_map: dict[str, int] = {}
+    daily_ent_map: dict[str, int] = {}
+    daily_envoy_map: dict[str, int] = {}
+    tot_p = int(e.get("standardProxies", 0)) + int(e.get("extensibleProxies", 0))
+    std_ratio = (int(e.get("standardProxies", 0)) / tot_p) if tot_p > 0 else 0.75
+
+    for d_idx in range(num_days + 1):
+        day_dt = q_start + datetime.timedelta(days=d_idx)
+        if day_dt > q_end:
+            break
+        day_str = day_dt.strftime("%Y-%m-%d")
+        c_val = max(0, int(round(daily_avg * (0.85 + 0.30 * math.sin((d_idx + len(e["environment"])) * 0.4)))))
+        d_envoy = int(round(c_val * 0.10))
+        d_runtime = c_val - d_envoy
+        d_std = int(round(d_runtime * std_ratio))
+        d_ext = d_runtime - d_std
+        daily_map[day_str], daily_std_map[day_str], daily_ext_map[day_str] = d_runtime, d_std, d_ext
+        daily_ent_map[day_str] = _compute_weighted_entitlement_calls(d_std, 0, d_ext)
+        daily_envoy_map[day_str] = d_envoy
+
+    std_c, ext_c, envoy_c = sum(daily_std_map.values()), sum(daily_ext_map.values()), sum(daily_envoy_map.values())
+    e.update({
+        "standardApiCalls": std_c,
+        "envoyApiCalls": envoy_c,
+        "extensibleApiCalls": ext_c,
+        "rawApiCalls": std_c + ext_c,
+        "yearlyApiCalls": _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c),
+        "callsSource": "APIGEE_ANALYTICS_DEMO",
+        "callsStatus": "OK",
+        "dailyCalls": daily_map,
+        "dailyStandardCalls": daily_std_map,
+        "dailyExtensibleCalls": daily_ext_map,
+        "dailyEntitlementCalls": daily_ent_map,
+        "dailyEnvoyCalls": daily_envoy_map,
+    })
 
 
 def _generate_demo_calls(
@@ -2085,46 +2937,7 @@ def _generate_demo_calls(
     num_days = max(1, (q_end - q_start).days)
     for o in raw_data.get("organizations", []):
         for e in o.get("environments", []):
-            base_annual = int(e.get("demoAnnualCallsBase", e.get("totalPdus", 0) * 420_000))
-            daily_avg = base_annual / 365.0
-            daily_map: dict[str, int] = {}
-            daily_ent_map: dict[str, int] = {}
-            daily_envoy_map: dict[str, int] = {}
-            std_c = 0
-            ext_c = 0
-            envoy_c = 0
-            std_proxies = int(e.get("standardProxies", 0))
-            ext_proxies = int(e.get("extensibleProxies", 0))
-            tot_p = std_proxies + ext_proxies
-            std_ratio = (std_proxies / tot_p) if tot_p > 0 else 0.75
-            for d_idx in range(num_days + 1):
-                day_dt = q_start + datetime.timedelta(days=d_idx)
-                if day_dt > q_end:
-                    break
-                day_str = day_dt.strftime("%Y-%m-%d")
-                wave = 0.85 + 0.30 * math.sin((d_idx + len(e["environment"])) * 0.4)
-                c_val = max(0, int(round(daily_avg * wave)))
-                d_envoy = int(round(c_val * 0.10))
-                d_runtime = c_val - d_envoy
-                d_std = int(round(d_runtime * std_ratio))
-                d_ext = d_runtime - d_std
-                daily_map[day_str] = d_runtime
-                daily_ent_map[day_str] = _compute_weighted_entitlement_calls(d_std, 0, d_ext)
-                daily_envoy_map[day_str] = d_envoy
-                std_c += d_std
-                ext_c += d_ext
-                envoy_c += d_envoy
-            total_raw = std_c + ext_c
-            weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c)
-            e["standardApiCalls"] = std_c
-            e["envoyApiCalls"] = envoy_c
-            e["extensibleApiCalls"] = ext_c
-            e["rawApiCalls"] = total_raw
-            e["yearlyApiCalls"] = weighted_c
-            e["callsSource"] = "APIGEE_ANALYTICS_DEMO"
-            e["dailyCalls"] = daily_map
-            e["dailyEntitlementCalls"] = daily_ent_map
-            e["dailyEnvoyCalls"] = daily_envoy_map
+            _simulate_single_demo_env_calls(e, q_start, q_end, num_days)
 
     raw_data["contractPeriod"] = {
         "contractStartDate": period_info["contractStartDate"],
@@ -2136,33 +2949,56 @@ def _generate_demo_calls(
     return raw_data
 
 
-def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) -> None:
-    """Update organization environments with collected traffic data."""
+def _resolve_org_calls_status(envs: Sequence[Mapping[str, Any]]) -> str:
+    """Derive organization-level API call collection status from its environments."""
+    statuses = {str(e.get("callsStatus", "OK")) for e in envs}
+    if "ERROR" in statuses and len(statuses) == 1:
+        return "ERROR"
+    if "ERROR" in statuses or "PARTIAL" in statuses:
+        return "PARTIAL"
+    if "ANALYTICS_DISABLED" in statuses:
+        return "ANALYTICS_DISABLED"
+    return "OK"
+
+
+def _apply_org_traffic_result(org_obj: dict[str, Any], org_res: dict[str, Any]) -> list[str]:
+    """Update organization environments with collected traffic data and return chunk errors."""
+    org_errors: list[str] = []
+    r_type = str(org_obj.get("runtimeType", "CLOUD"))
     for e in org_obj.get("environments", []):
         e_info = org_res.get(e["environment"], {})
         daily_map = e_info.get("daily", {})
         std_c = int(e_info.get("standardApiCalls", 0))
         envoy_c = int(e_info.get("envoyApiCalls", 0))
         ext_c = int(e_info.get("extensibleApiCalls", 0))
-        raw_c = std_c + ext_c
-        if raw_c == 0 and daily_map:
-            raw_c = sum(daily_map.values())
-            std_c = raw_c
         total_from_daily = sum(daily_map.values())
-        if total_from_daily > raw_c:
-            std_c += total_from_daily - raw_c
-            raw_c = total_from_daily
-        has_breakdown = std_c > 0 or ext_c > 0
-        weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c) if has_breakdown else raw_c
+        if total_from_daily > (std_c + ext_c):
+            delta = total_from_daily - (std_c + ext_c)
+            if _should_default_calls_extensible(e, r_type):
+                ext_c += delta
+            else:
+                std_c += delta
+        raw_c = std_c + ext_c
+        weighted_c = _compute_weighted_entitlement_calls(std_c, envoy_c, ext_c)
         e["standardApiCalls"] = std_c
         e["envoyApiCalls"] = envoy_c
         e["extensibleApiCalls"] = ext_c
         e["rawApiCalls"] = raw_c
         e["yearlyApiCalls"] = weighted_c
         e["callsSource"] = e_info.get("source", "APIGEE_ANALYTICS")
+        e["callsStatus"] = e_info.get("status", "OK")
         e["dailyCalls"] = daily_map
+        e["dailyStandardCalls"] = e_info.get("dailyStandard", {})
+        e["dailyExtensibleCalls"] = e_info.get("dailyExtensible", {})
         e["dailyEntitlementCalls"] = e_info.get("dailyEntitlement", {})
         e["dailyEnvoyCalls"] = e_info.get("dailyEnvoy", {})
+        env_errors = list(e_info.get("errors", []))
+        e["trafficErrors"] = env_errors
+        org_errors.extend(env_errors)
+    org_errors = list(dict.fromkeys(org_errors))
+    org_obj["trafficErrors"] = org_errors
+    org_obj["callsStatus"] = _resolve_org_calls_status(org_obj.get("environments", []))
+    return org_errors
 
 
 def _notify_traffic_progress(
@@ -2173,7 +3009,8 @@ def _notify_traffic_progress(
     env_count: int,
 ) -> None:
     """Send traffic collection progress notification to callback."""
-    pct = 68 + int((completed / max(1, total)) * 28)
+    _ = env_count
+    pct = 52 + int((completed / max(1, total)) * 34)
     try:
         callback({
             "percent": pct,
@@ -2195,17 +3032,24 @@ def _pop_in_flight_org(in_flight: list[str], org_name: str) -> str:
     return in_flight[0] if in_flight else org_name
 
 
+@dataclass(frozen=True)
+class TrafficCollectionContext:
+    """Context parameters for concurrent traffic queries across organizations."""
+    q_start: datetime.datetime
+    q_end: datetime.datetime
+    account: str | None = None
+    explicit_token: str | None = None
+    jurisdiction: str | None = None
+    progress_callback: Callable[[dict[str, Any]], None] | None = None
+
+
 def _collect_traffic_for_active_orgs(
     active_orgs: list[dict[str, Any]],
-    q_start: datetime.datetime,
-    q_end: datetime.datetime,
-    account: str | None,
-    explicit_token: str | None,
-    progress_callback: Callable[[dict[str, Any]], None] | None,
-) -> None:
+    ctx: TrafficCollectionContext,
+) -> list[str]:
     """Execute concurrent queries for org traffic across active environments."""
     if not active_orgs:
-        return
+        return []
     total = len(active_orgs)
     lock = threading.Lock()
     in_flight: list[str] = []
@@ -2218,18 +3062,24 @@ def _collect_traffic_for_active_orgs(
         env_count = len(org_obj.get("environments", []))
         with lock:
             in_flight.append(org_name)
-            _notify_traffic_progress(progress_callback, org_name, traffic_done, total, env_count)
-        res = _fetch_single_org_contract_calls_sync(org_obj, q_start, q_end, account, explicit_token)
+            if ctx.progress_callback:
+                _notify_traffic_progress(ctx.progress_callback, org_name, traffic_done, total, env_count)
+        res = _fetch_single_org_contract_calls_sync(
+            org_obj, ctx.q_start, ctx.q_end, ctx.account, ctx.explicit_token, ctx.jurisdiction
+        )
         with lock:
             traffic_done += 1
             display_org = _pop_in_flight_org(in_flight, org_name)
-            _notify_traffic_progress(progress_callback, display_org, traffic_done, total, env_count)
+            if ctx.progress_callback:
+                _notify_traffic_progress(ctx.progress_callback, display_org, traffic_done, total, env_count)
         return res
 
     with ThreadPoolExecutor(max_workers=min(10, total)) as executor:
         futures = {executor.submit(_run_org_traffic, o): o for o in active_orgs}
+        all_errors: list[str] = []
         for fut in as_completed(futures):
-            _apply_org_traffic_result(futures[fut], fut.result())
+            all_errors.extend(_apply_org_traffic_result(futures[fut], fut.result()))
+    return all_errors
 
 
 def populate_contract_api_calls_sync(
@@ -2238,16 +3088,39 @@ def populate_contract_api_calls_sync(
     account: str | None = None,
     explicit_token: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, Any]:
-    """Populate API calls across all environments for the active contract period."""
+    """Populate API calls across all environments for the active contract period while preserving org inventories."""
     period_info = resolve_contract_period(contract_start_date)
     q_start, q_end = period_info["queryStartDt"], period_info["queryEndDt"]
 
     if raw_data.get("source") == "DEMO_DATASET":
         return _generate_demo_calls(raw_data, q_start, q_end, period_info)
 
-    active_orgs = [o for o in raw_data.get("organizations", []) if len(o.get("environments", [])) > 0]
-    _collect_traffic_for_active_orgs(active_orgs, q_start, q_end, account, explicit_token, progress_callback)
+    raw_orgs = list(raw_data.get("organizations", []))
+    sub_orgs, excluded_billing = filter_subscription_organizations(raw_orgs)
+    existing_excl_billing = set(raw_data.get("excludedBillingOrganizations") or [])
+    merged_excl_names = sorted(existing_excl_billing | set(excluded_billing), key=str.lower)
+    if merged_excl_names:
+        raw_data["excludedBillingOrganizations"] = merged_excl_names
+        raw_data["excludedBillingDetails"] = extract_excluded_billing_details(
+            raw_orgs, raw_data.get("excludedBillingDetails"), merged_excl_names
+        )
+    raw_data["organizations"] = sub_orgs
+
+    active_orgs = [o for o in sub_orgs if len(o.get("environments", [])) > 0]
+    t_ctx = TrafficCollectionContext(q_start, q_end, account, explicit_token, jurisdiction, progress_callback)
+    traffic_errors = _collect_traffic_for_active_orgs(active_orgs, t_ctx)
+    raw_data["trafficErrors"] = traffic_errors
+    affected_orgs = [o["organization"] for o in sub_orgs if o.get("trafficErrors")]
+    raw_data["affectedTrafficOrganizations"] = affected_orgs
+    raw_data["excludedOrganizations"] = []
+    if traffic_errors:
+        logger.warning(
+            "Apigee Analytics queries reported %d issue(s) across %s; PDUs and Env Units retained, call counts marked PARTIAL/ERROR.",
+            len(traffic_errors),
+            ", ".join(affected_orgs),
+        )
 
     raw_data["contractPeriod"] = {
         "contractStartDate": period_info["contractStartDate"],
@@ -2265,6 +3138,7 @@ async def populate_contract_api_calls(
     account: str | None = None,
     explicit_token: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    jurisdiction: str | None = None,
 ) -> dict[str, Any]:
     """Async wrapper for populating contract-period API calls."""
     return await asyncio.to_thread(
@@ -2274,6 +3148,7 @@ async def populate_contract_api_calls(
         account,
         explicit_token,
         progress_callback,
+        jurisdiction,
     )
 
 
@@ -2284,7 +3159,7 @@ def _emit_org_audit_progress(
     org_name: str,
 ) -> None:
     """Emit organization audit progress percentage and active organization label."""
-    pct = 10 + int((completed / max(1, total)) * 58)
+    pct = 10 + int((completed / max(1, total)) * 42)
     notify(
         pct,
         "Auditing environments & PDUs...",
@@ -2302,6 +3177,7 @@ def _collect_targets_concurrently(
     explicit_token: str | None,
     hybrid_region_overrides: dict[str, int] | None,
     notify: Callable[..., None],
+    jurisdiction: str | None = None,
 ) -> list[dict[str, Any]]:
     """Query organization details concurrently across target organizations."""
     total = len(selected_targets)
@@ -2323,6 +3199,7 @@ def _collect_targets_concurrently(
             account=account,
             explicit_token=explicit_token,
             hybrid_region_overrides=hybrid_region_overrides,
+            jurisdiction=jurisdiction,
         )
         with lock:
             completed_count += 1
@@ -2393,6 +3270,45 @@ def _build_empty_collection_payload(auth_source: str, account: str | None, api_e
     }
 
 
+def _assemble_collected_raw_payload(
+    collected_orgs: list[dict[str, Any]],
+    discovery: Mapping[str, Any],
+    account: str | None,
+    is_partial: bool,
+) -> dict[str, Any]:
+    """Filter subscription organizations, log collection errors, and build raw scan payload."""
+    organizations, excluded_billing = filter_subscription_organizations(collected_orgs)
+    excluded_details = _extract_excluded_billing_details(collected_orgs, excluded_names=excluded_billing)
+    organizations.sort(key=lambda o: o["organization"].lower())
+    error_orgs = [o["organization"] for o in organizations if o.get("status") == "ERROR"]
+    if error_orgs:
+        logger.warning("Organization metadata/deployment collection failed for: %s", ", ".join(error_orgs))
+    return {
+        "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source": "LIVE_APIGEE_API",
+        "authSource": discovery["authSource"],
+        "account": account,
+        "apiEndpoint": discovery["apiEndpoint"],
+        "totalAuthorizedOrgs": len(organizations),
+        "totalDiscoveredOrgs": len(discovery.get("organizations", [])),
+        "isPartialScan": is_partial,
+        "organizations": organizations,
+        "excludedBillingOrganizations": excluded_billing,
+        "excludedBillingDetails": excluded_details,
+    }
+
+
+def _emit_traffic_start_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    organizations: list[dict[str, Any]],
+) -> None:
+    """Emit 52% traffic audit start progress when at least one subscription org exists."""
+    if not organizations:
+        return
+    first_org = next((o["organization"] for o in organizations if o.get("environments")), organizations[0]["organization"])
+    _notify_scan_progress(progress_callback, 52, "Auditing API traffic...", stage="TRAFFIC", organization=first_org, detail=first_org)
+
+
 def collect_all_organizations_sync(
     explicit_token: str | None = None,
     org_filter: list[str] | None = None,
@@ -2400,33 +3316,37 @@ def collect_all_organizations_sync(
     account: str | None = None,
     contract_start_date: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    **options: Any,
 ) -> dict[str, Any]:
     """Discover authorized Apigee organizations and collect live metrics in parallel."""
+    jurisdiction: str | None = options.get("jurisdiction")
+    completion_pct = int(options.get("completion_percent", 100))
+    is_partial = bool(org_filter and any(o and o.strip() for o in org_filter))
     initial_hint = org_filter[0] if org_filter and len(org_filter) == 1 else "Querying Google Cloud Apigee API..."
     _notify_scan_progress(progress_callback, 5, "Discovering Apigee organizations...", stage="DISCOVERY", detail=initial_hint)
-    discovery = discover_authorized_organizations_sync(account=account, explicit_token=explicit_token)
+    discovery = discover_authorized_organizations_sync(
+        account=account, explicit_token=explicit_token, jurisdiction=jurisdiction
+    )
     selected_targets = _resolve_selected_targets(discovery["organizations"], org_filter)
 
     if not selected_targets:
-        _notify_scan_progress(progress_callback, 100, "No authorized Apigee organizations found for this account.", stage="COMPLETE")
-        return _build_empty_collection_payload(discovery["authSource"], account, discovery["apiEndpoint"])
+        done_stage = "COMPLETE" if completion_pct >= 100 else "ORGANIZATIONS"
+        _notify_scan_progress(progress_callback, completion_pct, "No authorized Apigee organizations found for this account.", stage=done_stage)
+        empty_payload = _build_empty_collection_payload(discovery["authSource"], account, discovery["apiEndpoint"])
+        empty_payload["isPartialScan"] = is_partial
+        return empty_payload
 
     notify_cb = lambda p, m, **kw: _notify_scan_progress(progress_callback, p, m, **kw)
-    organizations = _collect_targets_concurrently(selected_targets, account, explicit_token, hybrid_region_overrides, notify_cb)
-    organizations.sort(key=lambda o: o["organization"].lower())
-    raw_payload: dict[str, Any] = {
-        "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "source": "LIVE_APIGEE_API",
-        "authSource": discovery["authSource"],
-        "account": account,
-        "apiEndpoint": discovery["apiEndpoint"],
-        "totalAuthorizedOrgs": len(discovery["organizations"]),
-        "organizations": organizations,
-    }
-    first_org = next((o["organization"] for o in organizations if o.get("environments")), organizations[0]["organization"])
-    _notify_scan_progress(progress_callback, 68, "Auditing API traffic...", stage="TRAFFIC", organization=first_org, detail=first_org)
-    populate_contract_api_calls_sync(raw_payload, contract_start_date, account, explicit_token, progress_callback)
-    _notify_scan_progress(progress_callback, 100, "Collection completed successfully.", stage="COMPLETE")
+    collected_orgs = _collect_targets_concurrently(
+        selected_targets, account, explicit_token, hybrid_region_overrides, notify_cb, jurisdiction=jurisdiction
+    )
+    raw_payload = _assemble_collected_raw_payload(collected_orgs, discovery, account, is_partial)
+    _emit_traffic_start_progress(progress_callback, raw_payload["organizations"])
+    populate_contract_api_calls_sync(
+        raw_payload, contract_start_date, account, explicit_token, progress_callback, jurisdiction=jurisdiction
+    )
+    done_stage = "COMPLETE" if completion_pct >= 100 else "TRAFFIC"
+    _notify_scan_progress(progress_callback, completion_pct, "Collection completed successfully.", stage=done_stage)
     return raw_payload
 
 
@@ -2437,26 +3357,59 @@ async def collect_all_organizations(
     account: str | None = None,
     contract_start_date: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    **options: Any,
 ) -> dict[str, Any]:
     """Async wrapper for dynamic multi-organization collection."""
     return await asyncio.to_thread(
-        collect_all_organizations_sync,
-        explicit_token,
-        org_filter,
-        hybrid_region_overrides,
-        account,
-        contract_start_date,
-        progress_callback,
+        lambda: collect_all_organizations_sync(
+            explicit_token,
+            org_filter,
+            hybrid_region_overrides,
+            account,
+            contract_start_date,
+            progress_callback,
+            **options,
+        )
     )
 
 
-def _needs_calls_population(raw_data: dict[str, Any], period_start_date: str) -> bool:
+def _needs_calls_population(
+    raw_data: dict[str, Any],
+    period_start_date: str,
+    force_refresh: bool = False,
+) -> bool:
     """Check if traffic calls need to be fetched or refreshed."""
+    if force_refresh:
+        return True
     current_cp = (raw_data.get("contractPeriod") or {}).get("contractStartDate")
     if current_cp != period_start_date:
         return True
-    orgs_list = raw_data.get("organizations", [])
-    return not any("dailyCalls" in e for o in orgs_list for e in o.get("environments", []))
+    envs = [e for o in raw_data.get("organizations", []) for e in o.get("environments", [])]
+    if not envs:
+        return False
+    return any("dailyCalls" not in e or e.get("callsSource") == "PENDING" for e in envs)
+
+
+def _build_env_call_point(
+    day_key: str,
+    daily_map: Mapping[str, int],
+    daily_ent_map: Mapping[str, int],
+    daily_envoy_map: Mapping[str, int],
+    daily_std_map: Mapping[str, int],
+    daily_ext_map: Mapping[str, int],
+) -> dict[str, Any]:
+    """Construct a single daily API call point with Standard/Extensible/Envoy breakdown."""
+    raw_val = int(daily_map.get(day_key, 0))
+    ent_val = int(daily_ent_map[day_key]) if day_key in daily_ent_map else raw_val
+    return {
+        "timestamp": f"{day_key}T00:00:00Z",
+        "pdu": raw_val,
+        "dailyCalls": raw_val,
+        "standardCalls": int(daily_std_map.get(day_key, 0)),
+        "extensibleCalls": int(daily_ext_map.get(day_key, 0)),
+        "entitlementCalls": ent_val,
+        "envoyCalls": int(daily_envoy_map.get(day_key, 0)),
+    }
 
 
 def _extract_env_calls_series(
@@ -2468,17 +3421,17 @@ def _extract_env_calls_series(
     daily_map: dict[str, int] = env.get("dailyCalls") or {}
     daily_ent_map: dict[str, int] = env.get("dailyEntitlementCalls") or {}
     daily_envoy_map: dict[str, int] = env.get("dailyEnvoyCalls") or {}
-    all_days = sorted(set(daily_map) | set(daily_ent_map) | set(daily_envoy_map))
-    if not all_days and int(env.get("totalPdus", 0)) <= 0:
+    daily_std_map: dict[str, int] = env.get("dailyStandardCalls") or {}
+    daily_ext_map: dict[str, int] = env.get("dailyExtensibleCalls") or {}
+    all_days = sorted(
+        set(daily_map) | set(daily_ent_map) | set(daily_envoy_map) | set(daily_std_map) | set(daily_ext_map)
+    )
+    calls_status = str(env.get("callsStatus", "OK"))
+    has_notable_status = calls_status in {"ANALYTICS_DISABLED", "ERROR", "PARTIAL"}
+    if not all_days and int(env.get("totalPdus", 0)) <= 0 and not has_notable_status:
         return None
     pts = [
-        {
-            "timestamp": f"{k}T00:00:00Z",
-            "pdu": int(daily_map.get(k, 0)),
-            "dailyCalls": int(daily_map.get(k, 0)),
-            "entitlementCalls": int(daily_ent_map[k]) if k in daily_ent_map else int(daily_map.get(k, 0)),
-            "envoyCalls": int(daily_envoy_map.get(k, 0)),
-        }
+        _build_env_call_point(k, daily_map, daily_ent_map, daily_envoy_map, daily_std_map, daily_ext_map)
         for k in all_days
     ]
     return {
@@ -2486,6 +3439,7 @@ def _extract_env_calls_series(
         "environment": env["environment"],
         "runtimeType": runtime_type,
         "source": env.get("callsSource", "APIGEE_ANALYTICS"),
+        "callsStatus": calls_status,
         "points": pts,
         "standardApiCalls": int(env.get("standardApiCalls", 0)),
         "envoyApiCalls": int(env.get("envoyApiCalls", 0)),
@@ -2500,21 +3454,28 @@ def _build_calls_dimension_series(
     contract_start_date: str | None,
     account: str | None,
     explicit_token: str | None,
+    jurisdiction: str | None = None,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Build historical time-series for the yearly API calls dimension."""
     period_info = resolve_contract_period(
         contract_start_date or (raw_data.get("contractPeriod") or {}).get("contractStartDate")
     )
-    if _needs_calls_population(raw_data, period_info["contractStartDate"]):
+    populated = False
+    if _needs_calls_population(raw_data, period_info["contractStartDate"], force_refresh=force_refresh):
         populate_contract_api_calls_sync(
             raw_data,
             contract_start_date=period_info["contractStartDate"],
             account=account,
             explicit_token=explicit_token,
+            jurisdiction=jurisdiction,
         )
+        populated = True
 
     calls_series: list[dict[str, Any]] = []
     for o in raw_data.get("organizations", []):
+        if is_non_subscription_org(o):
+            continue
         r_type = o.get("runtimeType", "CLOUD")
         for e in o.get("environments", []):
             series = _extract_env_calls_series(o["organization"], r_type, e)
@@ -2524,7 +3485,7 @@ def _build_calls_dimension_series(
     return {
         "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "dimension": "calls",
-        "metricType": "Apigee Analytics sum(message_count) + apigee.googleapis.com/proxy/response_count",
+        "metricType": "Apigee Analytics sum(message_count)",
         "contractStartDate": period_info["contractStartDate"],
         "periodStart": period_info["periodStart"],
         "periodEnd": period_info["periodEnd"],
@@ -2532,6 +3493,9 @@ def _build_calls_dimension_series(
         "alignmentPeriodSeconds": 86400,
         "seriesCount": len(calls_series),
         "series": calls_series,
+        "trafficErrors": raw_data.get("trafficErrors", []),
+        "affectedTrafficOrganizations": raw_data.get("affectedTrafficOrganizations", []),
+        "callsRefreshed": populated,
     }
 
 
@@ -2546,27 +3510,35 @@ def _resolve_alignment_seconds(days: int) -> int:
     return 43200
 
 
+def _snap_monitoring_bucket_timestamp(t_str: str, align_seconds: int) -> str:
+    """Snap an ISO timestamp string to the nearest aligned monitoring bucket."""
+    try:
+        dt = datetime.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+        epoch_snap = int(round(dt.timestamp() / align_seconds)) * align_seconds
+        return datetime.datetime.fromtimestamp(epoch_snap, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        return t_str
+
+
 def _parse_monitoring_points_environments(
     time_series_items: Sequence[dict[str, Any]],
     align_seconds: int,
     org_name: str,
     runtime_type: str,
 ) -> list[dict[str, Any]]:
-    """Parse environment unit time series counting distinct regional locations."""
+    """Parse environment unit time series counting distinct regional locations per aligned bucket."""
     env_ts_regions: dict[str, dict[str, int]] = {}
     for ts in time_series_items:
         env_name = ts.get("resource", {}).get("labels", {}).get("env", "default")
+        seen_buckets: set[str] = set()
         for p in ts.get("points", []):
             t_str = p.get("interval", {}).get("endTime") or p.get("interval", {}).get("startTime")
             val = int(p.get("value", {}).get("int64Value", 0))
             if t_str and val > 0:
-                try:
-                    dt = datetime.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
-                    epoch_snap = int(round(dt.timestamp() / align_seconds)) * align_seconds
-                    t_clean = datetime.datetime.fromtimestamp(epoch_snap, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                except (ValueError, TypeError):
-                    t_clean = t_str
-                env_ts_regions.setdefault(env_name, {})[t_clean] = env_ts_regions.get(env_name, {}).get(t_clean, 0) + 1
+                t_clean = _snap_monitoring_bucket_timestamp(t_str, align_seconds)
+                if t_clean not in seen_buckets:
+                    seen_buckets.add(t_clean)
+                    env_ts_regions.setdefault(env_name, {})[t_clean] = env_ts_regions.get(env_name, {}).get(t_clean, 0) + 1
 
     return [
         {
@@ -2622,15 +3594,38 @@ class MonitoringQueryConfig:
     end_str: str
     account: str | None = None
     explicit_token: str | None = None
+    jurisdiction: str | None = None
+
+
+def _fetch_monitoring_timeseries_pages(
+    sess: requests.Session,
+    url: str,
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch all paginated Cloud Monitoring timeSeries items for one organization."""
+    ts_items: list[dict[str, Any]] = []
+    page_params = dict(params)
+    for _ in range(_MAX_APIGEE_PAGES):
+        data, err = _get_json_with_retry_sync(sess, url, params=page_params, timeout=18.0, retries=1)
+        if err or data is None:
+            return ts_items, err or "Empty response"
+        ts_items.extend(data.get("timeSeries", []))
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            break
+        page_params["pageToken"] = next_token
+    return ts_items, None
 
 
 def _query_single_org_monitoring(
     target: tuple[str, str, dict[str, Any]],
     cfg: MonitoringQueryConfig,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str | None]:
     """Query Cloud Monitoring proxy details for a single target organization."""
     org_name, proj_id, org_obj = target
-    sess, _, _ = _get_thread_session(account=cfg.account, explicit_token=cfg.explicit_token)
+    sess, _, _ = _get_thread_session(
+        account=cfg.account, explicit_token=cfg.explicit_token, jurisdiction=cfg.jurisdiction
+    )
     url = f"{MONITORING_BASE_URL}/projects/{proj_id}/timeSeries"
     group_fields = (
         ["resource.label.org", "resource.label.env", "resource.label.location"]
@@ -2646,30 +3641,34 @@ def _query_single_org_monitoring(
         "aggregation.crossSeriesReducer": "REDUCE_COUNT",
         "aggregation.groupByFields": group_fields,
     }
-    data, err = _get_json_sync(sess, url, params=params, timeout=18.0)
-    if err or not data or not data.get("timeSeries"):
-        return []
-    ts_items = data.get("timeSeries", [])
+    ts_items, err = _fetch_monitoring_timeseries_pages(sess, url, params)
+    err_msg = f"[{org_name}] Cloud Monitoring query failed ({proj_id}): {err}" if err else None
+    if not ts_items:
+        return [], err_msg
     r_type = org_obj.get("runtimeType", "CLOUD")
     if cfg.dim == "environments":
-        return _parse_monitoring_points_environments(ts_items, cfg.align_seconds, org_name, r_type)
-    return _parse_monitoring_points_pdus(ts_items, cfg.align_seconds, org_name, r_type)
+        return _parse_monitoring_points_environments(ts_items, cfg.align_seconds, org_name, r_type), err_msg
+    return _parse_monitoring_points_pdus(ts_items, cfg.align_seconds, org_name, r_type), err_msg
 
 
 def _execute_monitoring_queries(
     active_targets: list[tuple[str, str, dict[str, Any]]],
     cfg: MonitoringQueryConfig,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Execute time-series queries concurrently across active target organizations."""
     if not active_targets:
-        return []
+        return [], []
     all_series: list[dict[str, Any]] = []
+    monitoring_errors: list[str] = []
     max_workers = min(10, max(1, len(active_targets)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_query_single_org_monitoring, t, cfg) for t in active_targets]
         for f in futures:
-            all_series.extend(f.result())
-    return all_series
+            series_part, err_msg = f.result()
+            all_series.extend(series_part)
+            if err_msg:
+                monitoring_errors.append(err_msg)
+    return all_series, monitoring_errors
 
 
 def _build_monitoring_time_window(days: int, align_seconds: int) -> tuple[str, str]:
@@ -2681,6 +3680,19 @@ def _build_monitoring_time_window(days: int, align_seconds: int) -> tuple[str, s
     return aligned_start.strftime("%Y-%m-%dT%H:%M:%SZ"), aligned_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _select_monitoring_targets(
+    orgs_list: list[dict[str, Any]],
+    dim: str,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Select active Apigee X organizations eligible for Cloud Monitoring proxy/details queries."""
+    _ = dim
+    return [
+        (o["organization"], o.get("projectId", o["organization"]), o)
+        for o in orgs_list
+        if o.get("runtimeType") != "HYBRID" and len(o.get("environments", [])) > 0
+    ]
+
+
 def fetch_monitoring_pdu_timeseries_sync(
     raw_data: dict[str, Any],
     days: int = 14,
@@ -2688,32 +3700,23 @@ def fetch_monitoring_pdu_timeseries_sync(
     explicit_token: str | None = None,
     dimension: str = "pdu",
     contract_start_date: str | None = None,
+    **options: Any,
 ) -> dict[str, Any]:
     """Retrieve historical time-series across all active Apigee organizations."""
+    jurisdiction: str | None = options.get("jurisdiction")
     dim = (dimension or "pdu").strip().lower()
     if dim == "calls":
-        return _build_calls_dimension_series(raw_data, contract_start_date, account, explicit_token)
+        return _build_calls_dimension_series(
+            raw_data, contract_start_date, account, explicit_token, jurisdiction, bool(options.get("force_refresh"))
+        )
 
     days = max(1, min(90, int(days)))
     align_seconds = _resolve_alignment_seconds(days)
     start_str, end_str = _build_monitoring_time_window(days, align_seconds)
-    cfg = MonitoringQueryConfig(
-        dim=dim,
-        align_seconds=align_seconds,
-        start_str=start_str,
-        end_str=end_str,
-        account=account,
-        explicit_token=explicit_token,
-    )
-
-    orgs_list = raw_data.get("organizations", [])
-    active_targets = [
-        (o["organization"], o.get("projectId", o["organization"]), o)
-        for o in orgs_list
-        if len(o.get("deployments", [])) > 0 or any(e.get("totalPdus", 0) > 0 for e in o.get("environments", []))
-    ]
-    all_series = _execute_monitoring_queries(active_targets, cfg)
-
+    cfg = MonitoringQueryConfig(dim, align_seconds, start_str, end_str, account, explicit_token, jurisdiction)
+    orgs_list = [o for o in raw_data.get("organizations", []) if not is_non_subscription_org(o)]
+    all_series, monitoring_errors = _execute_monitoring_queries(_select_monitoring_targets(orgs_list, dim), cfg)
+    hybrid_orgs = [o["organization"] for o in orgs_list if o.get("runtimeType") == "HYBRID"]
     return {
         "fetchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "dimension": dim,
@@ -2722,6 +3725,8 @@ def fetch_monitoring_pdu_timeseries_sync(
         "alignmentPeriodSeconds": align_seconds,
         "seriesCount": len(all_series),
         "series": all_series,
+        "monitoringErrors": monitoring_errors,
+        "unsupportedHybridOrganizations": hybrid_orgs,
     }
 
 
@@ -2732,16 +3737,19 @@ async def fetch_monitoring_pdu_timeseries(
     explicit_token: str | None = None,
     dimension: str = "pdu",
     contract_start_date: str | None = None,
+    **options: Any,
 ) -> dict[str, Any]:
     """Async wrapper for multi-dimension time-series collection."""
     return await asyncio.to_thread(
-        fetch_monitoring_pdu_timeseries_sync,
-        raw_data=raw_data,
-        days=days,
-        account=account,
-        dimension=dimension,
-        contract_start_date=contract_start_date,
-        explicit_token=explicit_token,
+        lambda: fetch_monitoring_pdu_timeseries_sync(
+            raw_data=raw_data,
+            days=days,
+            account=account,
+            dimension=dimension,
+            contract_start_date=contract_start_date,
+            explicit_token=explicit_token,
+            **options,
+        )
     )
 
 
@@ -2772,10 +3780,14 @@ def _resolve_effective_regions(
 ) -> tuple[list[str], int, bool]:
     """Determine active regions for an environment considering manual overrides."""
     override_key = f"{org_meta.org_name}:{env_name}"
-    if override_key not in region_overrides:
+    if override_key in region_overrides:
+        raw_override = region_overrides[override_key]
+    elif org_meta.org_name in region_overrides:
+        raw_override = region_overrides[org_meta.org_name]
+    else:
         return orig_regions, len(orig_regions), False
 
-    r_count = max(0, int(region_overrides[override_key]))
+    r_count = max(0, int(raw_override))
     if r_count == len(orig_regions):
         return orig_regions, r_count, True
     if r_count < len(orig_regions):
@@ -2809,10 +3821,12 @@ def _resolve_env_call_metrics(env: dict[str, Any]) -> tuple[int, int, int, int, 
     std_calls = int(env.get("standardApiCalls", 0))
     envoy_calls = int(env.get("envoyApiCalls", 0))
     ext_calls = int(env.get("extensibleApiCalls", 0))
-    raw_calls = int(env.get("rawApiCalls", std_calls + ext_calls))
-    env_yearly_calls = int(env.get("yearlyApiCalls", 0))
-    if env_yearly_calls == 0 and (std_calls > 0 or ext_calls > 0):
+    if std_calls > 0 or ext_calls > 0:
+        raw_calls = std_calls + ext_calls
         env_yearly_calls = _compute_weighted_entitlement_calls(std_calls, envoy_calls, ext_calls)
+    else:
+        raw_calls = int(env.get("rawApiCalls", 0))
+        env_yearly_calls = int(env.get("yearlyApiCalls", 0))
     return std_calls, envoy_calls, ext_calls, raw_calls, env_yearly_calls
 
 
@@ -2834,6 +3848,30 @@ def _resolve_env_region_caution(
     return region_caution
 
 
+def _build_env_pdu_breakdown(
+    std_p: int,
+    ext_p: int,
+    sf_p: int,
+    r_count: int,
+    include_sf: bool,
+) -> dict[str, int]:
+    """Compute proxy, shared flow, and PDU inventory breakdown for one environment."""
+    tot_p = std_p + ext_p
+    sf_pdus = (sf_p * r_count) if include_sf else 0
+    return {
+        "standardProxies": std_p,
+        "extensibleProxies": ext_p,
+        "totalProxies": tot_p,
+        "sharedFlows": sf_p,
+        "totalArtifacts": tot_p + (sf_p if include_sf else 0),
+        "standardProxyPdus": std_p * r_count,
+        "extensibleProxyPdus": ext_p * r_count,
+        "proxyOnlyPdus": tot_p * r_count,
+        "sharedFlowPdus": sf_pdus,
+        "totalPdus": (tot_p * r_count) + sf_pdus,
+    }
+
+
 def _build_env_recalculated_record(
     env: dict[str, Any],
     meta: OrgRecalculateMeta,
@@ -2846,12 +3884,13 @@ def _build_env_recalculated_record(
     r_count = len(effective_regions)
     std_p = int(env.get("standardProxies", 0))
     ext_p = int(env.get("extensibleProxies", 0))
-    tot_p = std_p + ext_p
     sf_p = int(env.get("sharedFlows", 0))
-    env_total_pdus = (tot_p * r_count) + ((sf_p * r_count) if cfg.include_shared_flows else 0)
+    pdu_info = _build_env_pdu_breakdown(std_p, ext_p, sf_p, r_count, cfg.include_shared_flows)
     std_calls, envoy_calls, ext_calls, raw_calls, env_yearly_calls = _resolve_env_call_metrics(env)
-    extra = _build_env_formula_and_shares(tot_p, sf_p, r_count, env_total_pdus, env_yearly_calls, cfg)
-    region_caution = _resolve_env_region_caution(env, meta, tot_p + sf_p, is_overridden)
+    extra = _build_env_formula_and_shares(
+        pdu_info["totalProxies"], sf_p, r_count, pdu_info["totalPdus"], env_yearly_calls, cfg
+    )
+    region_caution = _resolve_env_region_caution(env, meta, pdu_info["totalProxies"] + sf_p, is_overridden)
 
     return {
         "organization": meta.org_name,
@@ -2866,22 +3905,15 @@ def _build_env_recalculated_record(
         "environmentUnits": r_count,
         "regionCaution": region_caution,
         "isOverridden": is_overridden,
-        "standardProxies": std_p,
-        "extensibleProxies": ext_p,
-        "totalProxies": tot_p,
-        "sharedFlows": sf_p,
-        "totalArtifacts": tot_p + (sf_p if cfg.include_shared_flows else 0),
-        "standardProxyPdus": std_p * r_count,
-        "extensibleProxyPdus": ext_p * r_count,
-        "proxyOnlyPdus": tot_p * r_count,
-        "sharedFlowPdus": sf_p * r_count,
-        "totalPdus": env_total_pdus,
+        **pdu_info,
         "standardApiCalls": std_calls,
         "envoyApiCalls": envoy_calls,
         "extensibleApiCalls": ext_calls,
         "rawApiCalls": raw_calls,
         "yearlyApiCalls": env_yearly_calls,
         "callsSource": env.get("callsSource", "APIGEE_ANALYTICS"),
+        "callsStatus": env.get("callsStatus", "OK"),
+        "trafficErrors": list(env.get("trafficErrors", [])),
         **extra,
     }
 
@@ -2990,6 +4022,8 @@ def _build_recalculated_org_record(
         "projectId": meta.project_id,
         "status": org.get("status", "OK"),
         "error": org.get("error"),
+        "callsStatus": _resolve_org_calls_status(org_envs_out) if org_envs_out else str(org.get("callsStatus") or "OK"),
+        "trafficErrors": list(org.get("trafficErrors", [])),
         "runtimeType": meta.runtime_type,
         "billingType": meta.billing_type,
         "subscriptionPlan": org.get("subscriptionPlan", "Enterprise"),
@@ -3074,8 +4108,13 @@ def _compute_calls_quota_metrics(
         "remainingYearlyCalls": max(0, entitlement_yearly_calls - total_calls),
         "overageYearlyCalls": max(0, total_calls - entitlement_yearly_calls),
         "callsQuotaStatus": (
-            "OVER_LIMIT" if total_calls > entitlement_yearly_calls
-            else ("WARNING" if calls_util_pct >= 85 else "HEALTHY")
+            "OVER_LIMIT"
+            if total_calls > entitlement_yearly_calls
+            else (
+                "WARNING"
+                if (calls_util_pct >= 85 or projected_calls > entitlement_yearly_calls)
+                else "HEALTHY"
+            )
         ),
     }
 
@@ -3101,7 +4140,7 @@ def _compute_quota_summary(
         "remainingPdus": max(0, entitlement_pdu - total_pdus),
         "overagePdus": overage_pdus,
         "recommendedAddOnPacks50": math.ceil(overage_pdus / 50) if overage_pdus > 0 else 0,
-        "quotaStatus": "OVER_LIMIT" if util_pct > 100 else ("WARNING" if util_pct >= 85 else "HEALTHY"),
+        "quotaStatus": "OVER_LIMIT" if total_pdus > entitlement_pdu else ("WARNING" if util_pct >= 85 else "HEALTHY"),
         "entitlementEnvs": entitlement_envs,
         "envUtilizationPct": env_util_pct,
         "remainingEnvs": max(0, entitlement_envs - total_env_units),
@@ -3121,6 +4160,7 @@ def _aggregate_org_metrics(organizations_out: list[dict[str, Any]]) -> dict[str,
     metrics = {
         "apigeeXOrgs": 0,
         "apigeeHybridOrgs": 0,
+        "errorOrgs": 0,
         "apigeeXPdus": 0,
         "apigeeHybridPdus": 0,
         "totalDeployedProxies": 0,
@@ -3131,11 +4171,13 @@ def _aggregate_org_metrics(organizations_out: list[dict[str, Any]]) -> dict[str,
         "sharedFlowPdus": 0,
     }
     for o in organizations_out:
-        is_hybrid = o.get("runtimeType") == "HYBRID"
-        if is_hybrid:
+        if o.get("status") == "ERROR":
+            metrics["errorOrgs"] += 1
+        r_type = o.get("runtimeType")
+        if r_type == "HYBRID":
             metrics["apigeeHybridOrgs"] += 1
             metrics["apigeeHybridPdus"] += o.get("totalPdus", 0)
-        else:
+        elif r_type != "UNKNOWN":
             metrics["apigeeXOrgs"] += 1
             metrics["apigeeXPdus"] += o.get("totalPdus", 0)
         metrics["totalDeployedProxies"] += o.get("deployedProxiesCount", 0)
@@ -3203,6 +4245,19 @@ def _build_recalculated_portfolio_payload(
 ) -> dict[str, Any]:
     """Assemble final recalculated portfolio dictionary."""
     organizations_out, all_envs_out, all_deps_out = org_results
+    excl_names = list(raw_data.get("excludedBillingOrganizations") or [])
+    excl_details = _extract_excluded_billing_details(
+        (), raw_data.get("excludedBillingDetails"), excluded_names=excl_names
+    )
+    disabled_envs = [
+        {
+            "organization": e["organization"],
+            "environment": e["environment"],
+            "totalPdus": e.get("totalPdus", 0),
+        }
+        for e in all_envs_out
+        if e.get("callsStatus") == "ANALYTICS_DISABLED"
+    ]
     return {
         "collectedAt": raw_data.get("collectedAt"),
         "source": raw_data.get("source", "DEMO_DATASET"),
@@ -3210,6 +4265,7 @@ def _build_recalculated_portfolio_payload(
         "account": raw_data.get("account"),
         "apiEndpoint": raw_data.get("apiEndpoint"),
         "totalAuthorizedOrgs": raw_data.get("totalAuthorizedOrgs", len(organizations_out)),
+        "totalDiscoveredOrgs": raw_data.get("totalDiscoveredOrgs", len(organizations_out) + len(excl_names)),
         "settings": {
             "entitlementPdu": cfg.entitlement_pdu,
             "entitlementEnvs": cfg.entitlement_envs,
@@ -3222,6 +4278,12 @@ def _build_recalculated_portfolio_payload(
         "organizations": organizations_out,
         "environments": all_envs_out,
         "deployments": all_deps_out,
+        "trafficErrors": raw_data.get("trafficErrors", []),
+        "affectedTrafficOrganizations": raw_data.get("affectedTrafficOrganizations", []),
+        "analyticsDisabledEnvironments": disabled_envs,
+        "excludedOrganizations": raw_data.get("excludedOrganizations", []),
+        "excludedBillingOrganizations": excl_names,
+        "excludedBillingDetails": excl_details,
     }
 
 
@@ -3236,6 +4298,28 @@ def _sum_portfolio_organization_totals(organizations_out: list[dict[str, Any]]) 
         "rawApiCalls": sum(o.get("rawApiCalls", 0) for o in organizations_out),
         "yearlyApiCalls": sum(o["yearlyApiCalls"] for o in organizations_out),
     }
+
+
+def _prepare_effective_raw_for_recalc(raw_data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Filter raw dataset organizations into Subscription orgs and enrich excluded billing lists."""
+    sub_orgs, excluded_billing = filter_subscription_organizations(raw_data.get("organizations", []))
+    merged_excl_billing = sorted(
+        set(raw_data.get("excludedBillingOrganizations") or []) | set(excluded_billing),
+        key=str.lower,
+    )
+    merged_excl_details = _extract_excluded_billing_details(
+        raw_data.get("organizations", []),
+        raw_data.get("excludedBillingDetails"),
+        excluded_names=merged_excl_billing,
+    )
+    tot_auth = len(sub_orgs) if excluded_billing else raw_data.get("totalAuthorizedOrgs", len(sub_orgs))
+    return {
+        **raw_data,
+        "organizations": sub_orgs,
+        "totalAuthorizedOrgs": tot_auth,
+        "excludedBillingOrganizations": merged_excl_billing,
+        "excludedBillingDetails": merged_excl_details,
+    }, sub_orgs
 
 
 def recalculate_portfolio(
@@ -3260,16 +4344,16 @@ def recalculate_portfolio(
         region_overrides=region_overrides or {},
     )
     period_info = resolve_contract_period(contract_start)
-    org_results = _recalculate_all_organizations(raw_data.get("organizations", []), cfg)
+    effective_raw, sub_orgs = _prepare_effective_raw_for_recalc(raw_data)
+    org_results = _recalculate_all_organizations(sub_orgs, cfg)
     organizations_out, all_envs_out, _ = org_results
-
     portfolio_totals = _sum_portfolio_organization_totals(organizations_out)
     quota_summary = _compute_quota_summary(
         portfolio_totals, period_info, cfg.entitlement_pdu, cfg.entitlement_envs, cfg.entitlement_yearly_calls
     )
     summary = _build_portfolio_summary(organizations_out, all_envs_out, portfolio_totals, quota_summary)
     return _build_recalculated_portfolio_payload(
-        raw_data, cfg, period_info["contractStartDate"], summary, org_results
+        effective_raw, cfg, period_info["contractStartDate"], summary, org_results
     )
 
 
@@ -3646,7 +4730,7 @@ def _build_demo_org(org_spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_demo_dataset() -> dict[str, Any]:
+def get_demo_dataset(*, populate_calls: bool = True) -> dict[str, Any]:
     """Generates a realistic multi-organization Apigee X + Apigee Hybrid dataset."""
     organizations = [_build_demo_org(spec) for spec in _DEMO_SPECS]
     demo_payload: dict[str, Any] = {
@@ -3655,5 +4739,6 @@ def get_demo_dataset() -> dict[str, Any]:
         "authSource": "Sample Multi-Org Dataset (2 Apigee X + 2 Apigee Hybrid)",
         "organizations": organizations,
     }
-    populate_contract_api_calls_sync(demo_payload)
+    if populate_calls:
+        populate_contract_api_calls_sync(demo_payload)
     return demo_payload

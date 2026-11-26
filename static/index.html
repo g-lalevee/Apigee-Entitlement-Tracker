@@ -1,14 +1,19 @@
 <!DOCTYPE html>
+<!--
+  Copyright 2026 The Apigee Entitlement Tracker Authors
+  SPDX-License-Identifier: Apache-2.0
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
   <title>Apigee Entitlement Tracker</title>
   <link rel="icon" href="/static/apigee-logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261116-1" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261125-6" />
 </head>
 <body>
 
@@ -60,13 +65,19 @@
       </div>
 
 
-      <!-- Action Buttons: Exactly 1 Enter button (frozen if token expired/missing), 1 Authenticate/Change Account button -->
-      <div class="login-actions-group">
+      <!-- Token verification state (shown until /api/auth-status finishes testing token) -->
+      <div id="login-auth-checking" class="login-auth-checking" role="status">
+        <span class="scan-pulse-dot" aria-hidden="true"></span>
+        <span>Checking authentication token...</span>
+      </div>
+
+      <!-- Action Buttons: revealed only after token check resolves Enter Dashboard (blue or grayed) -->
+      <div id="login-actions-group" class="login-actions-group" hidden>
         <button id="btn-enter-app" type="button" class="btn btn-primary btn-lg btn-enter-action btn-frozen" disabled title="Authentication mandatory: token expired or missing">
           <span id="btn-enter-app-text">&#128274; Enter Dashboard</span>
         </button>
 
-        <button id="btn-authenticate-account" type="button" class="btn btn-google-login">
+        <button id="btn-authenticate-account" type="button" class="btn btn-google-login" hidden>
           <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
             <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
             <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
@@ -78,8 +89,9 @@
       </div>
 
       <!-- Error message container -->
-      <div id="login-error-box" class="login-error-box" style="display: none;"></div>
-    </section>
+      <div id="login-error-box" class="login-error-box" style="display: none;" role="alert"></div>
+    </div>
+  </section>
 
 
 
@@ -122,13 +134,27 @@
               <h1>Apigee Entitlement Tracker</h1>
               <div class="brand-subtitle-row">
                 <span class="brand-subtitle" id="header-account-subtitle">GCP User: —</span>
-                <span id="header-token-badge" class="token-pill token-pill-active" style="display: none;">User Token Active</span>
                 <span id="header-jurisdiction-badge" class="token-pill jurisdiction-pill">Control Plane: Global</span>
               </div>
             </div>
           </div>
 
           <div class="header-actions">
+            <button
+              id="btn-excluded-orgs-warning"
+              type="button"
+              class="btn btn-sm icon-btn scope-warning-btn"
+              style="display: none;"
+              title="Excluded Non-Subscription Organizations (PAYG / Trial)"
+              aria-label="View Excluded Non-Subscription Organizations"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+              </svg>
+              <span id="excluded-orgs-badge-count" class="scope-warning-count" aria-hidden="true">0</span>
+            </button>
             <button
               id="btn-theme-toggle"
               type="button"
@@ -195,6 +221,24 @@
             <button type="button" id="btn-banner-add-token" class="btn btn-sm btn-outline">
               Add User Token
             </button>
+          </div>
+
+          <!-- Apigee Analytics Disabled / Partial Traffic Warning Banner -->
+          <div id="dashboard-analytics-warning" class="dashboard-analytics-warning glass-card" style="display: none;" role="status">
+            <div class="analytics-warning-top">
+              <div class="analytics-warning-header">
+                <span class="analytics-warning-badge">NO ANALYTICS / PARTIAL</span>
+                <span id="analytics-warning-text" class="analytics-warning-text"></span>
+              </div>
+              <button
+                type="button"
+                id="btn-close-analytics-warning"
+                class="btn-close analytics-warning-close"
+                title="Close warning"
+                aria-label="Close analytics warning"
+              >&times;</button>
+            </div>
+            <div id="analytics-warning-chips" class="analytics-warning-chips"></div>
           </div>
 
           <!-- Scan Progress Banner -->
@@ -292,9 +336,9 @@
             <!-- Entitlement Dimension Cards -->
             <div class="stacked-metrics">
               <!-- Dimension 1: Proxy Deployment Units (PDUs) -->
-              <div class="glass-card stat-mini-card dimension-card active" data-dim="pdu">
+              <div class="glass-card stat-mini-card dimension-card active" data-dim="pdu" role="button" tabindex="0" aria-pressed="true">
                 <div class="stat-icon-circle">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
                 </div>
                 <div class="stat-info" style="flex: 1;">
                   <div class="limit-inline-row">
@@ -316,9 +360,9 @@
               </div>
 
               <!-- Dimension 2: Environment Units (Env × Regions) -->
-              <div class="glass-card stat-mini-card dimension-card" data-dim="environments">
+              <div class="glass-card stat-mini-card dimension-card" data-dim="environments" role="button" tabindex="0" aria-pressed="false">
                 <div class="stat-icon-circle">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
                 </div>
                 <div class="stat-info" style="flex: 1;">
                   <div class="limit-inline-row">
@@ -338,9 +382,9 @@
               </div>
 
               <!-- Dimension 3: Yearly API Calls -->
-              <div class="glass-card stat-mini-card dimension-card" data-dim="calls">
+              <div class="glass-card stat-mini-card dimension-card" data-dim="calls" role="button" tabindex="0" aria-pressed="false">
                 <div class="stat-icon-circle">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                 </div>
                 <div class="stat-info" style="flex: 1;">
                   <div class="limit-inline-row">
@@ -382,17 +426,17 @@
               </div>
 
               <!-- Dimension Selector -->
-              <div class="gauge-dim-pills" role="tablist" aria-label="Select Gauge Dimension">
-                <button type="button" class="gauge-dim-btn active" data-gauge-dim="pdu">PDUs</button>
-                <button type="button" class="gauge-dim-btn" data-gauge-dim="environments">Env Units</button>
-                <button type="button" class="gauge-dim-btn" data-gauge-dim="calls">Yearly Calls</button>
+              <div class="gauge-dim-pills" role="group" aria-label="Select Gauge Dimension">
+                <button type="button" class="gauge-dim-btn active" data-gauge-dim="pdu" aria-pressed="true">PDUs</button>
+                <button type="button" class="gauge-dim-btn" data-gauge-dim="environments" aria-pressed="false">Env Units</button>
+                <button type="button" class="gauge-dim-btn" data-gauge-dim="calls" aria-pressed="false">Yearly Calls</button>
               </div>
 
               <div class="overview-gauge-body">
                 <!-- Ring Gauge -->
                 <div class="donut-wrap">
-                  <svg width="168" height="168" viewBox="0 0 168 168" class="donut-svg">
-                    <circle cx="84" cy="84" r="64" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="16" />
+                  <svg width="168" height="168" viewBox="0 0 168 168" class="donut-svg" aria-hidden="true">
+                    <circle class="donut-track-ring" cx="84" cy="84" r="64" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="16" />
                     <circle
                       id="donut-progress-ring"
                       cx="84"
@@ -462,17 +506,17 @@
                   id="org-dropdown-btn"
                   type="button"
                   class="select-control org-dropdown-trigger"
-                  aria-haspopup="listbox"
                   aria-expanded="false"
+                  aria-controls="org-dropdown-menu"
                 >
                   <span id="org-dropdown-label">All Authorized Organizations</span>
-                  <svg class="dropdown-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                  <svg class="dropdown-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="6 9 12 15 18 9"></polyline>
                   </svg>
                 </button>
 
                 <!-- Organization Dropdown Menu -->
-                <div id="org-dropdown-menu" class="org-dropdown-menu" role="listbox" aria-multiselectable="true">
+                <div id="org-dropdown-menu" class="org-dropdown-menu" role="group" aria-label="Organization Filter Options">
                   <div class="org-dropdown-toolbar">
                     <span id="org-selection-summary" class="org-selection-badge">All Selected</span>
                     <div class="org-dropdown-actions">
@@ -570,7 +614,7 @@
                   <span id="calls-chart-limit-pill" class="chart-status-pill below">UNDER YEARLY LIMIT</span>
                 </div>
                 <p class="chart-subtitle" id="calls-chart-subtitle">
-                  Source: <code>Apigee Analytics (14m retention) + Cloud Monitoring</code> &bull; Loading monthly call volume...
+                  Source: <code>Apigee Analytics (up to 14m retention)</code> &bull; Loading monthly call volume...
                 </p>
               </div>
               <div class="chart-controls">
@@ -764,8 +808,46 @@
     </div>
   </div>
 
+  <!-- Traffic Analytics Error Modal -->
+  <div id="modal-traffic-error" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="traffic-error-modal-title">
+    <div class="modal-card glass-window" style="max-width: 540px;">
+      <div class="modal-header">
+        <h3 id="traffic-error-modal-title" class="traffic-error-title">API Call Analytics Warning</h3>
+        <button type="button" id="btn-close-traffic-error-modal" class="btn-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="traffic-error-modal-message" style="margin: 0 0 0.75rem 0; font-size: 0.9rem; color: var(--text-secondary);">
+          Some Apigee Analytics queries failed after retrying. Organization PDUs and Environment Units were retained; affected API call counts are marked PARTIAL / ERROR.
+        </p>
+        <ul id="traffic-error-modal-list" style="margin: 0 0 1rem 0; padding-left: 1.2rem; max-height: 180px; overflow-y: auto; font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; color: var(--text-muted);"></ul>
+        <div style="display: flex; justify-content: flex-end; gap: 0.65rem;">
+          <button type="button" id="btn-dismiss-traffic-error" class="btn btn-sm btn-outline">Dismiss</button>
+          <button type="button" id="btn-retry-traffic-scan" class="btn btn-sm btn-primary">Retry Scan</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Native Dialog: Scope & Excluded Organizations Popup -->
+  <dialog id="modal-excluded-orgs" class="scope-dialog modal-card glass-window" closedby="any" aria-labelledby="excluded-orgs-modal-title">
+    <div class="modal-header">
+      <div class="scope-dialog-title-row">
+        <span class="scope-banner-badge">SCOPE</span>
+        <h3 id="excluded-orgs-modal-title">Included &amp; Excluded Organizations</h3>
+      </div>
+      <form method="dialog">
+        <button type="submit" class="btn-close" aria-label="Close">&times;</button>
+      </form>
+    </div>
+    <div class="modal-body scope-dialog-body">
+      <p id="excluded-orgs-modal-included" class="scope-dialog-summary"></p>
+      <p id="excluded-orgs-modal-summary" class="scope-dialog-sub"></p>
+      <div id="excluded-orgs-modal-list" class="excluded-orgs-modal-list"></div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast-notification" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20261116-1"></script>
+  <script src="/static/app.js?v=20261125-6"></script>
 
 
 </body>

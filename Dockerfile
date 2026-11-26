@@ -1,3 +1,6 @@
+# Copyright 2026 The Apigee Entitlement Tracker Authors
+# SPDX-License-Identifier: Apache-2.0
+
 FROM python:3.12-slim
 
 # Prevent Python from writing bytecode and enable unbuffered logging

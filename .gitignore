@@ -6,7 +6,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Runtime state, cached scan data, and local exports (never commit live org data)
+# Runtime state, cached scan data, local tests, and local exports (never commit live org data)
 data/
 exports/
 pdu_limit.json

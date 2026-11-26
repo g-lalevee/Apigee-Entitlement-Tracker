@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Apigee Entitlement Tracker Authors
+# SPDX-License-Identifier: Apache-2.0
 # ==============================================================================
 # setup_oauth_cloudrun.sh
 #
@@ -17,6 +19,9 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
 # ANSI color codes
 BOLD='\033[1m'
 GREEN='\033[0;32m'
@@ -34,8 +39,16 @@ SECRET_CLIENT_ID="apigee-tracker-oauth-client-id"
 SECRET_CLIENT_SECRET="apigee-tracker-oauth-client-secret"
 DEPLOY_FROM_SOURCE=false
 SKIP_DEPLOY=false
+REQUIRE_IAM_AUTH=false
 CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
 CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-}"
+
+require_arg() {
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    echo -e "${RED}Error: Option '$1' requires a non-empty value.${NC}" >&2
+    exit 1
+  fi
+}
 
 print_usage() {
   echo -e "${BOLD}Usage:${NC} $(basename "$0") [OPTIONS]"
@@ -47,47 +60,58 @@ print_usage() {
   echo -e "  --region <REGION>         GCP Region (default: ${REGION})"
   echo -e "  --service <SERVICE_NAME>  Cloud Run service name (default: ${SERVICE_NAME})"
   echo -e "  --deploy-source           Rebuild & deploy from current source code with secrets"
+  echo -e "  --require-iam-auth        Deploy with --no-allow-unauthenticated (for IAP / IAM-gated access)"
   echo -e "  --skip-deploy             Only create secrets and IAM bindings; skip Cloud Run update"
   echo -e "  -h, --help                Show this help message"
   echo ""
   echo -e "${BOLD}Examples:${NC}"
   echo -e "  # Interactive prompt"
-  echo -e "  ./scripts/setup_oauth_cloudrun.sh"
+  echo -e "  ./scripts/setup_oauth_cloudrun.sh --project my-gcp-project --region europe-west1"
   echo ""
   echo -e "  # Automated with arguments"
   echo -e "  ./scripts/setup_oauth_cloudrun.sh \\"
+  echo -e "    --project my-gcp-project --region europe-west1 \\"
   echo -e "    --client-id \"project_id-xxx.apps.googleusercontent.com\" \\"
   echo -e "    --client-secret \"GOCSPX-xxx\""
   echo ""
   echo -e "  # Deploy current source with secrets"
-  echo -e "  ./scripts/setup_oauth_cloudrun.sh --deploy-source"
+  echo -e "  ./scripts/setup_oauth_cloudrun.sh --project my-gcp-project --region europe-west1 --deploy-source"
 }
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --client-id)
+      require_arg "$@"
       CLIENT_ID="$2"
       shift 2
       ;;
     --client-secret)
+      require_arg "$@"
       CLIENT_SECRET="$2"
       shift 2
       ;;
     --project)
+      require_arg "$@"
       PROJECT_ID="$2"
       shift 2
       ;;
     --region)
+      require_arg "$@"
       REGION="$2"
       shift 2
       ;;
     --service)
+      require_arg "$@"
       SERVICE_NAME="$2"
       shift 2
       ;;
     --deploy-source)
       DEPLOY_FROM_SOURCE=true
+      shift
+      ;;
+    --require-iam-auth)
+      REQUIRE_IAM_AUTH=true
       shift
       ;;
     --skip-deploy)
@@ -105,6 +129,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "${PROJECT_ID}" || "${PROJECT_ID}" == "<YOUR-PROJECT-ID>" ]]; then
+  echo -e "${RED}Error: GCP Project ID is required. Pass --project <PROJECT_ID> or set GCP_PROJECT.${NC}" >&2
+  exit 1
+fi
+if [[ -z "${REGION}" || "${REGION}" == "<YOUR-REGION>" ]]; then
+  echo -e "${RED}Error: GCP Region is required. Pass --region <REGION> or set GCP_REGION.${NC}" >&2
+  exit 1
+fi
 
 echo -e "${BOLD}${CYAN}====================================================================${NC}"
 echo -e "${BOLD}${CYAN}   Apigee Entitlement Tracker - OAuth 2.0 Cloud Run Setup          ${NC}"
@@ -127,18 +160,21 @@ SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
   --region "${REGION}" \
   --format="value(status.url)" 2>/dev/null || echo "")
 
+SERVICE_EXISTS=true
 if [[ -z "${SERVICE_URL}" ]]; then
-  echo -e "${YELLOW}Warning: Cloud Run service '${SERVICE_NAME}' not found in ${REGION}. Using default URL pattern.${NC}"
+  SERVICE_EXISTS=false
+  echo -e "${YELLOW}Warning: Cloud Run service '${SERVICE_NAME}' not found in ${REGION}. Will deploy initial service from source.${NC}"
   PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)" 2>/dev/null || echo "default-project-number")
   SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 fi
 
 REDIRECT_URI_CLOUDRUN="${SERVICE_URL}/api/auth/oidc/callback"
+REDIRECT_URI_LOOPBACK="http://127.0.0.1:8080/api/auth/oidc/callback"
 REDIRECT_URI_LOCAL="http://localhost:8080/api/auth/oidc/callback"
 
 echo -e "Service URL:             ${GREEN}${SERVICE_URL}${NC}"
 echo -e "Cloud Run Callback URI:  ${GREEN}${REDIRECT_URI_CLOUDRUN}${NC}"
-echo -e "Localhost Callback URI:  ${GREEN}${REDIRECT_URI_LOCAL}${NC}"
+echo -e "Local Callback URIs:     ${GREEN}${REDIRECT_URI_LOOPBACK}${NC} , ${GREEN}${REDIRECT_URI_LOCAL}${NC}"
 echo ""
 
 # Prompt for OAuth Client Credentials if not passed
@@ -153,8 +189,9 @@ if [[ -z "${CLIENT_ID}" || -z "${CLIENT_SECRET}" ]]; then
   echo -e "2. Configure the client:"
   echo -e "   • Application type: ${BOLD}Web application${NC}"
   echo -e "   • Name:             ${BOLD}Apigee Entitlement Tracker${NC}"
-  echo -e "   • Authorized redirect URIs (add both):"
+  echo -e "   • Authorized redirect URIs (add all needed):"
   echo -e "     ${BOLD}${REDIRECT_URI_CLOUDRUN}${NC}"
+  echo -e "     ${BOLD}${REDIRECT_URI_LOOPBACK}${NC}"
   echo -e "     ${BOLD}${REDIRECT_URI_LOCAL}${NC}"
   echo ""
   echo -e "3. Click ${BOLD}'CREATE'${NC} and copy the generated credentials."
@@ -176,9 +213,11 @@ if [[ -z "${CLIENT_ID}" || -z "${CLIENT_SECRET}" ]]; then
   exit 1
 fi
 
-# Clean values
-CLIENT_ID=$(echo "${CLIENT_ID}" | xargs)
-CLIENT_SECRET=$(echo "${CLIENT_SECRET}" | xargs)
+# Trim leading/trailing whitespace safely in pure Bash without spawning subprocesses or mangling quotes
+CLIENT_ID="${CLIENT_ID#"${CLIENT_ID%%[![:space:]]*}"}"
+CLIENT_ID="${CLIENT_ID%"${CLIENT_ID##*[![:space:]]}"}"
+CLIENT_SECRET="${CLIENT_SECRET#"${CLIENT_SECRET%%[![:space:]]*}"}"
+CLIENT_SECRET="${CLIENT_SECRET%"${CLIENT_SECRET##*[![:space:]]}"}"
 
 # Step 2: Store in Secret Manager
 echo ""
@@ -250,13 +289,23 @@ else
   echo -e "${BOLD}${BLUE}Step 4: Updating Cloud Run service with Secret Manager bindings...${NC}"
 
   SECRETS_PARAM="GOOGLE_CLIENT_ID=${SECRET_CLIENT_ID}:latest,GOOGLE_CLIENT_SECRET=${SECRET_CLIENT_SECRET}:latest"
+  AUTH_FLAG="--allow-unauthenticated"
+  if [[ "${REQUIRE_IAM_AUTH}" == true ]]; then
+    AUTH_FLAG="--no-allow-unauthenticated"
+  fi
 
-  if [[ "${DEPLOY_FROM_SOURCE}" == true ]]; then
-    echo -e "  Rebuilding and deploying from source code..."
+  if [[ "${DEPLOY_FROM_SOURCE}" == true || "${SERVICE_EXISTS}" == false ]]; then
+    echo -e "  Building and deploying Cloud Run service from source..."
     gcloud run deploy "${SERVICE_NAME}" \
       --source . \
       --project "${PROJECT_ID}" \
       --region "${REGION}" \
+      --service-account="${RUN_SA}" \
+      --session-affinity \
+      --memory="1Gi" \
+      --cpu="1" \
+      --port=8080 \
+      "${AUTH_FLAG}" \
       --set-secrets="${SECRETS_PARAM}" \
       --quiet
   else
@@ -264,8 +313,18 @@ else
     gcloud run services update "${SERVICE_NAME}" \
       --project "${PROJECT_ID}" \
       --region "${REGION}" \
+      --session-affinity \
       --set-secrets="${SECRETS_PARAM}" \
       --quiet
+  fi
+
+  ACTUAL_URL=$(gcloud run services describe "${SERVICE_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --format="value(status.url)" 2>/dev/null || echo "")
+  if [[ -n "${ACTUAL_URL}" && "${ACTUAL_URL}" != "${SERVICE_URL}" ]]; then
+    echo -e "${YELLOW}Note: Deployed service URL is ${ACTUAL_URL}. Ensure '${ACTUAL_URL}/api/auth/oidc/callback' is in your OAuth Client's Authorized Redirect URIs.${NC}"
+    SERVICE_URL="${ACTUAL_URL}"
   fi
 
   echo -e "${GREEN}✓ Cloud Run service updated with OAuth 2.0 secrets.${NC}"
@@ -276,7 +335,13 @@ echo ""
 echo -e "${BOLD}${BLUE}Step 5: Verifying service configuration...${NC}"
 
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}" || echo "000")
-echo -e "  Health Check Status: ${GREEN}HTTP ${HTTP_STATUS}${NC}"
+if [[ "${HTTP_STATUS}" =~ ^2[0-9][0-9]$ || "${HTTP_STATUS}" =~ ^3[0-9][0-9]$ ]]; then
+  echo -e "  Health Check Status: ${GREEN}HTTP ${HTTP_STATUS} (Healthy)${NC}"
+elif [[ "${HTTP_STATUS}" == "401" || "${HTTP_STATUS}" == "403" ]]; then
+  echo -e "  Health Check Status: ${YELLOW}HTTP ${HTTP_STATUS} (IAM/IAP gated)${NC}"
+else
+  echo -e "  Health Check Status: ${RED}HTTP ${HTTP_STATUS} (Unreachable or error)${NC}"
+fi
 
 echo ""
 echo -e "${BOLD}${GREEN}====================================================================${NC}"
@@ -288,8 +353,7 @@ echo -e "Application URL: ${BOLD}${CYAN}${SERVICE_URL}${NC}"
 echo ""
 echo -e "Next steps:"
 echo -e "1. Visit ${CYAN}${SERVICE_URL}${NC}"
-echo -e "2. Click ${BOLD}'Sign in with Google (OAuth 2.0)'${NC}"
-echo -e "3. Grant consent on the Google screen"
-echo -e "4. The app will automatically enter the dashboard and query all organizations"
-echo -e "   using your personal user IAM identity!"
+echo -e "2. Click ${BOLD}'Authenticate with Google'${NC} and grant consent"
+echo -e "3. Click ${BOLD}'Enter Dashboard'${NC} to audit all organizations authorized"
+echo -e "   for your personal user IAM identity!"
 echo ""

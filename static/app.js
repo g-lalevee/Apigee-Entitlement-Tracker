@@ -1,4 +1,13 @@
 /**
+ * Copyright 2026 The Apigee Entitlement Tracker Authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Apigee Entitlement Tracker — Frontend Dashboard Controller
  */
 
@@ -15,10 +24,15 @@ function isLightTheme() {
 
 function applyTheme(theme) {
   const mode = theme === 'light' ? 'light' : 'dark';
+  const schemeMeta = document.querySelector('meta[name="color-scheme"]');
   if (mode === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
     document.body.setAttribute('data-theme', 'light');
+    if (schemeMeta) schemeMeta.setAttribute('content', 'light');
   } else {
+    document.documentElement.removeAttribute('data-theme');
     document.body.removeAttribute('data-theme');
+    if (schemeMeta) schemeMeta.setAttribute('content', 'dark');
   }
   try {
     localStorage.setItem('apigee_pdu_theme', mode);
@@ -106,37 +120,39 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function formatFootprint(runtimeType) {
   if (runtimeType === 'HYBRID') {
     return '<span class="badge badge-hybrid">HYBRID</span>';
   }
+  if (runtimeType === 'UNKNOWN') {
+    return '<span class="calls-status-badge error" title="Organization metadata query failed">UNKNOWN</span>';
+  }
   return '<span class="badge badge-x">APIGEE X</span>';
 }
 
+let inMemoryUserToken = '';
+
+function purgeLegacyBrowserTokens() {
+  try { sessionStorage.removeItem('apigee_user_access_token'); } catch (_) {}
+  try { localStorage.removeItem('apigee_user_access_token'); } catch (_) {}
+}
+
 function getStoredUserToken() {
-  try {
-    return sessionStorage.getItem('apigee_user_access_token') || localStorage.getItem('apigee_user_access_token') || '';
-  } catch (_) {
-    return '';
-  }
+  return inMemoryUserToken;
 }
 
 function setStoredUserToken(token) {
-  if (token && token.trim()) {
-    try { sessionStorage.setItem('apigee_user_access_token', token.trim()); } catch (_) {}
-    try { localStorage.setItem('apigee_user_access_token', token.trim()); } catch (_) {}
-  } else {
-    try { sessionStorage.removeItem('apigee_user_access_token'); } catch (_) {}
-    try { localStorage.removeItem('apigee_user_access_token'); } catch (_) {}
-  }
+  inMemoryUserToken = token && token.trim() ? token.trim() : '';
+  purgeLegacyBrowserTokens();
 }
 
 async function apiFetch(url, options = {}) {
   const token = getStoredUserToken();
-  const opts = { ...options };
+  const opts = { credentials: 'same-origin', ...options };
   opts.headers = { ...(options.headers || {}) };
   if (token && !opts.headers['Authorization']) {
     opts.headers['Authorization'] = `Bearer ${token}`;
@@ -146,12 +162,14 @@ async function apiFetch(url, options = {}) {
 
 let activeSessionEmail = '';
 let activeHasUserToken = false;
+const dismissedAnalyticsWarnSet = new Set();
+let currentAnalyticsWarnKeys = [];
+const attemptedMismatchKeys = new Set();
+let monitoringFetchSeq = 0;
+let callsFetchSeq = 0;
 
 function updateTokenStatusPill(hasToken, label = null) {
   const pill = document.getElementById('user-token-pill');
-  const tokenSection = document.getElementById('user-token-section');
-  const headerBadge = document.getElementById('header-token-badge');
-  const enterBtn = document.getElementById('btn-enter-app') || document.getElementById('btn-continue-active-account');
 
   activeHasUserToken = Boolean(hasToken);
 
@@ -162,19 +180,6 @@ function updateTokenStatusPill(hasToken, label = null) {
     } else {
       pill.textContent = label || 'Service Account Mode';
       pill.className = 'token-pill token-pill-required';
-    }
-  }
-
-
-  if (headerBadge) {
-    if (hasToken) {
-      headerBadge.textContent = 'User Token Active';
-      headerBadge.className = 'token-pill token-pill-active';
-      headerBadge.style.display = 'inline-flex';
-    } else {
-      headerBadge.textContent = 'Service Account Mode';
-      headerBadge.className = 'token-pill token-pill-required';
-      headerBadge.style.display = 'inline-flex';
     }
   }
 }
@@ -218,13 +223,38 @@ async function applyUserToken(token, feedbackEl = null) {
     }
     const info = await res.json();
     setStoredUserToken(cleanTok);
-    if (info.activeAccount) {
-      activeSessionEmail = info.activeAccount;
-      const enterBtnText = document.getElementById('btn-enter-app-text');
-      if (enterBtnText) {
-        enterBtnText.innerHTML = `Enter Dashboard (${escapeHtml(info.activeAccount)}) &rarr;`;
-      }
+    const resolvedAcct = info.activeAccount || activeSessionEmail || '';
+    if (resolvedAcct) {
+      activeSessionEmail = resolvedAcct;
     }
+    const enterBtn = document.getElementById('btn-enter-app');
+    if (enterBtn) {
+      enterBtn.disabled = false;
+      enterBtn.classList.remove('btn-frozen');
+      enterBtn.title = 'Enter Dashboard';
+    }
+    const enterBtnText = document.getElementById('btn-enter-app-text');
+    if (enterBtnText) {
+      const idLabel = resolvedAcct ? ` (${escapeHtml(resolvedAcct)})` : '';
+      enterBtnText.innerHTML = `Enter Dashboard${idLabel} &rarr;`;
+    }
+    const authBtn = document.getElementById('btn-authenticate-account');
+    if (authBtn) {
+      authBtn.classList.remove('btn-mandatory');
+      authBtn.hidden = false;
+    }
+    const authBtnText = document.getElementById('btn-authenticate-text');
+    if (authBtnText) {
+      authBtnText.textContent = 'Authenticate / Change Account';
+    }
+    const loginErrBox = document.getElementById('login-error-box');
+    if (loginErrBox) {
+      loginErrBox.style.display = 'none';
+    }
+    const checkingEl = document.getElementById('login-auth-checking');
+    if (checkingEl) checkingEl.hidden = true;
+    const actionsGroup = document.getElementById('login-actions-group');
+    if (actionsGroup) actionsGroup.hidden = false;
     updateTokenStatusPill(true);
     if (feedbackEl) {
       feedbackEl.textContent = `Token valid for ${info.activeAccount || 'user'}!`;
@@ -274,9 +304,12 @@ function setStoredJurisdiction(val) {
 
 function updateJurisdictionHint(jurCode) {
   const descEl = document.getElementById('jurisdiction-endpoint-desc');
-  const info = JURISDICTION_ENDPOINTS[jurCode] || { endpoint: `https://${jurCode}-apigee.googleapis.com/v1` };
+  const safeCode = String(jurCode || 'global').replace(/[^a-z0-9-]/gi, '').toLowerCase() || 'global';
+  const info = JURISDICTION_ENDPOINTS[safeCode] || { endpoint: `https://${safeCode}-apigee.googleapis.com/v1` };
   if (descEl) {
-    descEl.innerHTML = `Endpoint: <code>${info.endpoint}</code>`;
+    const codeEl = document.createElement('code');
+    codeEl.textContent = info.endpoint;
+    descEl.replaceChildren('Endpoint: ', codeEl);
   }
 }
 
@@ -322,17 +355,63 @@ function hideScanProgressModal() {
   }
 }
 
+let pendingTrafficRetryHandler = null;
+
+function showTrafficErrorModal(errors, retryHandler = null) {
+  const modal = document.getElementById('modal-traffic-error');
+  const msgEl = document.getElementById('traffic-error-modal-message');
+  const listEl = document.getElementById('traffic-error-modal-list');
+  if (!modal || !listEl) return;
+
+  const items = Array.isArray(errors) ? errors.filter(Boolean) : [String(errors || 'Unknown error')];
+  if (items.length === 0) return;
+
+  pendingTrafficRetryHandler = retryHandler;
+  if (msgEl) {
+    msgEl.textContent =
+      items.length === 1
+        ? 'An Apigee Analytics query failed. Organization PDUs and Environment Units were retained; affected API call counts are marked PARTIAL / ERROR:'
+        : `${items.length} Apigee Analytics queries failed. Organization PDUs and Environment Units were retained; affected API call counts are marked PARTIAL / ERROR:`;
+  }
+  listEl.replaceChildren();
+  items.slice(0, 20).forEach((entry) => {
+    const li = document.createElement('li');
+    li.textContent = String(entry);
+    listEl.appendChild(li);
+  });
+  if (items.length > 20) {
+    const moreLi = document.createElement('li');
+    moreLi.textContent = `...and ${items.length - 20} more`;
+    listEl.appendChild(moreLi);
+  }
+  modal.style.display = 'grid';
+}
+
+function hideTrafficErrorModal() {
+  const modal = document.getElementById('modal-traffic-error');
+  if (modal) {
+    modal.style.display = 'none';
+  }
+  pendingTrafficRetryHandler = null;
+}
+
 async function initAuthScreen() {
   const enterBtn = document.getElementById('btn-enter-app');
   const enterBtnText = document.getElementById('btn-enter-app-text');
   const authBtn = document.getElementById('btn-authenticate-account');
   const authBtnText = document.getElementById('btn-authenticate-text');
+  const checkingEl = document.getElementById('login-auth-checking');
+  const actionsGroup = document.getElementById('login-actions-group');
   const errBox = document.getElementById('login-error-box');
   const jurSelect = document.getElementById('select-control-plane');
 
   activeSessionEmail = '';
+  if (checkingEl) checkingEl.hidden = false;
+  if (actionsGroup) actionsGroup.hidden = true;
+  if (authBtn) authBtn.hidden = true;
 
   // Wire jurisdiction selector
+  let userPickedJurDuringCheck = false;
   const activeJur = getStoredJurisdiction();
   if (jurSelect) {
     jurSelect.value = activeJur;
@@ -340,6 +419,7 @@ async function initAuthScreen() {
     if (!jurSelect.dataset.listenerBound) {
       jurSelect.dataset.listenerBound = 'true';
       jurSelect.addEventListener('change', async (e) => {
+        userPickedJurDuringCheck = true;
         const val = e.target.value;
         setStoredJurisdiction(val);
         updateJurisdictionHint(val);
@@ -366,9 +446,10 @@ async function initAuthScreen() {
     showToast('Successfully authenticated with Google!');
     window.history.replaceState({}, document.title, window.location.pathname);
   }
-  if (urlParams.get('oidc_error')) {
+  const rawOidcErr = urlParams.get('oidc_error');
+  if (rawOidcErr) {
     if (errBox) {
-      errBox.textContent = `Authentication Notice: ${decodeURIComponent(urlParams.get('oidc_error'))}`;
+      errBox.textContent = `Authentication Notice: ${rawOidcErr}`;
       errBox.style.display = 'block';
     }
     window.history.replaceState({}, document.title, window.location.pathname);
@@ -383,7 +464,7 @@ async function initAuthScreen() {
     const email = auth.activeAccount || (accounts.length > 0 ? accounts[0].account : '') || '';
     activeSessionEmail = email;
 
-    if (auth.jurisdiction && auth.jurisdiction.code && jurSelect) {
+    if (!userPickedJurDuringCheck && auth.jurisdiction && auth.jurisdiction.code && jurSelect) {
       jurSelect.value = auth.jurisdiction.code;
       setStoredJurisdiction(auth.jurisdiction.code);
       updateJurisdictionHint(auth.jurisdiction.code);
@@ -391,12 +472,14 @@ async function initAuthScreen() {
 
     const isTokenExpired = Boolean(auth.tokenExpired);
     const isTokenValid = Boolean(auth.tokenValid && auth.hasUserToken && !isTokenExpired);
+    const isIapVerified = Boolean(auth.isIap && auth.authenticated);
+    const canEnter = Boolean(isTokenValid || isIapVerified);
 
-    updateTokenStatusPill(isTokenValid);
+    updateTokenStatusPill(isTokenValid, isIapVerified && !isTokenValid ? 'IAP Verified' : null);
 
     // Rule: If authentication is required, freeze "Enter Dashboard" button.
     // When logged in, button displays: "Enter Dashboard (google id) →"
-    if (!isTokenValid) {
+    if (!canEnter) {
       if (enterBtn) {
         enterBtn.disabled = true;
         enterBtn.classList.add('btn-frozen');
@@ -425,7 +508,7 @@ async function initAuthScreen() {
         authBtn.classList.remove('btn-mandatory');
       }
       if (authBtnText) {
-        authBtnText.textContent = 'Authenticate / Change Account';
+        authBtnText.textContent = isIapVerified && !isTokenValid ? 'Switch IAP Account' : 'Authenticate / Change Account';
       }
     }
   } catch (err) {
@@ -445,6 +528,10 @@ async function initAuthScreen() {
     if (authBtnText) {
       authBtnText.textContent = 'Authenticate with Google';
     }
+  } finally {
+    if (checkingEl) checkingEl.hidden = true;
+    if (actionsGroup) actionsGroup.hidden = false;
+    if (authBtn) authBtn.hidden = false;
   }
 }
 
@@ -456,12 +543,19 @@ async function startLiveScanWithProgress({
 } = {}) {
   const token = getStoredUserToken();
   const jur = jurisdiction || getStoredJurisdiction();
-  const url = `/api/scan/stream?account=${encodeURIComponent(account || '')}&jurisdiction=${encodeURIComponent(jur)}`;
-  const headers = {};
+  const headers = { 'Content-Type': 'application/json' };
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
-  const response = await fetch(url, { headers });
+  const response = await fetch('/api/scan/stream', {
+    method: 'POST',
+    headers,
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      account: account || undefined,
+      jurisdiction: jur,
+    }),
+  });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: Failed to connect to scan stream`);
   }
@@ -482,45 +576,49 @@ async function startLiveScanWithProgress({
       if (!trimmed.startsWith('data:')) continue;
       const jsonStr = trimmed.slice(5).trim();
       if (!jsonStr) continue;
+      let event;
       try {
-        const event = JSON.parse(jsonStr);
-        if (event.done) {
-          if (event.stage === 'ERROR') {
-            throw new Error(event.error || event.message);
-          }
-          return event.portfolio;
-        }
-        if (onProgress) onProgress(event);
-      } catch (err) {
-        if (err.message && !err.message.includes('JSON')) throw err;
+        event = JSON.parse(jsonStr);
+      } catch (_) {
+        continue;
       }
+      if (event.done) {
+        if (event.stage === 'ERROR') {
+          throw new Error(event.error || event.message || 'Live scan failed');
+        }
+        const portfolio = event.portfolio || {};
+        portfolio._prefetchedPduTs = event.pduTimeseries || null;
+        portfolio._prefetchedCallsTs = event.callsTimeseries || null;
+        return portfolio;
+      }
+      if (onProgress) onProgress(event);
     }
   }
   throw new Error('Scan stream ended unexpectedly without completion payload');
 }
 
 async function openDashboardForAccount(account, runLiveScan = true) {
-  if (!account && !activeSessionEmail) return;
+  const enterBtn = document.getElementById('btn-enter-app');
+  if (!account && !activeSessionEmail) {
+    if (enterBtn) enterBtn.disabled = false;
+    return;
+  }
 
   const errBox = document.getElementById('login-error-box');
-  const enterBtn = document.getElementById('btn-enter-app');
 
   if (enterBtn && enterBtn.classList.contains('btn-frozen')) {
+    enterBtn.disabled = true;
     return;
   }
 
   if (errBox) errBox.style.display = 'none';
 
-  // Immediately transition to Home Page / Dashboard screen
-  document.getElementById('login-screen').style.display = 'none';
-  document.getElementById('dashboard-screen').style.display = 'flex';
-
-  // Display scan progress modal popup on the home page
+  // Keep Login screen visible during the entire login scan & chart prefetch phase
   showScanProgressModal('Discovering Apigee organizations...', 'Querying Google Cloud Apigee API...', 5);
 
+  let usedCachedFallbackNotice = '';
   try {
     if (runLiveScan) {
-      showScanProgressModal('Discovering Apigee organizations...', 'Querying Google Cloud Apigee API...', 5);
       try {
         currentPortfolio = await startLiveScanWithProgress({
           account: account || null,
@@ -528,19 +626,25 @@ async function openDashboardForAccount(account, runLiveScan = true) {
           onProgress: updateScanProgressModal,
         });
       } catch (scanErr) {
-        console.warn('Live scan encountered an issue, attempting cached fallback:', scanErr);
+        console.warn('Live scan encountered an issue, checking for genuine cached live snapshot:', scanErr);
         const targetJur = getStoredJurisdiction();
         const res = await apiFetch(`/api/portfolio?jurisdiction=${encodeURIComponent(targetJur)}`);
         if (!res.ok) throw scanErr;
-        currentPortfolio = await res.json();
+        const fallback = await res.json();
+        const fallbackJur = fallback.controlPlaneJurisdiction || fallback.jurisdiction?.code || targetJur;
+        if (fallback.source !== 'LIVE_APIGEE_API' || fallbackJur !== targetJur) {
+          throw scanErr;
+        }
+        currentPortfolio = fallback;
+        usedCachedFallbackNotice = `Live scan failed (${scanErr.message}); showing cached snapshot from ${fallback.collectedAt || 'previous scan'}.`;
       }
     } else {
       updateScanProgressModal({ percent: 15, message: 'Loading Apigee Entitlements...', detail: 'Connecting to APIs' });
-      
+
       const targetJur = getStoredJurisdiction();
       const fetchPromise = apiFetch(`/api/portfolio?jurisdiction=${encodeURIComponent(targetJur)}`);
       updateScanProgressModal({ percent: 35, message: 'Retrieving organization portfolio...', detail: 'Fetching audit data' });
-      
+
       const res = await fetchPromise;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       currentPortfolio = await res.json();
@@ -548,42 +652,71 @@ async function openDashboardForAccount(account, runLiveScan = true) {
       const portfolioJur = currentPortfolio.controlPlaneJurisdiction || (currentPortfolio.jurisdiction && currentPortfolio.jurisdiction.code);
       if (currentPortfolio.source !== 'LIVE_APIGEE_API' || portfolioJur !== targetJur) {
         updateScanProgressModal({ percent: 45, message: 'Initiating live scan for account...', detail: 'Streaming live audit' });
-        try {
-          currentPortfolio = await startLiveScanWithProgress({
-            account: account || null,
-            jurisdiction: targetJur,
-            onProgress: updateScanProgressModal,
-          });
-        } catch (scanErr) {
-          console.warn('Initial live scan fallback encountered an issue, continuing with cached portfolio:', scanErr);
-        }
+        currentPortfolio = await startLiveScanWithProgress({
+          account: account || null,
+          jurisdiction: targetJur,
+          onProgress: updateScanProgressModal,
+        });
       }
     }
 
-    updateScanProgressModal({ percent: 90, message: 'Finalizing compliance metrics...', detail: 'Preparing dashboard views' });
+    // Complete API Calls & PDU Monitoring chart preloading DURING the login phase (no duplicate Analytics scan)
+    if (currentPortfolio?._prefetchedCallsTs) {
+      currentCallsTs = currentPortfolio._prefetchedCallsTs;
+    } else {
+      updateScanProgressModal({
+        percent: 91,
+        message: 'Preparing monthly API calls...',
+        detail: 'Aggregating 90-day Apigee Analytics chunks',
+      });
+      await fetchMonthlyCallsSeries(Boolean(currentPortfolio?.callsPeriodMismatch), { skipRender: true });
+    }
+
+    if (
+      currentPortfolio?._prefetchedPduTs &&
+      selectedChartDimension === 'pdu' &&
+      selectedMonitoringDays === 14
+    ) {
+      currentMonitoringTs = currentPortfolio._prefetchedPduTs;
+    } else {
+      updateScanProgressModal({
+        percent: 95,
+        message: 'Querying Cloud Monitoring PDU history...',
+        detail: 'apigee.googleapis.com/proxy/details',
+      });
+      await fetchMonitoringTimeSeries(selectedMonitoringDays, false, selectedChartDimension, { skipRender: true });
+    }
+
+    updateScanProgressModal({ percent: 100, message: 'Dashboard Ready!', detail: 'Launching view' });
 
     // Always reset org selection so organizations from previously selected regions do NOT linger
     allOrgsSelected = true;
     selectedOrgs.clear();
+    dismissedAnalyticsWarnSet.clear();
 
-    // Populate dashboard UI
+    // Switch to Dashboard screen BEFORE rendering SVG charts so container.clientWidth is exact
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('dashboard-screen').style.display = 'flex';
+
     populateOrgDropdown(currentPortfolio);
     populateEnvDropdown(currentPortfolio);
     renderSimplifiedDashboard();
 
-    updateScanProgressModal({ percent: 100, message: 'Dashboard Ready!', detail: 'Launching view' });
-
-    // Smooth transition: brief delay before dismissing modal popup
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
     hideScanProgressModal();
 
-    fetchMonitoringTimeSeries(selectedMonitoringDays, runLiveScan, selectedChartDimension);
-    fetchMonthlyCallsSeries(runLiveScan);
+    if (usedCachedFallbackNotice) {
+      showToast(usedCachedFallbackNotice);
+    }
+    if (Array.isArray(currentPortfolio?.trafficErrors) && currentPortfolio.trafficErrors.length > 0) {
+      showTrafficErrorModal(currentPortfolio.trafficErrors, () => {
+        document.getElementById('btn-refresh-scan')?.click();
+      });
+    }
   } catch (err) {
     hideScanProgressModal();
-    // Return back to login screen with error notice
     document.getElementById('dashboard-screen').style.display = 'none';
-    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('login-screen').style.display = '';
     if (errBox) {
       errBox.textContent = `Scan Error: ${err.message}`;
       errBox.style.display = 'block';
@@ -597,7 +730,13 @@ async function openDashboardForAccount(account, runLiveScan = true) {
 
 /* Cloud Monitoring Time-Series Chart */
 
-async function fetchMonitoringTimeSeries(days = 14, refresh = false, dimension = selectedChartDimension) {
+async function fetchMonitoringTimeSeries(
+  days = 14,
+  refresh = false,
+  dimension = selectedChartDimension,
+  { skipRender = false } = {}
+) {
+  const reqId = ++monitoringFetchSeq;
   selectedMonitoringDays = days;
   selectedChartDimension = dimension === 'environments' ? 'environments' : 'pdu';
 
@@ -605,14 +744,18 @@ async function fetchMonitoringTimeSeries(days = 14, refresh = false, dimension =
   const subtitle = document.getElementById('chart-subtitle');
   const mainTitle = document.getElementById('chart-main-title');
 
-  if (mainTitle) {
+  if (!skipRender && mainTitle) {
     mainTitle.textContent =
       selectedChartDimension === 'environments'
         ? 'Environment Units Across Time (Cloud Monitoring)'
         : 'PDUs Across Time (Cloud Monitoring)';
   }
 
-  if (container && (!currentMonitoringTs || refresh || currentMonitoringTs.dimension !== selectedChartDimension)) {
+  if (
+    !skipRender &&
+    container &&
+    (!currentMonitoringTs || refresh || currentMonitoringTs.dimension !== selectedChartDimension)
+  ) {
     container.innerHTML =
       '<div class="chart-empty">Querying Cloud Monitoring (apigee.googleapis.com/proxy/details)...</div>';
   }
@@ -626,9 +769,21 @@ async function fetchMonitoringTimeSeries(days = 14, refresh = false, dimension =
     );
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    currentMonitoringTs = await res.json();
-    renderMonitoringChart();
+    const payload = await res.json();
+    if (reqId !== monitoringFetchSeq) return;
+    currentMonitoringTs = payload;
+    if (!skipRender) {
+      renderMonitoringChart();
+    }
   } catch (err) {
+    if (reqId !== monitoringFetchSeq) return;
+    if (skipRender) {
+      console.warn('Monitoring prefetch warning:', err);
+      if (!currentMonitoringTs) {
+        currentMonitoringTs = { dimension: selectedChartDimension, days, series: [], seriesCount: 0 };
+      }
+      return;
+    }
     if (container) {
       container.innerHTML = `<div class="chart-empty">Could not load time-series: ${escapeHtml(err.message)}</div>`;
     }
@@ -642,9 +797,16 @@ function renderMonitoringChart() {
   const container = document.getElementById('chart-container');
   const subtitle = document.getElementById('chart-subtitle');
   const chartPill = document.getElementById('chart-limit-pill');
+  const mainTitle = document.getElementById('chart-main-title');
   if (!container || !currentMonitoringTs) return;
 
   const dim = currentMonitoringTs.dimension === 'environments' ? 'environments' : 'pdu';
+  if (mainTitle) {
+    mainTitle.textContent =
+      dim === 'environments'
+        ? 'Environment Units Across Time (Cloud Monitoring)'
+        : 'PDUs Across Time (Cloud Monitoring)';
+  }
   const envFilter = document.getElementById('filter-env')?.value || 'ALL';
   const footprintFilter = document.getElementById('filter-footprint')?.value || 'ALL';
   const hideZero = document.getElementById('chk-hide-zero')?.checked ?? false;
@@ -668,26 +830,37 @@ function renderMonitoringChart() {
   const formatVal = (v) => Number(v || 0).toLocaleString();
   const totalOrgsCount = currentPortfolio?.organizations?.length || 0;
 
+  const validPortfolioOrgs = Array.isArray(currentPortfolio?.organizations)
+    ? new Set(currentPortfolio.organizations.map((o) => o.organization))
+    : null;
+
   // Filter series by active Multi-Select Orgs / Env / Footprint / Hide 0-PDU Envs
   const matchingSeries = (currentMonitoringTs.series || []).filter((s) => {
+    if (validPortfolioOrgs && !validPortfolioOrgs.has(s.organization)) return false;
     if (!isOrgSelected(s.organization)) return false;
     if (envFilter !== 'ALL' && s.environment !== envFilter) return false;
     if (footprintFilter !== 'ALL' && s.runtimeType !== footprintFilter) return false;
-    if (hideZero && zeroPduEnvKeys.has(`${s.organization}::${s.environment}`)) return false;
+    if (hideZero && dim === 'pdu' && zeroPduEnvKeys.has(`${s.organization}::${s.environment}`)) return false;
     return true;
   });
 
   // 1. Determine alignment resolution (bucket interval in ms)
   const alignSeconds =
     currentMonitoringTs.alignmentPeriodSeconds ||
-    (selectedChartDays <= 1
+    (selectedMonitoringDays <= 1
       ? 3600
-      : selectedChartDays <= 7
+      : selectedMonitoringDays <= 7
       ? 14400
-      : selectedChartDays <= 14
+      : selectedMonitoringDays <= 14
       ? 21600
       : 43200);
   const bucketMs = alignSeconds * 1000;
+  const monErrors = Array.isArray(currentMonitoringTs.monitoringErrors)
+    ? currentMonitoringTs.monitoringErrors
+    : [];
+  const hybridOrgs = Array.isArray(currentMonitoringTs.unsupportedHybridOrganizations)
+    ? currentMonitoringTs.unsupportedHybridOrganizations.filter((o) => isOrgSelected(o))
+    : [];
 
   // 2. Gather all valid epoch timestamps across matching series
   const allEpochs = [];
@@ -699,18 +872,26 @@ function renderMonitoringChart() {
   });
 
   if (!allEpochs.length) {
+    const scopeHint =
+      footprintFilter === 'HYBRID' || (hybridOrgs.length > 0 && matchingSeries.length === 0)
+        ? ' Note: apigee.googleapis.com/proxy/details tracks Apigee X active proxy revisions only (not emitted by Apigee Hybrid or 0-deployment environments).'
+        : '';
+    const errHint = monErrors.length > 0 ? ` (${monErrors.length} query error(s): ${monErrors[0]})` : '';
     container.innerHTML = `<div class="chart-empty">No Cloud Monitoring telemetry found for the selected filter (${escapeHtml(
       unitLabel
-    )}).</div>`;
+    )}).${escapeHtml(scopeHint + errHint)}</div>`;
     if (subtitle) {
-      subtitle.innerHTML = `Metric: <code>apigee.googleapis.com/proxy/details</code> &bull; 0 active series for current filter`;
+      subtitle.innerHTML = `Metric: <code>apigee.googleapis.com/proxy/details</code> (Apigee X active revisions) &bull; 0 active series for current filter`;
     }
     return;
   }
 
-  // 3. Create regular canonical time buckets from min to max
-  const minEpoch = Math.floor(Math.min(...allEpochs) / bucketMs) * bucketMs;
+  // 3. Create regular canonical time buckets clamped to the requested lookback window
+  const rawMinEpoch = Math.floor(Math.min(...allEpochs) / bucketMs) * bucketMs;
   const maxEpoch = Math.floor(Math.max(...allEpochs) / bucketMs) * bucketMs;
+  const windowDays = Number(currentMonitoringTs.days || selectedMonitoringDays || 14);
+  const windowStartEpoch = Math.floor((maxEpoch - windowDays * 86400 * 1000) / bucketMs) * bucketMs;
+  const minEpoch = Math.max(rawMinEpoch, windowStartEpoch);
 
   const buckets = [];
   for (let t = minEpoch; t <= maxEpoch; t += bucketMs) {
@@ -733,13 +914,18 @@ function renderMonitoringChart() {
       const firstTime = rawPts[0].time;
       const firstVal = rawPts[0].val;
       let ptIdx = 0;
-      // If the series starts within 2 buckets of minEpoch, use first point's value as baseline
-      let currentVal = firstTime - minEpoch <= 2 * bucketMs ? firstVal : 0;
+      const startsNearWindow = firstTime - minEpoch <= 2 * bucketMs;
+      let currentVal = startsNearWindow ? firstVal : 0;
+      let lastSampleTime = startsNearWindow ? minEpoch : -Infinity;
 
       buckets.forEach((bucketTime, bIdx) => {
         while (ptIdx < rawPts.length && rawPts[ptIdx].time <= bucketTime + bucketMs / 2) {
           currentVal = rawPts[ptIdx].val;
+          lastSampleTime = rawPts[ptIdx].time;
           ptIdx++;
+        }
+        if (bucketTime - lastSampleTime > 2 * bucketMs) {
+          currentVal = 0;
         }
         bucketTotals[bIdx] += currentVal;
       });
@@ -764,15 +950,6 @@ function renderMonitoringChart() {
       date: new Date(ts),
       pdu: timeMap.get(ts),
     }));
-  }
-
-  // Drop trailing bucket if it's a partial final alignment window with fewer reporting orgs
-  if (points.length > 3) {
-    const prevVal = points[points.length - 2].pdu;
-    const lastVal = points[points.length - 1].pdu;
-    if (lastVal < prevVal * 0.7) {
-      points = points.slice(0, points.length - 1);
-    }
   }
 
   if (!points.length) {
@@ -808,13 +985,20 @@ function renderMonitoringChart() {
       : `${orgScopeText}${envFilter !== 'ALL' ? ' / ' + envFilter : ''}`;
 
   if (subtitle) {
+    const subLight = isLightTheme();
+    const warnColor = subLight ? '#b45309' : '#fbbf24';
+    const latestColor = isLatestAbove ? (subLight ? '#dc2626' : '#f87171') : (subLight ? '#059669' : '#34d399');
+    const hybridNote =
+      hybridOrgs.length > 0 ? ` &bull; <em>Excl. ${hybridOrgs.length} Hybrid org(s)</em>` : '';
+    const monErrNote =
+      monErrors.length > 0
+        ? ` &bull; <span style="color:${warnColor};" title="${escapeHtml(monErrors.join(' | '))}">&#9888;&#65039; ${monErrors.length} Monitoring warning(s)</span>`
+        : '';
     subtitle.innerHTML = `Metric: <code>apigee.googleapis.com/proxy/details</code> &bull; <strong>${escapeHtml(
       scopeDesc
     )}</strong> &bull; Min: <strong>${formatVal(minVal)}</strong> | Max: <strong>${formatVal(
       maxVal
-    )}</strong> | Latest: <strong style="color:${
-      isLatestAbove ? '#f87171' : '#34d399'
-    };">${formatVal(latestVal)} ${unitLabel}</strong>`;
+    )}</strong> | Latest: <strong style="color:${latestColor};">${formatVal(latestVal)} ${unitLabel}</strong>${hybridNote}${monErrNote}`;
   }
 
   const width = container.clientWidth || 960;
@@ -844,10 +1028,13 @@ function renderMonitoringChart() {
     ...p,
   }));
 
-  const linePath = coords
-    .map((c, i) => `${i === 0 ? 'M' : 'L'}${c.x.toFixed(1)},${c.y.toFixed(1)}`)
-    .join(' ');
-  const areaPath = `${linePath} L${coords[coords.length - 1].x.toFixed(1)},${(padTop + plotH).toFixed(1)} L${coords[0].x.toFixed(1)},${(padTop + plotH).toFixed(1)} Z`;
+  const isSingleBucket = coords.length === 1;
+  const linePath = isSingleBucket
+    ? `M${padLeft.toFixed(1)},${coords[0].y.toFixed(1)} L${(padLeft + plotW).toFixed(1)},${coords[0].y.toFixed(1)}`
+    : coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
+  const areaPath = isSingleBucket
+    ? `${linePath} L${(padLeft + plotW).toFixed(1)},${(padTop + plotH).toFixed(1)} L${padLeft.toFixed(1)},${(padTop + plotH).toFixed(1)} Z`
+    : `${linePath} L${coords[coords.length - 1].x.toFixed(1)},${(padTop + plotH).toFixed(1)} L${coords[0].x.toFixed(1)},${(padTop + plotH).toFixed(1)} Z`;
 
   const lightMode = isLightTheme();
   const COLOR_GREEN = lightMode ? '#059669' : '#34d399';
@@ -931,8 +1118,9 @@ function renderMonitoringChart() {
         </mask>
       </defs>
       ${yGridHtml}
-      <path d="${areaPath}" fill="url(#pduAreaGrad)" mask="url(#pduAreaMask)" />
-      <path d="${linePath}" fill="none" stroke="url(#pduStrokeGrad)" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round" />
+      <path d="${areaPath}" fill="${isSingleBucket ? primaryColor : 'url(#pduAreaGrad)'}" fill-opacity="${isSingleBucket ? '0.22' : '1'}" mask="url(#pduAreaMask)" />
+      <path d="${linePath}" fill="none" stroke="${isSingleBucket ? primaryColor : 'url(#pduStrokeGrad)'}" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round" />
+      ${isSingleBucket ? `<circle cx="${coords[0].x.toFixed(1)}" cy="${coords[0].y.toFixed(1)}" r="4.5" fill="${primaryColor}" stroke="#fff" stroke-width="1.5" />` : ''}
       ${limitLineHtml}
       ${xLabelsHtml}
       <line id="hover-vline" x1="0" y1="${padTop}" x2="0" y2="${padTop + plotH}" stroke="rgba(255,255,255,0.45)" stroke-width="1" stroke-dasharray="2,2" style="display:none;" />
@@ -1037,28 +1225,53 @@ function updateCallsBreakdownBanner(stdCalls, envoyCalls, extCalls, weightedCall
   }
 }
 
-async function fetchMonthlyCallsSeries(refresh = false) {
+async function fetchMonthlyCallsSeries(refresh = false, { skipRender = false } = {}) {
+  const reqId = ++callsFetchSeq;
   const container = document.getElementById('calls-monthly-chart-container');
   const subtitle = document.getElementById('calls-chart-subtitle');
-  if (container && (!currentCallsTs || refresh)) {
+  if (!skipRender && container && (!currentCallsTs || refresh)) {
     container.innerHTML =
-      '<div class="chart-empty">Querying Apigee Analytics (14m retention) &amp; Cloud Monitoring for monthly API calls...</div>';
+      '<div class="chart-empty">Querying Apigee Analytics (90-day chunks) for API calls...</div>';
   }
 
   try {
     const jur = getStoredJurisdiction();
     const res = await apiFetch(`/api/monitoring/timeseries?dimension=calls&refresh=${refresh ? 'true' : 'false'}&jurisdiction=${encodeURIComponent(jur)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    currentCallsTs = await res.json();
-    renderMonthlyCallsChart();
+    const payload = await res.json();
+    if (reqId !== callsFetchSeq) return;
+    currentCallsTs = payload;
+    if (refresh || currentCallsTs?.callsRefreshed) {
+      const portRes = await apiFetch(`/api/portfolio?jurisdiction=${encodeURIComponent(jur)}`);
+      if (portRes.ok && reqId === callsFetchSeq) {
+        currentPortfolio = await portRes.json();
+        if (!skipRender) {
+          renderSimplifiedDashboard();
+        }
+      }
+    }
+    if (!skipRender) {
+      renderMonthlyCallsChart();
+      if (Array.isArray(currentCallsTs?.trafficErrors) && currentCallsTs.trafficErrors.length > 0) {
+        showTrafficErrorModal(currentCallsTs.trafficErrors, () => fetchMonthlyCallsSeries(true));
+      }
+    }
   } catch (err) {
-
+    if (reqId !== callsFetchSeq) return;
+    if (skipRender) {
+      console.warn('Monthly calls prefetch warning:', err);
+      if (!currentCallsTs) {
+        currentCallsTs = { dimension: 'calls', series: [], seriesCount: 0 };
+      }
+      return;
+    }
     if (container) {
       container.innerHTML = `<div class="chart-empty">Could not load monthly API calls: ${escapeHtml(err.message)}</div>`;
     }
     if (subtitle) {
       subtitle.textContent = 'Error loading monthly API calls';
     }
+    showTrafficErrorModal([`Failed to load monthly API calls: ${err.message}`], () => fetchMonthlyCallsSeries(true));
   }
 }
 
@@ -1081,22 +1294,41 @@ function renderMonthlyCallsChart() {
     '2026-01-01';
   const periodEndStr = currentCallsTs.periodEnd || summary.contractPeriodEnd || '';
 
+  const validPortfolioOrgs = Array.isArray(currentPortfolio?.organizations)
+    ? new Set(currentPortfolio.organizations.map((o) => o.organization))
+    : null;
+
   // Filter series by active Multi-Select Orgs / Env / Footprint
   const matchingSeries = (currentCallsTs.series || []).filter((s) => {
+    if (validPortfolioOrgs && !validPortfolioOrgs.has(s.organization)) return false;
     if (!isOrgSelected(s.organization)) return false;
     if (envFilter !== 'ALL' && s.environment !== envFilter) return false;
     if (footprintFilter !== 'ALL' && s.runtimeType !== footprintFilter) return false;
     return true;
   });
 
-  // Build 12 monthly buckets starting from the Contract Starting Date's month
+  // Build calendar monthly buckets spanning [periodStartStr, periodEndStr) (12 buckets on 1st-of-month, 13 on mid-month)
   const startParts = periodStartStr.split('-').map(Number);
   const startYear = startParts[0] || new Date().getUTCFullYear();
-  const startMonth0 = (startParts[1] || 1) - 1; // 0-indexed month
+  const startMonth0 = (startParts[1] || 1) - 1;
+
+  let bucketCount = 12;
+  if (periodEndStr) {
+    const endParts = periodEndStr.split('-').map(Number);
+    if (endParts[0] && endParts[1]) {
+      const endExclusiveUtc = Date.UTC(endParts[0], endParts[1] - 1, endParts[2] || 1);
+      const lastInclusiveDt = new Date(endExclusiveUtc - 86400 * 1000);
+      const monthsDiff =
+        (lastInclusiveDt.getUTCFullYear() - startYear) * 12 +
+        (lastInclusiveDt.getUTCMonth() - startMonth0) +
+        1;
+      bucketCount = Math.max(12, Math.min(13, monthsDiff));
+    }
+  }
 
   const monthBuckets = [];
   const monthKeyToIndex = new Map();
-  for (let m = 0; m < 12; m++) {
+  for (let m = 0; m < bucketCount; m++) {
     const d = new Date(Date.UTC(startYear, startMonth0 + m, 1));
     const ymKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
     const shortLabel = d.toLocaleDateString('en-US', {
@@ -1114,24 +1346,33 @@ function renderMonthlyCallsChart() {
       ymKey,
       shortLabel,
       fullLabel,
+      stdCalls: 0,
+      extCalls: 0,
+      fallbackEntCalls: 0,
       entitlementCalls: 0,
       envoyCalls: 0,
       cumulativeCalls: 0,
     });
   }
 
-  // Sum daily entitlement and Envoy calls into the 12 contract-year monthly buckets (only on or after periodStartStr)
+  // Sum daily calls into active contract-period monthly buckets [periodStartStr, periodEndStr)
   matchingSeries.forEach((s) => {
     (s.points || []).forEach((pt) => {
       const dayStr = String(pt.timestamp || '').slice(0, 10);
       if (dayStr < periodStartStr) return;
+      if (periodEndStr && dayStr >= periodEndStr) return;
       const ymKey = dayStr.slice(0, 7);
       const idx = monthKeyToIndex.get(ymKey);
       if (idx === undefined) return;
+      const dStd = Number(pt.standardCalls ?? 0);
+      const dExt = Number(pt.extensibleCalls ?? 0);
       const entVal = Number(pt.entitlementCalls ?? pt.dailyCalls ?? pt.pdu ?? 0);
       const envoyVal = Number(pt.envoyCalls ?? 0);
-      if (entVal > 0) {
-        monthBuckets[idx].entitlementCalls += entVal;
+      if (dStd > 0 || dExt > 0) {
+        monthBuckets[idx].stdCalls += dStd;
+        monthBuckets[idx].extCalls += dExt;
+      } else if (entVal > 0) {
+        monthBuckets[idx].fallbackEntCalls += entVal;
       }
       if (envoyVal > 0) {
         monthBuckets[idx].envoyCalls += envoyVal;
@@ -1139,9 +1380,13 @@ function renderMonthlyCallsChart() {
     });
   });
 
-  // Compute running cumulative entitlement total across the 12 months (Envoy calls are free)
+  // Compute exact monthly weighted entitlement calls and running cumulative total
   let runningTotal = 0;
   monthBuckets.forEach((b) => {
+    b.entitlementCalls =
+      b.stdCalls > 0 || b.extCalls > 0
+        ? Math.round(b.stdCalls * 0.2) + Math.round(b.extCalls * 1.0) + b.fallbackEntCalls
+        : b.fallbackEntCalls;
     runningTotal += b.entitlementCalls;
     b.cumulativeCalls = runningTotal;
   });
@@ -1240,8 +1485,8 @@ function renderMonthlyCallsChart() {
     `;
   }
 
-  // Render 12 monthly stacked bars (bottom: Entitlement = Std + Ext, top: Envoy Adapter in grey)
-  const slotW = plotW / 12;
+  // Render monthly stacked bars (bottom: Entitlement = Std + Ext, top: Envoy Adapter in grey)
+  const slotW = plotW / Math.max(1, monthBuckets.length);
   const barW = Math.max(16, Math.min(46, slotW * 0.58));
   const yBase = padTop + plotH;
 
@@ -1370,7 +1615,9 @@ function populateOrgDropdown(portfolio) {
   if (!listContainer || !portfolio) return;
 
   const hideZero = Boolean(document.getElementById('chk-hide-zero')?.checked);
-  const orgs = [...(portfolio.organizations || [])]
+  const allPortfolioOrgs = [...(portfolio.organizations || [])];
+  const allPortfolioOrgSet = new Set(allPortfolioOrgs.map((o) => o.organization));
+  const orgs = allPortfolioOrgs
     .filter((o) => !hideZero || (o.totalPdus || 0) > 0)
     .sort((a, b) =>
       String(a.organization || '').localeCompare(String(b.organization || ''), undefined, {
@@ -1378,48 +1625,76 @@ function populateOrgDropdown(portfolio) {
         numeric: true,
       })
     );
-  const validOrgSet = new Set(orgs.map((o) => o.organization));
 
   Array.from(selectedOrgs).forEach((name) => {
-    if (!validOrgSet.has(name)) {
+    if (!allPortfolioOrgSet.has(name)) {
       selectedOrgs.delete(name);
     }
   });
 
-  if (!allOrgsSelected && orgs.length > 0 && selectedOrgs.size === orgs.length) {
+  if (!allOrgsSelected && allPortfolioOrgs.length > 0 && selectedOrgs.size === allPortfolioOrgs.length) {
     allOrgsSelected = true;
     selectedOrgs.clear();
   }
 
-  const activeCount = allOrgsSelected ? orgs.length : selectedOrgs.size;
+  const visibleSelectedCount = orgs.filter((o) => allOrgsSelected || selectedOrgs.has(o.organization)).length;
   if (triggerLabel) {
-    triggerLabel.textContent = getSelectedOrgsLabel(orgs.length);
+    triggerLabel.textContent = getSelectedOrgsLabel(allPortfolioOrgs.length);
   }
   if (summaryBadge) {
     summaryBadge.textContent = allOrgsSelected
       ? `All Selected (${orgs.length})`
-      : `${activeCount} of ${orgs.length} Selected`;
+      : `${selectedOrgs.size} of ${allPortfolioOrgs.length} Selected`;
   }
 
-  listContainer.innerHTML = orgs
-    .map((o) => {
-      const checked = allOrgsSelected || selectedOrgs.has(o.organization);
-      return `
-        <label class="org-checkbox-item">
-          <span class="org-checkbox-left">
-            <input
-              type="checkbox"
-              class="org-checkbox-input"
-              value="${escapeHtml(o.organization)}"
-              ${checked ? 'checked' : ''}
-            />
-            <span class="org-checkbox-name" title="${escapeHtml(o.organization)}">${escapeHtml(o.organization)}</span>
-          </span>
-          <span class="org-checkbox-pdu">${o.totalPdus} PDU</span>
-        </label>
-      `;
-    })
-    .join('');
+  listContainer.replaceChildren();
+  orgs.forEach((o) => {
+    const checked = allOrgsSelected || selectedOrgs.has(o.organization);
+    const labelEl = document.createElement('label');
+    labelEl.className = 'org-checkbox-item';
+
+    const leftEl = document.createElement('span');
+    leftEl.className = 'org-checkbox-left';
+
+    const inputEl = document.createElement('input');
+    inputEl.type = 'checkbox';
+    inputEl.className = 'org-checkbox-input';
+    inputEl.value = String(o.organization || '');
+    inputEl.checked = Boolean(checked);
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'org-checkbox-name';
+    nameEl.title = String(o.organization || '');
+    nameEl.textContent = String(o.organization || '');
+
+    leftEl.append(inputEl, nameEl);
+
+    const rightEl = document.createElement('span');
+    rightEl.className = 'org-checkbox-right';
+
+    const status = String(o.callsStatus || 'OK');
+    if (status === 'ANALYTICS_DISABLED') {
+      const badgeEl = document.createElement('span');
+      badgeEl.className = 'calls-status-badge disabled';
+      badgeEl.title = 'Apigee Analytics add-on is disabled on one or more environments in this organization';
+      badgeEl.textContent = 'NO ANALYTICS';
+      rightEl.appendChild(badgeEl);
+    } else if (status === 'PARTIAL' || status === 'ERROR') {
+      const badgeEl = document.createElement('span');
+      badgeEl.className = `calls-status-badge ${status === 'ERROR' ? 'error' : 'partial'}`;
+      badgeEl.title = (o.trafficErrors || []).join(' | ') || 'Apigee Analytics query issue';
+      badgeEl.textContent = status;
+      rightEl.appendChild(badgeEl);
+    }
+
+    const pduEl = document.createElement('span');
+    pduEl.className = 'org-checkbox-pdu';
+    pduEl.textContent = `${o.totalPdus ?? 0} PDU`;
+    rightEl.appendChild(pduEl);
+
+    labelEl.append(leftEl, rightEl);
+    listContainer.appendChild(labelEl);
+  });
 
   listContainer.querySelectorAll('.org-checkbox-input').forEach((input) => {
     input.addEventListener('change', (e) => {
@@ -1429,7 +1704,8 @@ function populateOrgDropdown(portfolio) {
       if (allOrgsSelected) {
         allOrgsSelected = false;
         selectedOrgs.clear();
-        orgs.forEach((o) => {
+        const seedPool = hideZero ? orgs : allPortfolioOrgs;
+        seedPool.forEach((o) => {
           if (o.organization !== orgName) {
             selectedOrgs.add(o.organization);
           }
@@ -1437,10 +1713,15 @@ function populateOrgDropdown(portfolio) {
       } else {
         if (isChecked) {
           selectedOrgs.add(orgName);
+          const allVisibleChecked = orgs.length > 0 && orgs.every((o) => selectedOrgs.has(o.organization));
+          if (allVisibleChecked && hideZero) {
+            allOrgsSelected = true;
+            selectedOrgs.clear();
+          }
         } else {
           selectedOrgs.delete(orgName);
         }
-        if (orgs.length > 0 && selectedOrgs.size === orgs.length) {
+        if (allPortfolioOrgs.length > 0 && selectedOrgs.size === allPortfolioOrgs.length) {
           allOrgsSelected = true;
           selectedOrgs.clear();
         }
@@ -1493,8 +1774,189 @@ function populateEnvDropdown(portfolio) {
   }
 }
 
+function getNormalizedExcludedOrgs(portfolio) {
+  if (!portfolio) return [];
+  const byOrg = new Map();
+  const details = Array.isArray(portfolio.excludedBillingDetails) ? portfolio.excludedBillingDetails : [];
+  details.forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const name = String(item.organization || '').trim();
+    if (!name) return;
+    byOrg.set(name, {
+      organization: name,
+      billingType: String(item.billingType || 'NON_SUBSCRIPTION').toUpperCase(),
+      subscriptionPlan: String(item.subscriptionPlan || ''),
+      runtimeType: String(item.runtimeType || ''),
+    });
+  });
+  const names = Array.isArray(portfolio.excludedBillingOrganizations) ? portfolio.excludedBillingOrganizations : [];
+  names.forEach((rawName) => {
+    const name = String(rawName || '').trim();
+    if (name && !byOrg.has(name)) {
+      byOrg.set(name, {
+        organization: name,
+        billingType: 'PAYG / TRIAL',
+        subscriptionPlan: '',
+        runtimeType: '',
+      });
+    }
+  });
+  return Array.from(byOrg.values()).sort((a, b) =>
+    a.organization.localeCompare(b.organization, undefined, { sensitivity: 'base', numeric: true })
+  );
+}
+
+function renderScopeAndAnalyticsBanners(portfolio, baseMatchingEnvs) {
+  const warnHeaderBtn = document.getElementById('btn-excluded-orgs-warning');
+  const warnCountBadge = document.getElementById('excluded-orgs-badge-count');
+  const modalIncludedEl = document.getElementById('excluded-orgs-modal-included');
+  const modalSummaryEl = document.getElementById('excluded-orgs-modal-summary');
+  const modalListEl = document.getElementById('excluded-orgs-modal-list');
+
+  const excludedList = getNormalizedExcludedOrgs(portfolio);
+  const subOrgs = Array.isArray(portfolio?.organizations) ? portfolio.organizations : [];
+
+  if (warnHeaderBtn) {
+    if (excludedList.length > 0) {
+      const countsByType = new Map();
+      excludedList.forEach((item) => {
+        const label = item.billingType === 'EVALUATION' ? 'TRIAL' : item.billingType;
+        countsByType.set(label, (countsByType.get(label) || 0) + 1);
+      });
+      const typeSummary = Array.from(countsByType.entries())
+        .map(([k, c]) => `${c} ${k}`)
+        .join(', ');
+
+      const subCountsByPlan = new Map();
+      subOrgs.forEach((o) => {
+        const plan = String(o.subscriptionPlan || 'SUBSCRIPTION').trim() || 'SUBSCRIPTION';
+        subCountsByPlan.set(plan, (subCountsByPlan.get(plan) || 0) + 1);
+      });
+      const subPlanSummary = Array.from(subCountsByPlan.entries())
+        .map(([k, c]) => `${c} ${k}`)
+        .join(', ');
+
+      if (warnCountBadge) {
+        warnCountBadge.textContent = String(excludedList.length);
+      }
+      warnHeaderBtn.title = `${excludedList.length} Excluded Organization(s) (${typeSummary}) — Click to view Scope`;
+      warnHeaderBtn.setAttribute(
+        'aria-label',
+        `View ${excludedList.length} excluded non-subscription organizations`
+      );
+      warnHeaderBtn.style.display = 'inline-flex';
+
+      if (modalIncludedEl) {
+        modalIncludedEl.textContent = subPlanSummary
+          ? `Included in Entitlement Audit: ${subOrgs.length} Subscription organization(s) (${subPlanSummary}).`
+          : `Included in Entitlement Audit: ${subOrgs.length} Subscription organization(s).`;
+      }
+      if (modalSummaryEl) {
+        modalSummaryEl.textContent = `Excluded from Entitlement Audit: ${excludedList.length} Non-Subscription organization(s) (${typeSummary}) — Trial and Pay-As-You-Go organizations are excluded:`;
+      }
+      if (modalListEl) {
+        modalListEl.replaceChildren();
+        excludedList.forEach((item) => {
+          const chip = document.createElement('span');
+          chip.className = 'excluded-org-chip';
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = item.organization;
+          const typeSpan = document.createElement('span');
+          typeSpan.className = 'excluded-org-type';
+          typeSpan.textContent = item.billingType === 'EVALUATION' ? 'TRIAL' : item.billingType;
+          chip.append(nameSpan, typeSpan);
+          modalListEl.appendChild(chip);
+        });
+      }
+    } else {
+      warnHeaderBtn.style.display = 'none';
+    }
+  }
+
+  const warnBanner = document.getElementById('dashboard-analytics-warning');
+  const warnBadge = warnBanner?.querySelector('.analytics-warning-badge');
+  const warnText = document.getElementById('analytics-warning-text');
+  const warnChips = document.getElementById('analytics-warning-chips');
+
+  if (warnBanner && warnText && warnChips) {
+    const envsToCheck = Array.isArray(baseMatchingEnvs) ? baseMatchingEnvs : portfolio?.environments || [];
+    const disabledEnvs = envsToCheck.filter(
+      (e) => e.callsStatus === 'ANALYTICS_DISABLED' || e.callsSource === 'ANALYTICS_DISABLED'
+    );
+    const degradedEnvs = envsToCheck.filter(
+      (e) => e.callsStatus === 'PARTIAL' || e.callsStatus === 'ERROR'
+    );
+    const allWarnEnvs = [...disabledEnvs, ...degradedEnvs];
+
+    if (allWarnEnvs.length > 0) {
+      currentAnalyticsWarnKeys = allWarnEnvs.map(
+        (e) => `${e.organization}/${e.environment}:${e.callsStatus || e.callsSource}`
+      );
+
+      const allDismissed = currentAnalyticsWarnKeys.every((k) => dismissedAnalyticsWarnSet.has(k));
+      if (allDismissed) {
+        warnBanner.style.display = 'none';
+        return;
+      }
+
+      if (warnBadge) {
+        warnBadge.textContent =
+          disabledEnvs.length > 0 && degradedEnvs.length > 0
+            ? 'NO ANALYTICS & PARTIAL'
+            : disabledEnvs.length > 0
+            ? 'NO ANALYTICS'
+            : 'ANALYTICS PARTIAL / ERROR';
+      }
+
+      const msgParts = [];
+      if (disabledEnvs.length > 0) {
+        msgParts.push(
+          `Apigee Analytics add-on is disabled on ${disabledEnvs.length} environment(s) — PDUs and Environment Units are counted, while API calls are 0 (no Cloud Monitoring fallback)`
+        );
+      }
+      if (degradedEnvs.length > 0) {
+        msgParts.push(
+          `Analytics call queries returned PARTIAL/ERROR on ${degradedEnvs.length} environment(s)`
+        );
+      }
+      warnText.textContent = `${msgParts.join(' • ')}:`;
+
+      warnChips.replaceChildren();
+      allWarnEnvs.forEach((e) => {
+        const chip = document.createElement('span');
+        chip.className = 'analytics-warning-chip';
+        const statusLabel =
+          e.callsStatus === 'ANALYTICS_DISABLED' || e.callsSource === 'ANALYTICS_DISABLED'
+            ? 'NO ANALYTICS'
+            : String(e.callsStatus || 'PARTIAL');
+        chip.textContent = `${e.organization} / ${e.environment} (${e.totalPdus ?? 0} PDUs • ${statusLabel})`;
+        if (Array.isArray(e.trafficErrors) && e.trafficErrors.length > 0) {
+          chip.title = e.trafficErrors.join(' | ');
+        }
+        warnChips.appendChild(chip);
+      });
+      warnBanner.style.display = 'flex';
+    } else {
+      currentAnalyticsWarnKeys = [];
+      warnBanner.style.display = 'none';
+    }
+  }
+}
+
 function renderSimplifiedDashboard() {
   if (!currentPortfolio || !currentPortfolio.summary) return;
+  const mismatchKey = `${getStoredJurisdiction()}:${currentPortfolio.summary.contractStartDate || ''}`;
+  if (
+    currentPortfolio.callsPeriodMismatch &&
+    !window.__refreshingMismatchJur &&
+    !attemptedMismatchKeys.has(mismatchKey)
+  ) {
+    attemptedMismatchKeys.add(mismatchKey);
+    window.__refreshingMismatchJur = true;
+    fetchMonthlyCallsSeries(true).finally(() => {
+      window.__refreshingMismatchJur = false;
+    });
+  }
 
   const summary = currentPortfolio.summary;
   const limitPdu = summary.entitlementPdu || 500;
@@ -1514,7 +1976,7 @@ function renderSimplifiedDashboard() {
     currentPortfolio.account ||
     activeSessionEmail ||
     'Authenticated';
-  document.getElementById('header-account-subtitle').textContent = `User: ${acct} • ${totalOrgsCount} Authorized Orgs`;
+  document.getElementById('header-account-subtitle').textContent = `User: ${acct}`;
 
   const jurBadge = document.getElementById('header-jurisdiction-badge');
   if (jurBadge) {
@@ -1596,6 +2058,7 @@ function renderSimplifiedDashboard() {
   if (envFilter !== 'ALL') exportParams.set('env', envFilter);
   if (footprintFilter !== 'ALL') exportParams.set('runtime', footprintFilter);
   exportParams.set('hideZero', hideZero ? 'true' : 'false');
+  exportParams.set('jurisdiction', getStoredJurisdiction());
   const qs = exportParams.toString();
   document.getElementById('btn-export-csv').href = `/api/export/environments${qs ? `?${qs}` : ''}`;
 
@@ -1605,6 +2068,8 @@ function renderSimplifiedDashboard() {
     if (footprintFilter !== 'ALL' && e.runtimeType !== footprintFilter) return false;
     return true;
   });
+
+  renderScopeAndAnalyticsBanners(currentPortfolio, baseMatchingEnvs);
 
   const allMatchingEnvs = hideZero
     ? baseMatchingEnvs.filter((e) => (e.totalPdus || 0) > 0)
@@ -1617,29 +2082,33 @@ function renderSimplifiedDashboard() {
   const isPduAbove = consumedPdus > limitPdu;
   const diffPdus = Math.abs(limitPdu - consumedPdus);
   const pctPduUsed = limitPdu > 0 ? ((consumedPdus / limitPdu) * 100).toFixed(1) : '0.0';
+  const isPduWarn = !isPduAbove && Number(pctPduUsed) >= 85;
 
-  // 2. Environment Units (Env × Regions) metrics for filtered scope
-  const consumedEnvUnits = allMatchingEnvs.reduce((sum, e) => sum + (e.regionCount || 0), 0);
+  // 2. Environment Units (Env × Regions) metrics for filtered scope (include all matching envs, even 0-PDU)
+  const consumedEnvUnits = baseMatchingEnvs.reduce((sum, e) => sum + (e.regionCount || 0), 0);
   const isEnvAbove = consumedEnvUnits > limitEnvs;
   const diffEnvs = Math.abs(limitEnvs - consumedEnvUnits);
   const pctEnvUsed = limitEnvs > 0 ? ((consumedEnvUnits / limitEnvs) * 100).toFixed(1) : '0.0';
+  const isEnvWarn = !isEnvAbove && Number(pctEnvUsed) >= 85;
 
-  // 3. Yearly API Calls (Contract Period) metrics for filtered scope
-  const consumedStdCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.standardApiCalls || 0), 0);
-  const consumedEnvoyCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.envoyApiCalls || 0), 0);
-  const consumedExtCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.extensibleApiCalls || 0), 0);
-  const consumedRawCalls = allMatchingEnvs.reduce(
+  // 3. Yearly API Calls (Contract Period) metrics for filtered scope (include all matching envs, even 0-PDU)
+  const consumedStdCalls = baseMatchingEnvs.reduce((sum, e) => sum + (e.standardApiCalls || 0), 0);
+  const consumedEnvoyCalls = baseMatchingEnvs.reduce((sum, e) => sum + (e.envoyApiCalls || 0), 0);
+  const consumedExtCalls = baseMatchingEnvs.reduce((sum, e) => sum + (e.extensibleApiCalls || 0), 0);
+  const consumedRawCalls = baseMatchingEnvs.reduce(
     (sum, e) =>
       sum +
       (e.rawApiCalls ??
         ((e.standardApiCalls || 0) + (e.extensibleApiCalls || 0))),
     0
   );
-  const consumedCalls = allMatchingEnvs.reduce((sum, e) => sum + (e.yearlyApiCalls || 0), 0);
+  const consumedCalls = baseMatchingEnvs.reduce((sum, e) => sum + (e.yearlyApiCalls || 0), 0);
   const projectedCalls = Math.round(consumedCalls * (daysInPeriod / Math.max(1, daysElapsed)));
   const isCallsAbove = consumedCalls > limitCalls;
+  const isCallsProjectedAbove = !isCallsAbove && projectedCalls > limitCalls;
   const diffCalls = Math.abs(limitCalls - consumedCalls);
   const pctCallsUsed = limitCalls > 0 ? ((consumedCalls / limitCalls) * 100).toFixed(1) : '0.0';
+  const isCallsWarn = !isCallsAbove && (Number(pctCallsUsed) >= 85 || isCallsProjectedAbove);
 
   updateCallsBreakdownBanner(
     consumedStdCalls,
@@ -1650,7 +2119,7 @@ function renderSimplifiedDashboard() {
   );
 
   const xPdus = allMatchingEnvs
-    .filter((e) => e.runtimeType !== 'HYBRID')
+    .filter((e) => e.runtimeType !== 'HYBRID' && e.runtimeType !== 'UNKNOWN')
     .reduce((sum, e) => sum + e.totalPdus, 0);
   const hybridPdus = allMatchingEnvs
     .filter((e) => e.runtimeType === 'HYBRID')
@@ -1661,7 +2130,7 @@ function renderSimplifiedDashboard() {
   const consumedPduEl = document.getElementById('val-consumed-pdus');
   if (consumedPduEl) {
     consumedPduEl.textContent = consumedPdus.toLocaleString();
-    consumedPduEl.className = isPduAbove ? 'above' : 'below';
+    consumedPduEl.className = isPduAbove ? 'above' : isPduWarn ? 'warning' : 'below';
   }
   document.getElementById('val-limit-pdus').textContent = limitPdu.toLocaleString();
   document.getElementById('val-consumed-formula').textContent = `${deployedUnits.toLocaleString()} deployed units (${matchingOrgsCount} orgs)`;
@@ -1672,26 +2141,34 @@ function renderSimplifiedDashboard() {
   document.getElementById('val-margin-label').textContent = isPduAbove ? 'overage' : 'available';
   const pillPdu = document.getElementById('pill-status-pdu');
   if (pillPdu) {
-    pillPdu.className = `chart-status-pill ${isPduAbove ? 'above' : 'below'}`;
-    pillPdu.textContent = isPduAbove ? `ABOVE (+${diffPdus.toLocaleString()})` : 'BELOW LIMIT';
+    pillPdu.className = `chart-status-pill ${isPduAbove ? 'above' : isPduWarn ? 'warning' : 'below'}`;
+    pillPdu.textContent = isPduAbove
+      ? `ABOVE (+${diffPdus.toLocaleString()})`
+      : isPduWarn
+      ? `WARNING (${pctPduUsed}%)`
+      : 'BELOW LIMIT';
   }
 
   // Update Card 2 (Environment Units = Env × Regions)
   const consumedEnvEl = document.getElementById('val-consumed-envs');
   if (consumedEnvEl) {
     consumedEnvEl.textContent = consumedEnvUnits.toLocaleString();
-    consumedEnvEl.className = isEnvAbove ? 'above' : 'below';
+    consumedEnvEl.className = isEnvAbove ? 'above' : isEnvWarn ? 'warning' : 'below';
   }
   document.getElementById('val-limit-envs').textContent = limitEnvs.toLocaleString();
   document.getElementById('val-envs-formula').innerHTML = `${consumedEnvUnits.toLocaleString()} regional env units across ${
-    allMatchingEnvs.length
+    baseMatchingEnvs.length
   } logical envs &bull; <strong>${pctEnvUsed}% used</strong> (${
     isEnvAbove ? `+${diffEnvs} overage` : `${diffEnvs} available`
   })`;
   const pillEnvs = document.getElementById('pill-status-envs');
   if (pillEnvs) {
-    pillEnvs.className = `chart-status-pill ${isEnvAbove ? 'above' : 'below'}`;
-    pillEnvs.textContent = isEnvAbove ? `ABOVE (+${diffEnvs})` : 'BELOW LIMIT';
+    pillEnvs.className = `chart-status-pill ${isEnvAbove ? 'above' : isEnvWarn ? 'warning' : 'below'}`;
+    pillEnvs.textContent = isEnvAbove
+      ? `ABOVE (+${diffEnvs})`
+      : isEnvWarn
+      ? `WARNING (${pctEnvUsed}%)`
+      : 'BELOW LIMIT';
   }
 
   // Update Card 3 (Yearly API Calls over Contract Period)
@@ -1699,7 +2176,7 @@ function renderSimplifiedDashboard() {
   if (consumedCallsEl) {
     consumedCallsEl.textContent = formatCompactCalls(consumedCalls);
     consumedCallsEl.title = `${consumedCalls.toLocaleString()} calls`;
-    consumedCallsEl.className = isCallsAbove ? 'above' : 'below';
+    consumedCallsEl.className = isCallsAbove ? 'above' : isCallsWarn ? 'warning' : 'below';
   }
   document.getElementById('val-limit-calls').textContent = formatCompactCalls(limitCalls);
   const chipStd = document.getElementById('chip-calls-std');
@@ -1723,14 +2200,22 @@ function renderSimplifiedDashboard() {
     chipRaw.title = `Raw Runtime API Calls (Ext + Std, excl. Envoy): ${consumedRawCalls.toLocaleString()}`;
   }
 
+  const lightUi = isLightTheme();
+  const projWarnColor = lightUi ? '#b45309' : '#fbbf24';
   document.getElementById('val-calls-formula').innerHTML = `Period: <code>${escapeHtml(
     contractPeriodStart
-  )} &rarr; ${escapeHtml(contractPeriodEnd)}</code> &bull; <strong>${pctCallsUsed}% used</strong>`;
+  )} &rarr; ${escapeHtml(contractPeriodEnd)}</code> &bull; <strong>${pctCallsUsed}% used</strong> &bull; Projected: <strong style="color:${
+    projectedCalls > limitCalls ? projWarnColor : 'inherit'
+  };">${escapeHtml(formatCompactCalls(projectedCalls))}/yr</strong>`;
   const pillCalls = document.getElementById('pill-status-calls');
   if (pillCalls) {
-    pillCalls.className = `chart-status-pill ${isCallsAbove ? 'above' : 'below'}`;
+    pillCalls.className = `chart-status-pill ${isCallsAbove ? 'above' : isCallsWarn ? 'warning' : 'below'}`;
     pillCalls.textContent = isCallsAbove
       ? `ABOVE (+${formatCompactCalls(diffCalls)})`
+      : isCallsProjectedAbove
+      ? `PACE > LIMIT (${formatCompactCalls(projectedCalls)}/yr)`
+      : isCallsWarn
+      ? `WARNING (${pctCallsUsed}%)`
       : 'BELOW LIMIT';
   }
 
@@ -1743,22 +2228,34 @@ function renderSimplifiedDashboard() {
   if (envFilter !== 'ALL') scopeParts.push(`Env: ${envFilter}`);
   if (footprintFilter !== 'ALL') scopeParts.push(footprintFilter === 'HYBRID' ? 'Apigee Hybrid' : 'Apigee X');
   if (!hideZero) scopeParts.push('Incl. 0-PDU Envs');
+  const errorOrgsCount = (currentPortfolio.organizations || []).filter(
+    (o) => isOrgSelected(o.organization) && o.status === 'ERROR'
+  ).length;
+  if (errorOrgsCount > 0) {
+    scopeParts.push(`⚠ ${errorOrgsCount} Org Error(s)`);
+  }
   scopeEl.textContent = scopeParts.length
     ? `Filtered Scope (${scopeParts.join(' • ')})`
     : `All Authorized Organizations (${totalOrgsCount} Orgs)`;
 
   // Update 3-Dimension Summary Legend in the Right Card
+  const colorForState = (above, warn) => {
+    if (lightUi) {
+      return above ? '#dc2626' : warn ? '#b45309' : '#059669';
+    }
+    return above ? '#f87171' : warn ? '#fbbf24' : '#34d399';
+  };
   const legPdu = document.getElementById('legend-pdu-summary');
   if (legPdu) {
-    legPdu.innerHTML = `<span style="color:${isPduAbove ? '#f87171' : '#34d399'}">${consumedPdus.toLocaleString()} / ${limitPdu.toLocaleString()} (${pctPduUsed}%)</span>`;
+    legPdu.innerHTML = `<span style="color:${colorForState(isPduAbove, isPduWarn)}">${consumedPdus.toLocaleString()} / ${limitPdu.toLocaleString()} (${pctPduUsed}%)</span>`;
   }
   const legEnv = document.getElementById('legend-env-summary');
   if (legEnv) {
-    legEnv.innerHTML = `<span style="color:${isEnvAbove ? '#f87171' : '#34d399'}">${consumedEnvUnits.toLocaleString()} / ${limitEnvs.toLocaleString()} (${pctEnvUsed}%)</span>`;
+    legEnv.innerHTML = `<span style="color:${colorForState(isEnvAbove, isEnvWarn)}">${consumedEnvUnits.toLocaleString()} / ${limitEnvs.toLocaleString()} (${pctEnvUsed}%)</span>`;
   }
   const legCalls = document.getElementById('legend-calls-summary');
   if (legCalls) {
-    legCalls.innerHTML = `<span style="color:${isCallsAbove ? '#f87171' : '#34d399'}">${formatCompactCalls(
+    legCalls.innerHTML = `<span style="color:${colorForState(isCallsAbove, isCallsWarn)}">${formatCompactCalls(
       consumedCalls
     )} / ${formatCompactCalls(limitCalls)} (${pctCallsUsed}%)</span>`;
   }
@@ -1796,6 +2293,7 @@ function renderSimplifiedDashboard() {
   let gaugeLimit = limitPdu;
   let gaugePct = pctPduUsed;
   let gaugeAbove = isPduAbove;
+  let gaugeWarn = isPduWarn;
   let gaugeSubLabel = `${consumedPdus.toLocaleString()} / ${limitPdu.toLocaleString()} PDUs`;
 
   if (selectedGaugeDimension === 'environments') {
@@ -1803,16 +2301,19 @@ function renderSimplifiedDashboard() {
     gaugeLimit = limitEnvs;
     gaugePct = pctEnvUsed;
     gaugeAbove = isEnvAbove;
+    gaugeWarn = isEnvWarn;
     gaugeSubLabel = `${consumedEnvUnits.toLocaleString()} / ${limitEnvs.toLocaleString()} Env Units`;
   } else if (selectedGaugeDimension === 'calls') {
     gaugeConsumed = consumedCalls;
     gaugeLimit = limitCalls;
     gaugePct = pctCallsUsed;
     gaugeAbove = isCallsAbove;
+    gaugeWarn = isCallsWarn;
     gaugeSubLabel = `${formatCompactCalls(consumedCalls)} / ${formatCompactCalls(limitCalls)} Calls`;
   }
 
   const anyAboveLimit = isPduAbove || isEnvAbove || isCallsAbove;
+  const anyWarnLimit = !anyAboveLimit && (isPduWarn || isEnvWarn || isCallsWarn);
   const cardEl = document.getElementById('limit-validation-card');
   const badgeEl = document.getElementById('verdict-badge');
   const progressFillEl = document.getElementById('limit-progress-fill');
@@ -1825,6 +2326,14 @@ function renderSimplifiedDashboard() {
     if (isEnvAbove) breached.push('ENV');
     if (isCallsAbove) breached.push('CALLS');
     badgeEl.textContent = `ABOVE LIMIT (${breached.join(' + ')})`;
+  } else if (anyWarnLimit) {
+    cardEl.className = 'overview-bento warning-limit';
+    badgeEl.className = 'verdict-pill warning';
+    const atRisk = [];
+    if (isPduWarn) atRisk.push('PDU');
+    if (isEnvWarn) atRisk.push('ENV');
+    if (isCallsWarn) atRisk.push('CALLS');
+    badgeEl.textContent = `OVERAGE RISK (${atRisk.join(' + ')})`;
   } else {
     cardEl.className = 'overview-bento below-limit';
     badgeEl.className = 'verdict-pill below';
@@ -1832,7 +2341,11 @@ function renderSimplifiedDashboard() {
   }
 
   if (progressFillEl) {
-    progressFillEl.className = gaugeAbove ? 'limit-progress-fill above' : 'limit-progress-fill';
+    progressFillEl.className = gaugeAbove
+      ? 'limit-progress-fill above'
+      : gaugeWarn
+      ? 'limit-progress-fill warning'
+      : 'limit-progress-fill';
     progressFillEl.style.width = `${Math.min(100, Number(gaugePct))}%`;
   }
 
@@ -1844,7 +2357,7 @@ function renderSimplifiedDashboard() {
     const circumference = 2 * Math.PI * 64; // 402.12
     const clampedRatio = Math.min(1, Math.max(0, gaugeConsumed / Math.max(1, gaugeLimit)));
     donutRing.style.strokeDashoffset = (circumference * (1 - clampedRatio)).toFixed(2);
-    donutRing.setAttribute('stroke', gaugeAbove ? '#f87171' : '#34d399');
+    donutRing.setAttribute('stroke', colorForState(gaugeAbove, gaugeWarn));
   }
   if (donutPctText) donutPctText.textContent = `${gaugePct}%`;
   if (donutSubText) donutSubText.textContent = gaugeSubLabel;
@@ -1897,6 +2410,17 @@ function renderSimplifiedDashboard() {
         const extCalls = Number(e.extensibleApiCalls || 0);
         const envCalls = Number(e.yearlyApiCalls || 0);
         const callLimitPct = limitCalls > 0 ? ((envCalls / limitCalls) * 100).toFixed(2) : '0.00';
+        const callsStatus = String(e.callsStatus || 'OK');
+        const callsSource = String(e.callsSource || '');
+        const errTooltip = escapeHtml((e.trafficErrors || []).join(' | ') || 'Apigee Analytics query issue');
+        let callsBadgeHtml = '';
+        if (callsSource === 'ANALYTICS_DISABLED' || callsStatus === 'ANALYTICS_DISABLED') {
+          callsBadgeHtml = ' <span class="calls-status-badge disabled" title="Apigee Analytics add-on is not enabled on this environment">NO ANALYTICS</span>';
+        } else if (callsStatus === 'PARTIAL') {
+          callsBadgeHtml = ` <span class="calls-status-badge partial" title="${errTooltip}">PARTIAL</span>`;
+        } else if (callsStatus === 'ERROR') {
+          callsBadgeHtml = ` <span class="calls-status-badge error" title="${errTooltip}">ERROR</span>`;
+        }
 
         return `
           <tr>
@@ -1911,7 +2435,7 @@ function renderSimplifiedDashboard() {
             <td class="num-cell">${pduLimitPct}%</td>
             <td class="num-cell" title="${extCalls.toLocaleString()} extensible calls">${extCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(extCalls)})</span></td>
             <td class="num-cell" title="${stdCalls.toLocaleString()} standard calls">${stdCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(stdCalls)})</span></td>
-            <td class="num-cell" title="${envCalls.toLocaleString()} entitlement calls (weighted)"><strong>${envCalls.toLocaleString()}</strong> <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envCalls)})</span></td>
+            <td class="num-cell" title="${envCalls.toLocaleString()} entitlement calls (weighted)"><strong>${envCalls.toLocaleString()}</strong> <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envCalls)})</span>${callsBadgeHtml}</td>
             <td class="num-cell" title="${envoyCalls.toLocaleString()} Envoy Adapter calls (Free / 0× weighting)">${envoyCalls.toLocaleString()} <span style="color:var(--text-muted);font-size:0.74rem;">(${formatCompactCalls(envoyCalls)})</span></td>
             <td class="num-cell">${callLimitPct}%</td>
           </tr>
@@ -1921,25 +2445,29 @@ function renderSimplifiedDashboard() {
   }
 
   const visibleUnits = visibleEnvs.reduce((s, e) => s + e.totalArtifacts, 0);
+  const visiblePdus = visibleEnvs.reduce((s, e) => s + (e.totalPdus || 0), 0);
   const visibleEnvUnits = visibleEnvs.reduce((s, e) => s + (e.regionCount || 0), 0);
   const visibleStdCalls = visibleEnvs.reduce((s, e) => s + (e.standardApiCalls || 0), 0);
   const visibleEnvoyCalls = visibleEnvs.reduce((s, e) => s + (e.envoyApiCalls || 0), 0);
   const visibleExtCalls = visibleEnvs.reduce((s, e) => s + (e.extensibleApiCalls || 0), 0);
   const visibleCalls = visibleEnvs.reduce((s, e) => s + (e.yearlyApiCalls || 0), 0);
+  const visibleEnvPct = limitEnvs > 0 ? ((visibleEnvUnits / limitEnvs) * 100).toFixed(1) : '0.0';
+  const visiblePduPct = limitPdu > 0 ? ((visiblePdus / limitPdu) * 100).toFixed(1) : '0.0';
+  const visibleCallsPct = limitCalls > 0 ? ((visibleCalls / limitCalls) * 100).toFixed(1) : '0.0';
 
   tfoot.innerHTML = `
     <tr>
       <td colspan="4">TOTAL (${visibleEnvs.length} Environments Displayed)</td>
       <td class="num-cell">${visibleEnvUnits.toLocaleString()} / ${limitEnvs.toLocaleString()}</td>
-      <td class="num-cell">${pctEnvUsed}%</td>
+      <td class="num-cell">${visibleEnvPct}%</td>
       <td class="num-cell">${visibleUnits.toLocaleString()} units</td>
-      <td class="num-cell">${consumedPdus.toLocaleString()} PDUs</td>
-      <td class="num-cell">${pctPduUsed}%</td>
+      <td class="num-cell">${visiblePdus.toLocaleString()} PDUs</td>
+      <td class="num-cell">${visiblePduPct}%</td>
       <td class="num-cell" title="${visibleExtCalls.toLocaleString()} extensible calls">${formatCompactCalls(visibleExtCalls)}</td>
       <td class="num-cell" title="${visibleStdCalls.toLocaleString()} standard calls">${formatCompactCalls(visibleStdCalls)}</td>
       <td class="num-cell" title="${visibleCalls.toLocaleString()} entitlement calls">${formatCompactCalls(visibleCalls)} / ${formatCompactCalls(limitCalls)}</td>
       <td class="num-cell" title="${visibleEnvoyCalls.toLocaleString()} Envoy Adapter calls">${formatCompactCalls(visibleEnvoyCalls)}</td>
-      <td class="num-cell">${pctCallsUsed}%</td>
+      <td class="num-cell">${visibleCallsPct}%</td>
     </tr>
   `;
 
@@ -1953,10 +2481,11 @@ function renderSimplifiedDashboard() {
 
 async function updateSettings(payload, toastMsg) {
   try {
+    const jur = getStoredJurisdiction();
     const res = await apiFetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ jurisdiction: jur, ...payload }),
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1973,15 +2502,20 @@ async function updateSettings(payload, toastMsg) {
 function setActiveDimensionUI(dim) {
   selectedGaugeDimension = dim;
   document.querySelectorAll('.dimension-card').forEach((card) => {
-    card.classList.toggle('active', card.getAttribute('data-dim') === dim);
+    const isActive = card.getAttribute('data-dim') === dim;
+    card.classList.toggle('active', isActive);
+    card.setAttribute('aria-pressed', isActive ? 'true' : 'false');
   });
   document.querySelectorAll('.gauge-dim-btn').forEach((btn) => {
-    btn.classList.toggle('active', btn.getAttribute('data-gauge-dim') === dim);
+    const isActive = btn.getAttribute('data-gauge-dim') === dim;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
   });
   renderSimplifiedDashboard();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  purgeLegacyBrowserTokens();
   try {
     const savedTheme = localStorage.getItem('apigee_pdu_theme');
     if (savedTheme === 'light' || savedTheme === 'dark') {
@@ -2059,15 +2593,29 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Dimension Cards & Gauge Switcher Pills
+  const activateDimensionCard = (card) => {
+    const dim = card.getAttribute('data-dim') || 'pdu';
+    setActiveDimensionUI(dim);
+    if (dim === 'pdu' || dim === 'environments') {
+      document.querySelectorAll('.dim-btn').forEach((b) => {
+        b.classList.toggle('active', b.getAttribute('data-chart-dim') === dim);
+      });
+      fetchMonitoringTimeSeries(selectedMonitoringDays, false, dim);
+    }
+  };
+
   document.querySelectorAll('.dimension-card').forEach((card) => {
-    card.addEventListener('click', () => {
-      const dim = card.getAttribute('data-dim') || 'pdu';
-      setActiveDimensionUI(dim);
-      if (dim === 'pdu' || dim === 'environments') {
-        document.querySelectorAll('.dim-btn').forEach((b) => {
-          b.classList.toggle('active', b.getAttribute('data-chart-dim') === dim);
-        });
-        fetchMonitoringTimeSeries(selectedMonitoringDays, false, dim);
+    card.addEventListener('click', () => activateDimensionCard(card));
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        activateDimensionCard(card);
+      } else if (e.key === ' ') {
+        e.preventDefault();
+      }
+    });
+    card.addEventListener('keyup', (e) => {
+      if (e.key === ' ') {
+        activateDimensionCard(card);
       }
     });
   });
@@ -2104,12 +2652,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
-      const res = await fetch('/api/auth/oidc/auth-url');
+      const res = await apiFetch('/api/auth/oidc/auth-url', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `HTTP ${res.status}`);
+        if (data.needsTokenModal) {
+          const modal = document.getElementById('modal-token-manager');
+          if (modal) modal.style.display = 'grid';
+        }
+        throw new Error(data.error || data.detail || `HTTP ${res.status}`);
       }
-      const data = await res.json();
       if (data.authUrl) {
         window.location.href = data.authUrl;
         return;
@@ -2144,7 +2695,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (errBox) errBox.style.display = 'none';
 
     try {
-      await fetch('/api/auth/login', {
+      await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2175,21 +2726,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Switch GCP Account
-
+  // Return to Login / Jurisdiction & Account Switcher (preserving active session for jurisdiction switch)
   document.getElementById('btn-switch-account')?.addEventListener('click', () => {
+    hideTrafficErrorModal();
+    const scopeDlg = document.getElementById('modal-excluded-orgs');
+    if (scopeDlg?.open) scopeDlg.close();
     currentPortfolio = null;
     allOrgsSelected = true;
     selectedOrgs.clear();
     currentMonitoringTs = null;
     currentCallsTs = null;
     document.getElementById('dashboard-screen').style.display = 'none';
-    document.getElementById('login-screen').style.display = 'grid';
+    document.getElementById('login-screen').style.display = '';
     initAuthScreen();
   });
 
   // Save Contract & Entitlement Parameters
+  let isSavingEntitlements = false;
   const saveEntitlementsHandler = async () => {
+    if (isSavingEntitlements) return;
     const pduVal = Number(document.getElementById('input-pdu-limit')?.value);
     const envVal = Number(document.getElementById('input-env-limit')?.value);
     const callsValMillion = Number(document.getElementById('input-calls-limit')?.value);
@@ -2204,12 +2759,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const prevContractDate = currentPortfolio?.summary?.contractStartDate;
     const contractChanged = Boolean(contractDateVal && contractDateVal !== prevContractDate);
 
+    isSavingEntitlements = true;
     const saveBtn = document.getElementById('btn-apply-limit');
     if (saveBtn) {
+      saveBtn.disabled = true;
       saveBtn.classList.add('is-refreshing');
       saveBtn.textContent = contractChanged ? 'Updating Contract & Analytics...' : 'Saving...';
     }
     try {
+      const saveTargetLabel = currentPortfolio?.auth?.isCloudRun ? 'session settings' : 'pdu_limit.json';
       await updateSettings(
         {
           entitlementPdu: pduVal,
@@ -2219,15 +2777,17 @@ document.addEventListener('DOMContentLoaded', () => {
         },
         `Saved parameters (${pduVal.toLocaleString()} PDUs, ${envVal} Envs, ${formatCompactCalls(
           callsVal
-        )} Calls, Start: ${contractDateVal}) to pdu_limit.json`
+        )} Calls, Start: ${contractDateVal}) to ${saveTargetLabel}`
       );
       if (contractChanged) {
-        await fetchMonthlyCallsSeries(true);
+        await fetchMonthlyCallsSeries(false);
       } else if (currentCallsTs) {
         renderMonthlyCallsChart();
       }
     } finally {
+      isSavingEntitlements = false;
       if (saveBtn) {
+        saveBtn.disabled = false;
         saveBtn.classList.remove('is-refreshing');
         saveBtn.textContent = 'Save Parameters';
       }
@@ -2239,13 +2799,15 @@ document.addEventListener('DOMContentLoaded', () => {
   ['input-pdu-limit', 'input-env-limit', 'input-calls-limit', 'input-contract-date'].forEach((id) => {
     const el = document.getElementById(id);
     el?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' && !e.isComposing) {
         saveEntitlementsHandler();
       }
     });
-    el?.addEventListener('change', () => {
-      saveEntitlementsHandler();
-    });
+    if (id !== 'input-contract-date') {
+      el?.addEventListener('change', () => {
+        saveEntitlementsHandler();
+      });
+    }
   });
 
   document.getElementById('input-calls-limit')?.addEventListener('input', (e) => {
@@ -2295,6 +2857,7 @@ document.addEventListener('DOMContentLoaded', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          jurisdiction: getStoredJurisdiction(),
           entitlementPdu: pduVal >= 1 ? pduVal : undefined,
           entitlementEnvs: envVal >= 1 ? envVal : undefined,
           entitlementYearlyCalls: callsVal >= 1 ? callsVal : undefined,
@@ -2309,15 +2872,32 @@ document.addEventListener('DOMContentLoaded', () => {
         onProgress: updateDashboardProgress,
       });
 
+      currentCallsTs = null;
+      currentMonitoringTs = null;
+      if (currentPortfolio?._prefetchedCallsTs) {
+        currentCallsTs = currentPortfolio._prefetchedCallsTs;
+      } else {
+        await fetchMonthlyCallsSeries(false, { skipRender: true });
+      }
+
+      if (
+        currentPortfolio?._prefetchedPduTs &&
+        selectedChartDimension === 'pdu' &&
+        selectedMonitoringDays === 14
+      ) {
+        currentMonitoringTs = currentPortfolio._prefetchedPduTs;
+      } else {
+        await fetchMonitoringTimeSeries(selectedMonitoringDays, true, selectedChartDimension, {
+          skipRender: true,
+        });
+      }
+
       allOrgsSelected = true;
       selectedOrgs.clear();
+      dismissedAnalyticsWarnSet.clear();
       populateOrgDropdown(currentPortfolio);
       populateEnvDropdown(currentPortfolio);
       renderSimplifiedDashboard();
-      await Promise.all([
-        fetchMonitoringTimeSeries(selectedMonitoringDays, true, selectedChartDimension),
-        fetchMonthlyCallsSeries(true),
-      ]);
       updateScanProgressModal({ percent: 100, message: 'Scan Complete!', detail: 'Live scan finished' });
       await new Promise((r) => setTimeout(r, 250));
       showToast(
@@ -2325,6 +2905,11 @@ document.addEventListener('DOMContentLoaded', () => {
           currentPortfolio.summary.totalEnvironmentUnits
         } Env Units, ${formatCompactCalls(currentPortfolio.summary.totalYearlyApiCalls)} Calls)`
       );
+      if (Array.isArray(currentPortfolio?.trafficErrors) && currentPortfolio.trafficErrors.length > 0) {
+        showTrafficErrorModal(currentPortfolio.trafficErrors, () => {
+          document.getElementById('btn-refresh-scan')?.click();
+        });
+      }
     } catch (err) {
       showToast(`Scan failed: ${err.message}`);
     } finally {
@@ -2338,6 +2923,36 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.disabled = false;
       btn.setAttribute('title', 'Refresh Live Scan');
     }
+  });
+
+  // Scope & Excluded Organizations Popup Dialog + Safari light-dismiss fallback
+  const scopeDialog = document.getElementById('modal-excluded-orgs');
+  document.getElementById('btn-excluded-orgs-warning')?.addEventListener('click', () => {
+    if (scopeDialog && typeof scopeDialog.showModal === 'function' && !scopeDialog.open) {
+      scopeDialog.showModal();
+    }
+  });
+
+  if (scopeDialog && typeof HTMLDialogElement !== 'undefined' && !('closedBy' in HTMLDialogElement.prototype)) {
+    scopeDialog.addEventListener('click', (event) => {
+      if (event.target !== scopeDialog) return;
+      const rect = scopeDialog.getBoundingClientRect();
+      const isDialogContent =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (!isDialogContent) {
+        scopeDialog.close();
+      }
+    });
+  }
+
+  // Close "NO ANALYTICS" warning box
+  document.getElementById('btn-close-analytics-warning')?.addEventListener('click', () => {
+    currentAnalyticsWarnKeys.forEach((k) => dismissedAnalyticsWarnSet.add(k));
+    const warnBanner = document.getElementById('dashboard-analytics-warning');
+    if (warnBanner) warnBanner.style.display = 'none';
   });
 
   // Organization Dropdown & Filter Controls
@@ -2479,6 +3094,14 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeAllCallInfoPopovers();
+      const tokModal = document.getElementById('modal-token-manager');
+      if (tokModal && tokModal.style.display !== 'none') {
+        tokModal.style.display = 'none';
+      }
+      const trafficModal = document.getElementById('modal-traffic-error');
+      if (trafficModal && trafficModal.style.display !== 'none') {
+        hideTrafficErrorModal();
+      }
     }
   });
 
@@ -2498,69 +3121,35 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   };
 
-  document.getElementById('btn-copy-token-cmd')?.addEventListener('click', () => copyCmdHandler('btn-copy-token-cmd'));
   document.getElementById('btn-copy-modal-token-cmd')?.addEventListener('click', () => copyCmdHandler('btn-copy-modal-token-cmd'));
 
-  // Apply User Token (Login Card)
-  document.getElementById('btn-apply-user-token')?.addEventListener('click', async () => {
-    const input = document.getElementById('input-user-token');
-    const msg = document.getElementById('token-validation-msg');
-    const ok = await applyUserToken(input?.value, msg);
-    if (ok && input) input.value = '';
-  });
-
-  document.getElementById('input-user-token')?.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter') {
-      const input = document.getElementById('input-user-token');
-      const msg = document.getElementById('token-validation-msg');
-      const ok = await applyUserToken(input?.value, msg);
-      if (ok && input) input.value = '';
-    }
-  });
-
   // Apply User Token (Modal)
-  document.getElementById('btn-apply-modal-token')?.addEventListener('click', async () => {
+  const submitModalTokenHandler = async () => {
     const input = document.getElementById('input-modal-user-token');
     const msg = document.getElementById('modal-token-msg');
     const ok = await applyUserToken(input?.value, msg);
-    if (ok) {
-      if (input) input.value = '';
+    if (!ok) return;
+    if (input) input.value = '';
+    const dashboardActive = document.getElementById('dashboard-screen')?.style.display !== 'none';
+    if (dashboardActive) {
+      const modal = document.getElementById('modal-token-manager');
+      if (modal) modal.style.display = 'none';
+      if (msg) msg.style.display = 'none';
+      document.getElementById('btn-refresh-scan')?.click();
+    } else {
       setTimeout(() => {
         const modal = document.getElementById('modal-token-manager');
         if (modal) modal.style.display = 'none';
         if (msg) msg.style.display = 'none';
-      }, 1000);
+      }, 800);
     }
-  });
+  };
+
+  document.getElementById('btn-apply-modal-token')?.addEventListener('click', submitModalTokenHandler);
 
   document.getElementById('input-modal-user-token')?.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter') {
-      const input = document.getElementById('input-modal-user-token');
-      const msg = document.getElementById('modal-token-msg');
-      const ok = await applyUserToken(input?.value, msg);
-      if (ok) {
-        if (input) input.value = '';
-        setTimeout(() => {
-          const modal = document.getElementById('modal-token-manager');
-          if (modal) modal.style.display = 'none';
-          if (msg) msg.style.display = 'none';
-        }, 1000);
-      }
-    }
-  });
-
-  // Modal Open & Close
-  document.getElementById('btn-token-dialog')?.addEventListener('click', () => {
-    const modal = document.getElementById('modal-token-manager');
-    if (modal) {
-      modal.style.display = 'grid';
-      const input = document.getElementById('input-modal-user-token');
-      if (input) {
-        input.value = '';
-        input.focus();
-      }
-      const msg = document.getElementById('modal-token-msg');
-      if (msg) msg.style.display = 'none';
+    if (e.key === 'Enter' && !e.isComposing) {
+      await submitModalTokenHandler();
     }
   });
 
@@ -2572,6 +3161,23 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-token-manager')?.addEventListener('click', (e) => {
     if (e.target.id === 'modal-token-manager') {
       e.target.style.display = 'none';
+    }
+  });
+
+  document.getElementById('btn-close-traffic-error-modal')?.addEventListener('click', hideTrafficErrorModal);
+  document.getElementById('btn-dismiss-traffic-error')?.addEventListener('click', hideTrafficErrorModal);
+  document.getElementById('modal-traffic-error')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-traffic-error') {
+      hideTrafficErrorModal();
+    }
+  });
+  document.getElementById('btn-retry-traffic-scan')?.addEventListener('click', () => {
+    const retryFn = pendingTrafficRetryHandler;
+    hideTrafficErrorModal();
+    if (typeof retryFn === 'function') {
+      retryFn();
+    } else {
+      document.getElementById('btn-refresh-scan')?.click();
     }
   });
 

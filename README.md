@@ -1,9 +1,10 @@
 # Apigee Entitlement Tracker (Apigee X & Hybrid)
 
 [![Status: Beta](https://img.shields.io/badge/Status-Beta-orange.svg)](#)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Changelog](https://img.shields.io/badge/Changelog-v1.1.0-brightgreen.svg)](./CHANGELOG.md)
 [![Google Cloud](https://img.shields.io/badge/Google%20Cloud-Apigee%20X%20%26%20Hybrid-4285F4.svg)](https://cloud.google.com/apigee)
 
 ***
@@ -13,10 +14,10 @@
 ***
 
 
-**Apigee Entitlement Tracker** is an cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
+**Apigee Entitlement Tracker** is a cross-organization capacity monitoring, entitlement audit, and compliance tracking application for **Google Cloud Apigee X** and **Apigee Hybrid**.
 
 > [!IMPORTANT]
-> - **Entitlement Model Support**: This tool **does not support the Entitlement v2021 model**; it is exclusively designed for the **Entitlement v2024 model**.
+> - **Organization Billing Scope**: **Trial / Evaluation** (`EVALUATION` / `TRIAL`) and **Pay-As-You-Go** (`PAYG`) organizations are automatically excluded from Subscription entitlement quotas and reports. **Subscription** organizations—including both **`SUBSCRIPTION_2024`** and **`SUBSCRIPTION_2021`**—are retained and evaluated using the Entitlement v2024 metrics model (PDUs, Environment Units, and weighted API Calls).
 > - **Apigee Hybrid Instance Discovery & Caution**: For **Apigee Hybrid**, attached runtime instances are discovered dynamically auditing API Proxy deployments. **Caution**: If an Apigee Hybrid environment has **no deployed proxies or shared flows** (or if no active runtime instance reports status), the number of attached runtime instances cannot be queried from deployment details and defaults to **1** (0 PDUs consumed when no artifacts are deployed, and 1 Environment Unit by default). **In this case, the recorded consumption metrics for environment units and PDU appear to be inaccurate.**
 > - **Apigee Adapter for Envoy Traffic**: Envoy-related traffic involves two distinct call types: 
 >    - (1) **API traffic handled directly by Envoy** (`gateway_source eq 'envoy'`), which is separated from Apigee runtime traffic (Standard and Extensible) and is free under Entitlement v2024; and 
@@ -39,7 +40,7 @@ Enterprises typically manage several Apigee organizations across business units,
 1. **Unified Single-Pane-of-Glass Interface**:
    * Automatically discovers all Apigee X and Hybrid organizations your Google identity is authorized to access.
    * **Full DRZ (Data Residency Zones) & Regional Control Plane Support**: Allows selection of non-global Apigee Control Plane Hosting jurisdictions (US, EU, Germany, France, ... or Global default).
-   * Real-time compliance indicators and status badges (`WITHIN COMMITMENT`, `OVERAGE RISK`, `ABOVE LIMIT`) across all 3 entitlement dimensions.
+   * Real-time compliance indicators and status badges (`ALL 3 DIMENSIONS BELOW LIMIT` / `BELOW LIMIT`, `OVERAGE RISK`, `ABOVE LIMIT`) across all 3 entitlement dimensions.
    * Multi-organization and multi-environment filtering.
    * Visual time-series analytics for historical PDU capacity trends and monthly API call run-rate pacing over your active contract year.
 
@@ -67,7 +68,7 @@ flowchart TD
     Backend -->|4. Environment & Deployment Inventory| ApigeeDep["Apigee API: GET /v1/organizations/{org}/deployments"]
     Backend -->|5. Apigee Hybrid Revision Instances| ApigeeRevDep["Apigee API: GET /environments/{env}/apis/{proxy}/revisions/{rev}/deployments"]
     Backend -->|6. Historical Traffic - Runtime & Envoy | ApigeeStats["Apigee API: GET /environments/{env}/stats/proxy_deployment_type (+ gateway_source eq 'envoy')"]
-    Backend -->|7. Fallback & Time-Series Metrics| CloudMon["Cloud Monitoring API: Metric / TimeSeries"]
+    Backend -->|7. PDU & Env Unit Time-Series| CloudMon["Cloud Monitoring API: apigee.googleapis.com/proxy/details"]
     
     ApigeeOrgs --> Engine[Entitlement Engine]
     ApigeeInst --> Engine
@@ -89,8 +90,7 @@ flowchart TD
    * **Historical API Traffic**: Queries `GET /v1/organizations/{org}/environments/{env}/stats/proxy_deployment_type?select=sum(message_count)` alongside `filter=(gateway_source eq 'envoy')` in optimized 90-day chunks across the 14-month Apigee Analytics window, measuring traffic since the configured **Contract Starting Date** and differentiating Apigee runtime calls (**Extensible** at `1.0×` weight, **Standard** at `1:5` / `0.2×` weight) from **Apigee Adapter for Envoy** calls (tracked separately as **free / `0×` weight** under Entitlement v2024) using the entitlement formula `Ext + 0.2×Std`.
 
 2. **Cloud Monitoring API (`monitoring.googleapis.com/v3`)**:
-   * Queries metric `apigee.googleapis.com/proxy/response_count` as an automatic fallback when the Analytics add-on is disabled on specific environments.
-   * Queries historical capacity and traffic time-series for the visual monitoring charts.
+   * Queries metric `apigee.googleapis.com/proxy/details` to render historical Apigee X PDU and Environment Unit capacity time-series charts. *(Environments where the Apigee Analytics add-on is disabled are explicitly flagged as `ANALYTICS_DISABLED` rather than queried via Cloud Monitoring).*
 
 ---
 
@@ -107,8 +107,8 @@ flowchart TD
 
 #### Required IAM Permissions
 The user account (or service account) requires the following read-only roles on each target GCP project containing an Apigee organization:
-* **`roles/apigee.readOnlyAdmin`** (or `roles/apigee.admin`): To list organizations, read instances, environments, deployments, and stats.
-* **`roles/monitoring.viewer`**: To query Cloud Monitoring metrics for API call volume time-series.
+* **`roles/apigee.readOnlyAdmin`** (or `roles/apigee.admin`): To list organizations, read instances, environments, deployments, and Apigee Analytics API call stats.
+* **`roles/monitoring.viewer`**: To query Cloud Monitoring metrics (`apigee.googleapis.com/proxy/details`) for PDU and Environment Unit capacity time-series (API call volumes are queried strictly from Apigee Analytics).
 
 To grant these roles across multiple GCP projects:
 ```bash
@@ -143,8 +143,8 @@ gcloud auth application-default login --scopes=https://www.googleapis.com/auth/c
 
 #### Step 2: Install Dependencies
 ```bash
-git clone https://github.com/your-org/apigee-entitlement-tracker.git
-cd apigee-entitlement-tracker
+git clone https://github.com/g-lalevee/Apigee-Entitlement-Tracker.git
+cd Apigee-Entitlement-Tracker
 
 # Optional: Create and activate a virtual environment
 python3 -m venv .venv
@@ -174,7 +174,7 @@ python3 app.py
    * **Contract Starting Date** (e.g. `2026-01-01`)
    * **PDU Entitlement Limit** (e.g. `500`)
    * **Environment Entitlement** (e.g. `6`)
-   * **Yearly API Calls Entitlement in Millions** (e.g. `10` for 100M calls)
+   * **Yearly API Calls Entitlement in Millions** (e.g. `100` for 100M calls)
 4. **Inspect Metrics**:
    * Review compliance status across the 3 top overview cards.
    * Filter by Organization (multi-select), Environment, or Footprint (`Apigee X` / `Hybrid`).
@@ -202,8 +202,8 @@ Deploying to Cloud Run allows your entire team or organization to access the das
 
 #### Architecture: Cloud Run + 3-Legged OAuth 2.0 Delegation
 1. The user connects to the Cloud Run service URL.
-2. The user signs in via Google OAuth 2.0 (`/api/auth/login`).
-3. Google returns an authorization code to `/api/auth/oidc/callback`, which exchanges it for an access token stored in a secure `HttpOnly; SameSite=Lax` cookie.
+2. The user signs in via Google OAuth 2.0 (`/api/auth/oidc/auth-url`).
+3. Google returns an authorization code to `/api/auth/oidc/callback`, which exchanges it for an access token stored in secure `HttpOnly; SameSite=Lax` cookies.
 4. All backend Apigee API calls execute using the **logged-in user's token**, ensuring exact IAM permissions.
 
 #### Step 1: Create an OAuth 2.0 Web Client ID
@@ -213,7 +213,7 @@ In the [Google Cloud Console Credentials Page](https://console.cloud.google.com/
 3. Name: `Apigee Entitlement Tracker Web Client`.
 4. In **Authorized redirect URIs**, add:
    * `https://<YOUR-CLOUD-RUN-SERVICE-URL>/api/auth/oidc/callback`
-   * *(For local development, you can also add `http://127.0.0.1:8080/api/auth/oidc/callback`)*
+   * *(For local development, also add `http://127.0.0.1:8080/api/auth/oidc/callback` and `http://localhost:8080/api/auth/oidc/callback`)*
 5. Click **Create** and copy the **Client ID** and **Client Secret**.
 
 #### Step 2: Automated Deployment & Configuration Script
@@ -221,17 +221,17 @@ The repository provides an automated script that securely stores credentials in 
 
 ```bash
 # Run the automated setup script
-./scripts/setup_oauth_cloudrun.sh
+./scripts/setup_oauth_cloudrun.sh --project <YOUR-PROJECT-ID> --region <YOUR-REGION>
 ```
 * Prompts for your Client ID and Client Secret (or accepts `--client-id` and `--client-secret`).
 * Creates/updates secrets in Secret Manager.
 * Grants `roles/secretmanager.secretAccessor` to your Cloud Run runtime service account.
-* Updates the Cloud Run service with secret mounts.
+* Updates the Cloud Run service with secret mounts and session affinity.
 
 #### Step 3: One-Click Redeployment
 To rebuild from source and deploy new application code at any time:
 ```bash
-./scripts/redeploy_cloudrun.sh
+./scripts/redeploy_cloudrun.sh --project <YOUR-PROJECT-ID> --region <YOUR-REGION>
 ```
 
 #### Manual Deployment via `gcloud` (Alternative)
@@ -243,12 +243,22 @@ export SERVICE_NAME="apigee-entitlement-tracker"
 export SA_NAME="apigee-pdu-monitor-sa"
 export SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Create runtime service account (if not already created) and grant Secret Manager access
+gcloud iam service-accounts create "${SA_NAME}" --project="${PROJECT_ID}" || true
+for SEC in apigee-tracker-oauth-client-id apigee-tracker-oauth-client-secret; do
+  gcloud secrets add-iam-policy-binding "${SEC}" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="roles/secretmanager.secretAccessor" \
+      --project="${PROJECT_ID}"
+done
+
 # Deploy container from source
 gcloud run deploy "${SERVICE_NAME}" \
     --source . \
     --project="${PROJECT_ID}" \
     --region="${REGION}" \
     --service-account="${SA_EMAIL}" \
+    --session-affinity \
     --allow-unauthenticated \
     --set-secrets="GOOGLE_CLIENT_ID=apigee-tracker-oauth-client-id:latest,GOOGLE_CLIENT_SECRET=apigee-tracker-oauth-client-secret:latest" \
     --port=8080 \
@@ -258,8 +268,8 @@ gcloud run deploy "${SERVICE_NAME}" \
 
 #### How to Use in Cloud Run
 1. Navigate to the Cloud Run Service URL.
-2. Sign in with your corporate Google Account when prompted.
-3. The dashboard automatically audits all Apigee organizations associated with your Google account.
+2. Click **Authenticate with Google** and sign in with your corporate Google Account.
+3. Click **Enter Dashboard** to audit all Apigee organizations authorized for your Google account.
 
 ---
 
@@ -279,11 +289,11 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 | `Deployed Units (Proxies + SF)` | Total deployed artifacts | `236 (204P + 32SF)` |
 | `Consumed PDUs` | Total Proxy Deployment Units consumed | `472` |
 | `% of PDU Limit` | Share of total PDU entitlement | `31.47%` |
-| `Standard Calls` | Raw calls for standard proxies (weighted at 1:5 / 0.2×) | `1000000` |
-| `Envoy Adapter Calls` | Raw calls processed via Apigee Adapter for Envoy (free / 0× under Entitlement v2024) | `300000` |
 | `Extensible Calls` | Raw calls for extensible proxies (weighted at 1.0×) | `14050000` |
-| `Raw Total Calls` | Unweighted total recorded runtime calls (Standard + Extensible, excluding Envoy) | `15050000` |
+| `Standard Calls` | Raw calls for standard proxies (weighted at 1:5 / 0.2×) | `1000000` |
 | `Entitlement Calls (Weighted)` | Weighted contractual entitlement calls (1.0× Ext + 0.2× Std) | `14250000` |
+| `Raw Total Calls` | Unweighted total recorded runtime calls (Standard + Extensible, excluding Envoy) | `15050000` |
+| `Envoy Adapter Calls (Free)` | Raw calls processed via Apigee Adapter for Envoy (free / 0× under Entitlement v2024) | `300000` |
 | `% of call Limit` | Share of Yearly API Calls entitlement | `14.25%` |
 
 ---
@@ -300,6 +310,7 @@ Clicking **Export CSV** downloads `apigee_entitlement_tracker_<timestamp>.csv` c
 │   └── setup_oauth_cloudrun.sh # Automated Secret Manager & Cloud Run OAuth configuration
 ├── pdu_limit.json.example      # Example contract parameters template
 ├── Dockerfile                  # Non-root container image for Cloud Run
+├── CHANGELOG.md                # Release history and notable updates
 ├── LICENSE                     # Apache 2.0 Open Source License
 └── static/
     ├── index.html              # Single-page dashboard application
